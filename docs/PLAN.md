@@ -124,9 +124,18 @@ Invalid actions (mask violations) translate to no-ops server-side.
 
 ## Reward
 
-Win +1; eliminated -1; alive when someone else wins -0.5; timeout alive
--0.25; per-kill +1/(num opponents). Optional territory-delta shaping via
-`shaping` env config (default 0).
+Terminals: win +1; eliminated / never-spawned -1; alive when someone else
+wins -0.5; timeout after expanding -0.25; timeout without expanding past
+the spawn blob (`peakTilesFrac <= spawnTilesFrac + 0.002`) is -1 (same as
+death, not stacked on top of a later death). First spawn +0.1; per-kill
++1/(num opponents). Territory-delta shaping via `shaping` env config
+(curriculum stages 1-3 use 5.0 / 3.0 / 2.0).
+
+Activity (paid only when a real effect *starts*, not when the policy
+clicks): new outgoing attack +0.015; new transport ship +0.015; new
+constructed unit +0.01. New incoming attack -0.015 each, capped at -0.04
+per step. Income: +0.03 * clip(relative troop-regen delta, -1, 1). Gold
+and troop stockpiles are not rewarded.
 
 ## Curriculum (agent/curriculum.py)
 
