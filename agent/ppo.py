@@ -76,8 +76,10 @@ class TrainStats:
     wins: int = 0
     deaths: int = 0
     kills: int = 0
+    spawns: int = 0  # episodes where the agent actually took land
     recent_returns: list = field(default_factory=list)
     recent_wins: list = field(default_factory=list)
+    recent_spawned: list = field(default_factory=list)
     sps: float = 0.0
 
     @property
@@ -91,6 +93,12 @@ class TrainStats:
         if not self.recent_returns:
             return 0.0
         return float(np.mean(self.recent_returns[-100:]))
+
+    @property
+    def spawn_rate(self) -> float:
+        if not self.recent_spawned:
+            return 0.0
+        return float(np.mean(self.recent_spawned[-100:]))
 
 
 class PPOTrainer:
@@ -177,6 +185,9 @@ class PPOTrainer:
                     self.stats.episodes += 1
                     self.stats.recent_returns.append(float(ep_returns[i]))
                     self.stats.recent_wins.append(1.0 if info.get("win") else 0.0)
+                    spawned = 1.0 if info.get("spawned") else 0.0
+                    self.stats.recent_spawned.append(spawned)
+                    self.stats.spawns += int(spawned)
                     self.stats.kills += int(info.get("kills", 0))
                     if info.get("dead"):
                         self.stats.deaths += 1

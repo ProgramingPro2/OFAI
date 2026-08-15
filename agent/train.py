@@ -146,6 +146,7 @@ def main() -> None:
                 "env_steps": st.env_steps,
                 "episodes": st.episodes,
                 "win_rate": round(st.win_rate, 4),
+                "spawn_rate": round(st.spawn_rate, 4),
                 "mean_return": round(st.mean_return, 4),
                 "kills_total": st.kills,
                 "sps": round(sps, 1),
@@ -158,6 +159,7 @@ def main() -> None:
             pbar.set_postfix(
                 sps=f"{sps:.0f}",
                 winrate=f"{st.win_rate:.3f}",
+                spawn=f"{st.spawn_rate:.2f}",
                 ret=f"{st.mean_return:.3f}",
                 eps=st.episodes,
                 collect=f"{collect_s:.1f}s",
