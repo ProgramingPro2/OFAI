@@ -160,3 +160,6 @@ cd OpenFrontIO && npx vitest run ofai/tests/env.test.ts
   Note: the OpenFront ToS prohibits automation on official servers; the
   intended scope is a handful of supervised private-lobby games with
   friends. Human-paced action cap (1 action/2s), no chat, kill switch.
+- **Emoji taunts (fun, user-requested idea)**: scripted emoji reactions keyed
+  off game events (getting a kill, being rushed, winning) via the emoji
+  intent. Pure flavor; trivial to wire into the live bridge or env.
