@@ -1,0 +1,6 @@
+.venv/
+checkpoints/
+logs/
+__pycache__/
+*.pyc
+OpenFrontIO/
