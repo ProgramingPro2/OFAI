@@ -49,6 +49,11 @@ private matches.
     one batched GPU forward for all shards.
   - torch.compile(reduce-overhead) for rollout inference: 12.5ms -> ~1ms
     per batch of 64 (launch-overhead bound net).
+  - EnvServerProcess drains Node stdout/stderr on a background thread.
+    The game core logs to console during play; an undrained PIPE (~64KiB)
+    deadlocks Node and surfaces as `TimeoutError` on the Python socket
+    (this killed the first long run1 after ~6 minutes). Dead shards are
+    restarted automatically.
   - Rollout buffer stores spatial planes as uint8 (values are in [0,1]),
     4x less RAM; dequantized in update().
 - PPO stability (debugged over four instrumented runs 2026-08-14):

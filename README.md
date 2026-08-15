@@ -7,6 +7,18 @@ as the environment and a PyTorch PPO stack as the learner.
 See `docs/PLAN.md` for architecture, observation/action spaces, reward
 design, curriculum, and roadmap.
 
+## Clone
+
+Two repositories: this trainer, and a fork of OpenFrontIO on the `ofai`
+branch (the headless env harness lives there).
+
+```bash
+git clone https://github.com/ProgramingPro2/OFAI.git
+cd OFAI
+git clone -b ofai https://github.com/ProgramingPro2/OpenFrontIO.git
+cd OpenFrontIO && npm install && cd ..
+```
+
 ## Quick start
 
 ```bash

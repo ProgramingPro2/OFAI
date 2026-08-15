@@ -11,6 +11,7 @@ import json
 import socket
 import struct
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ import numpy as np
 from . import spaces
 
 REPO_ROOT = Path(__file__).resolve().parent.parent / "OpenFrontIO"
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 _DTYPES = {"f32": np.float32, "u8": np.uint8, "i32": np.int32}
 
@@ -108,46 +110,77 @@ def _obs_dict(tensors: dict[str, np.ndarray], k: int) -> dict[str, np.ndarray]:
 
 
 class EnvServerProcess:
-    """Spawns and owns an EnvServer node subprocess."""
+    """Spawns and owns an EnvServer node subprocess.
+
+    stdout/stderr are drained on a background thread into a log file. The
+    OpenFront core (and tsx) write to console during play; if those pipes
+    fill (~64KiB) the Node process blocks forever and the Python client
+    times out. That is what killed the first long run1.
+    """
 
     def __init__(self, port: int, cwd: Path = REPO_ROOT, timeout_s: float = 120.0):
         self.port = port
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.log_path = LOG_DIR / f"env-server-{port}.log"
+        self._log = open(self.log_path, "ab", buffering=0)
         cmd = ["npx", "tsx", "ofai/env/EnvServer.ts", "--port", str(port)]
         self.proc = subprocess.Popen(
             cmd,
             cwd=cwd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stderr=subprocess.STDOUT,
         )
-        deadline = time.time() + timeout_s
+        self._ready = threading.Event()
+        self._drain = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._drain.start()
+        if not self._ready.wait(timeout_s):
+            self.stop()
+            raise TimeoutError(
+                f"env server on {port} did not become ready; see {self.log_path}"
+            )
+        if self.proc.poll() is not None:
+            raise RuntimeError(
+                f"env server on {port} exited early; see {self.log_path}"
+            )
+
+    def _drain_stdout(self) -> None:
         assert self.proc.stdout is not None
-        while time.time() < deadline:
-            line = self.proc.stdout.readline()
-            if "ENV_SERVER_READY" in line:
-                return
-            if self.proc.poll() is not None:
-                stderr = self.proc.stderr.read() if self.proc.stderr else ""
-                raise RuntimeError(f"env server exited early: {stderr}")
-        raise TimeoutError("env server did not become ready")
+        for raw in iter(self.proc.stdout.readline, b""):
+            self._log.write(raw)
+            if b"ENV_SERVER_READY" in raw:
+                self._ready.set()
+        self._ready.set()
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
 
     def stop(self):
-        self.proc.terminate()
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
         try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+            self._log.close()
+        except Exception:
+            pass
 
 
 class VecEnv:
     """Vectorized client: K parallel games behind one request/reply socket."""
 
-    def __init__(self, host: str, port: int):
-        self.sock = socket.create_connection((host, port), timeout=600)
+    def __init__(self, host: str, port: int, timeout_s: float = 120.0):
+        self.host = host
+        self.port = port
+        self.timeout_s = timeout_s
+        self.sock = socket.create_connection((host, port), timeout=timeout_s)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.k = 0
+        self._configs: list[dict] = []
 
     def init(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
+        self._configs = list(env_configs)
         self.sock.sendall(_encode_frame({"cmd": "init", "envs": env_configs}))
         header, tensors = _read_frame(self.sock)
         if header.get("type") == "error":
@@ -212,25 +245,61 @@ class ShardedVecEnv:
     ):
         self.envs_per_server = envs_per_server
         self.k = num_servers * envs_per_server
-        ports = [base_port + i for i in range(num_servers)]
+        self.ports = [base_port + i for i in range(num_servers)]
+        self.connect = connect
         self.servers: list[EnvServerProcess] = []
         if not connect:
-            self.servers = [EnvServerProcess(p) for p in ports]
-        self.clients = [VecEnv("127.0.0.1", p) for p in ports]
+            self.servers = [EnvServerProcess(p) for p in self.ports]
+        self.clients = [VecEnv("127.0.0.1", p) for p in self.ports]
         self.pool = ThreadPoolExecutor(max_workers=num_servers)
+        self._configs: list[dict] = []
 
     def init(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
         assert len(env_configs) == self.k
+        self._configs = list(env_configs)
+        return self._init_all()
+
+    def _init_all(self) -> dict[str, np.ndarray]:
         eps = self.envs_per_server
-        chunks = [env_configs[i * eps : (i + 1) * eps] for i in range(len(self.clients))]
+        chunks = [
+            self._configs[i * eps : (i + 1) * eps] for i in range(len(self.clients))
+        ]
         obses = list(self.pool.map(lambda t: t[0].init(t[1]), zip(self.clients, chunks)))
         return _concat_obs(obses)
+
+    def _restart_shard(self, i: int) -> None:
+        port = self.ports[i]
+        print(f"[env] restarting shard {i} on port {port}")
+        try:
+            self.clients[i].close()
+        except Exception:
+            pass
+        if not self.connect:
+            self.servers[i].stop()
+            self.servers[i] = EnvServerProcess(port)
+        self.clients[i] = VecEnv("127.0.0.1", port)
+        eps = self.envs_per_server
+        self.clients[i].init(self._configs[i * eps : (i + 1) * eps])
 
     def step(self, actions: np.ndarray) -> StepBatch:
         assert actions.shape == (self.k, 5)
         eps = self.envs_per_server
         chunks = [actions[i * eps : (i + 1) * eps] for i in range(len(self.clients))]
-        batches = list(self.pool.map(lambda t: t[0].step(t[1]), zip(self.clients, chunks)))
+        try:
+            batches = list(
+                self.pool.map(lambda t: t[0].step(t[1]), zip(self.clients, chunks))
+            )
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            if self.connect:
+                raise
+            dead = [i for i, s in enumerate(self.servers) if not s.alive()]
+            if not dead:
+                dead = list(range(len(self.clients)))
+            for i in dead:
+                self._restart_shard(i)
+            batches = list(
+                self.pool.map(lambda t: t[0].step(t[1]), zip(self.clients, chunks))
+            )
         return StepBatch(
             obs=_concat_obs([b.obs for b in batches]),
             rewards=np.concatenate([b.rewards for b in batches]),

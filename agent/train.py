@@ -169,6 +169,9 @@ def main() -> None:
                 trainer.save(str(run_dir / f"it{st.iterations}.pt"))
     except KeyboardInterrupt:
         pbar.write("interrupted; saving checkpoint")
+    except Exception as exc:
+        pbar.write(f"training crashed: {exc!r}; saving checkpoint")
+        raise
     finally:
         pbar.close()
         trainer.save(str(run_dir / "final.pt"))
