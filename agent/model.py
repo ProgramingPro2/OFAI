@@ -24,17 +24,16 @@ class SpatialEncoder(nn.Module):
     def __init__(self, out_dim: int = 256):
         super().__init__()
         c = spaces.SPATIAL_CHANNELS
+        s = spaces.SPATIAL_SIZE
         self.net = nn.Sequential(
-            nn.Conv2d(c, 32, 5, stride=2, padding=2),  # 128 -> 64
+            nn.Conv2d(c, 32, 5, stride=2, padding=2),  # s -> s/2
             nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 64 -> 32
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # s/2 -> s/4
             nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1),  # 32 -> 16
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1),  # 16 -> 8
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),  # s/4 -> s/8
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, out_dim),
+            nn.Linear(64 * (s // 8) ** 2, out_dim),
             nn.ReLU(),
         )
 
@@ -158,17 +157,37 @@ class Policy(nn.Module):
     def forward(
         self, obs: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample an action. Returns (actions [B,5], total logprob [B], value [B])."""
-        logits = self.logits(obs)
-        heads = ["action", "target", "region", "quantity", "unit"]
-        actions = []
-        total_logp = torch.zeros_like(logits["value"])
-        for name in heads:
-            dist = torch.distributions.Categorical(logits=logits[name])
+        """Sample an action. Returns (actions [B,5], total logprob [B], value [B]).
+
+        The region head is sampled under the mask for the *sampled* action
+        type, so rollout logprobs are consistent with evaluate().
+        """
+        h = self._embed(obs)
+        neg = 1e9
+        dist_action = torch.distributions.Categorical(
+            logits=self.head_action(h) + (obs["action_mask"] - 1) * neg
+        )
+        a_type = dist_action.sample()
+        region_mask = self._region_mask(obs, a_type)
+        dists = [
+            torch.distributions.Categorical(
+                logits=self.head_target(h) + (obs["target_mask"] - 1) * neg
+            ),
+            torch.distributions.Categorical(
+                logits=self.head_region(h) + (region_mask - 1) * neg
+            ),
+            torch.distributions.Categorical(logits=self.head_quantity(h)),
+            torch.distributions.Categorical(
+                logits=self.head_unit(h) + (obs["unit_mask"] - 1) * neg
+            ),
+        ]
+        actions = [a_type]
+        total_logp = dist_action.log_prob(a_type)
+        for dist in dists:
             a = dist.sample()
             actions.append(a)
             total_logp = total_logp + dist.log_prob(a)
-        return torch.stack(actions, dim=1), total_logp, logits["value"]
+        return torch.stack(actions, dim=1), total_logp, self.head_value(h).squeeze(-1)
 
     def evaluate(
         self, obs: dict[str, torch.Tensor], actions: torch.Tensor

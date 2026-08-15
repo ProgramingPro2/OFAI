@@ -10,11 +10,12 @@ design, curriculum, and roadmap.
 ## Quick start
 
 ```bash
-# Python deps live in .venv (torch, numpy, msgpack, ...)
+# Python deps live in .venv (torch, numpy, msgpack, tqdm, ...)
 source .venv/bin/activate
 
-# Train
-python -m agent.train --envs 8 --rollout-len 128 --run-name run1
+# Train: --servers N env-server processes x --envs K games each, stepped in
+# parallel. A tqdm progress bar shows sps / winrate / stage live.
+python -m agent.train --servers 4 --envs 8 --rollout-len 128 --run-name run1
 
 # Evaluate
 python -m agent.eval --ckpt checkpoints/run1/latest.pt --episodes 20
@@ -22,4 +23,10 @@ python -m agent.eval --ckpt checkpoints/run1/latest.pt --episodes 20
 # Tests
 cd OpenFrontIO && npx vitest run ofai/tests/env.test.ts
 python tests/test_env_client.py
+
+# Throughput micro-profile (env step vs policy forward)
+python tests/profile_pipeline.py
 ```
+
+Key flags: `--compile cudagraph|inductor|off` (CUDA-graph rollout inference,
+default on), `--servers`, `--envs`, `--total-steps`, `--resume`, `--stage`.

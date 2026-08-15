@@ -20,25 +20,31 @@ from .model import Policy, obs_to_tensors
 @dataclass
 class PPOConfig:
     rollout_len: int = 128  # decision steps per env per iteration
-    minibatch_size: int = 1024
+    minibatch_size: int = 256
     update_epochs: int = 4
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
     ent_coef: float = 0.02
     vf_coef: float = 0.5
-    lr: float = 3e-4
+    vf_clip: float = 1.0  # value-clipping range around rollout values
+    target_kl: float = 0.05  # early-stop an update when exceeded
+    lr: float = 1e-4
     max_grad_norm: float = 0.5
     device: str = "cuda"
 
 
 class RolloutBuffer:
+    """Rollout storage. Spatial planes are quantized to uint8 (values are all
+    in [0, 1]) so a (T, K, 10, 64, 64) buffer costs T*K*40KiB instead of 4x
+    that; update() dequantizes back to f32."""
+
     def __init__(self, rollout_len: int, k: int):
         self.t = rollout_len
         self.k = k
         s = spaces
         self.obs = {
-            "spatial": np.zeros((rollout_len, k, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE), np.float32),
+            "spatial": np.zeros((rollout_len, k, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE), np.uint8),
             "players": np.zeros((rollout_len, k, s.NUM_PLAYER_SLOTS, s.PLAYER_FEATURES), np.float32),
             "global": np.zeros((rollout_len, k, s.GLOBAL_FEATURES), np.float32),
             "action_mask": np.zeros((rollout_len, k, s.NUM_ACTION_TYPES), np.uint8),
@@ -53,15 +59,6 @@ class RolloutBuffer:
         self.rewards = np.zeros((rollout_len, k), np.float32)
         self.dones = np.zeros((rollout_len, k), np.float32)
         self.values = np.zeros((rollout_len, k), np.float32)
-
-    def store(self, step: int, obs: dict, actions, logprobs, rewards, dones, values):
-        for key in self.obs:
-            self.obs[key][step] = obs[key]
-        self.actions[step] = actions
-        self.logprobs[step] = logprobs
-        self.rewards[step] = rewards
-        self.dones[step] = dones
-        self.values[step] = values
 
 
 @dataclass
@@ -90,8 +87,11 @@ class TrainStats:
 
 
 class PPOTrainer:
-    def __init__(self, policy: Policy, cfg: PPOConfig):
+    def __init__(self, policy: Policy, cfg: PPOConfig, rollout_policy=None):
         self.policy = policy.to(cfg.device)
+        # Optional compiled (e.g. torch.compile reduce-overhead) module used
+        # only for rollout inference; shares parameters with self.policy.
+        self.rollout_policy = rollout_policy if rollout_policy is not None else self.policy
         self.cfg = cfg
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
         self.stats = TrainStats()
@@ -102,11 +102,14 @@ class PPOTrainer:
         device = torch.device(cfg.device)
         ep_returns = np.zeros(env.k, np.float32)
         for step in range(cfg.rollout_len):
+            buf.obs["spatial"][step] = (obs["spatial"] * 255).astype(np.uint8)
             for key in buf.obs:
-                buf.obs[key][step] = obs[key]
+                if key != "spatial":
+                    buf.obs[key][step] = obs[key]
             with torch.no_grad():
                 obs_t = obs_to_tensors(obs, device)
-                actions_t, logp_t, value_t = self.policy(obs_t)
+                torch.compiler.cudagraph_mark_step_begin()
+                actions_t, logp_t, value_t = self.rollout_policy(obs_t)
             actions = actions_t.cpu().numpy().astype(np.int32)
             batch = env.step(actions)
             buf.actions[step] = actions
@@ -159,17 +162,22 @@ class PPOTrainer:
             key: buf.obs[key].reshape((t * k,) + buf.obs[key].shape[2:])
             for key in buf.obs
         }
+        flat_spatial_u8 = flat_obs.pop("spatial")
         b_actions = buf.actions.reshape(t * k, 5)
         b_logprobs = buf.logprobs.reshape(t * k)
         b_advantages = advantages.reshape(t * k)
         b_returns = returns.reshape(t * k)
+        b_values = buf.values.reshape(t * k)
 
         idxs = np.arange(t * k)
         clipfracs = []
         approx_kl = 0.0
-        pg_loss = ent = v_loss = 0.0
+        pg_loss = ent = v_loss = None
         n_updates = 0
+        stop = False
         for _ in range(cfg.update_epochs):
+            if stop:
+                break
             np.random.shuffle(idxs)
             for start in range(0, t * k, cfg.minibatch_size):
                 mb = idxs[start : start + cfg.minibatch_size]
@@ -177,11 +185,15 @@ class PPOTrainer:
                     key: torch.as_tensor(flat_obs[key][mb], dtype=torch.float32, device=device)
                     for key in flat_obs
                 }
+                mb_obs["spatial"] = torch.as_tensor(
+                    flat_spatial_u8[mb], dtype=torch.float32, device=device
+                ).div_(255.0)
                 mb_actions = torch.as_tensor(b_actions[mb], device=device)
                 mb_adv = torch.as_tensor(b_advantages[mb], device=device)
                 mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                 mb_ret = torch.as_tensor(b_returns[mb], device=device)
                 mb_old_logp = torch.as_tensor(b_logprobs[mb], device=device)
+                mb_old_value = torch.as_tensor(b_values[mb], device=device)
 
                 logp, entropy, value = self.policy.evaluate(mb_obs, mb_actions)
                 ratio = (logp - mb_old_logp).exp()
@@ -190,10 +202,18 @@ class PPOTrainer:
                     clipfracs.append(
                         ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
                     )
+                if approx_kl > cfg.target_kl:
+                    stop = True
+                    break
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
                 pg_loss = torch.max(pg1, pg2).mean()
-                v_loss = 0.5 * ((value - mb_ret) ** 2).mean()
+                v_clipped = mb_old_value + torch.clamp(
+                    value - mb_old_value, -cfg.vf_clip, cfg.vf_clip
+                )
+                v_loss = 0.5 * torch.max(
+                    (value - mb_ret) ** 2, (v_clipped - mb_ret) ** 2
+                ).mean()
                 ent = entropy.mean()
                 loss = pg_loss - cfg.ent_coef * ent + cfg.vf_coef * v_loss
 
@@ -205,12 +225,14 @@ class PPOTrainer:
 
         self.stats.iterations += 1
         return {
-            "pg_loss": float(pg_loss.item()),
-            "value_loss": float(v_loss.item()),
-            "entropy": float(ent.item()),
+            "pg_loss": float(pg_loss.item()) if pg_loss is not None else 0.0,
+            "value_loss": float(v_loss.item()) if v_loss is not None else 0.0,
+            "entropy": float(ent.item()) if ent is not None else 0.0,
             "approx_kl": float(approx_kl),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "n_updates": n_updates,
+            "mean_value": float(b_values.mean()),
+            "mean_return_target": float(b_returns.mean()),
         }
 
     def save(self, path: str):

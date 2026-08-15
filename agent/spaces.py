@@ -5,7 +5,7 @@ mismatch here silently corrupts training.
 """
 
 SPATIAL_CHANNELS = 10
-SPATIAL_SIZE = 128
+SPATIAL_SIZE = 64
 NUM_PLAYER_SLOTS = 16  # slot 0 is always the agent
 PLAYER_FEATURES = 14
 GLOBAL_FEATURES = 10

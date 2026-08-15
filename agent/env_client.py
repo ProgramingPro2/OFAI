@@ -12,6 +12,7 @@ import socket
 import struct
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -187,3 +188,66 @@ class VecEnv:
             time.sleep(0.2)
         finally:
             self.sock.close()
+
+
+def _concat_obs(obses: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    return {key: np.concatenate([o[key] for o in obses], axis=0) for key in obses[0]}
+
+
+class ShardedVecEnv:
+    """Several EnvServer processes stepped in parallel behind one VecEnv-like
+    interface. Env index i lives on server i // envs_per_server.
+
+    Stepping is I/O-bound on sockets, so a thread pool gives real parallelism
+    despite the GIL; obs from all shards are concatenated so the policy still
+    sees a single batched forward per step.
+    """
+
+    def __init__(
+        self,
+        num_servers: int,
+        base_port: int,
+        envs_per_server: int,
+        connect: bool = False,
+    ):
+        self.envs_per_server = envs_per_server
+        self.k = num_servers * envs_per_server
+        ports = [base_port + i for i in range(num_servers)]
+        self.servers: list[EnvServerProcess] = []
+        if not connect:
+            self.servers = [EnvServerProcess(p) for p in ports]
+        self.clients = [VecEnv("127.0.0.1", p) for p in ports]
+        self.pool = ThreadPoolExecutor(max_workers=num_servers)
+
+    def init(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
+        assert len(env_configs) == self.k
+        eps = self.envs_per_server
+        chunks = [env_configs[i * eps : (i + 1) * eps] for i in range(len(self.clients))]
+        obses = list(self.pool.map(lambda t: t[0].init(t[1]), zip(self.clients, chunks)))
+        return _concat_obs(obses)
+
+    def step(self, actions: np.ndarray) -> StepBatch:
+        assert actions.shape == (self.k, 5)
+        eps = self.envs_per_server
+        chunks = [actions[i * eps : (i + 1) * eps] for i in range(len(self.clients))]
+        batches = list(self.pool.map(lambda t: t[0].step(t[1]), zip(self.clients, chunks)))
+        return StepBatch(
+            obs=_concat_obs([b.obs for b in batches]),
+            rewards=np.concatenate([b.rewards for b in batches]),
+            dones=np.concatenate([b.dones for b in batches]),
+            infos=[info for b in batches for info in b.infos],
+        )
+
+    def reset(self, index: int, seed: str | None = None) -> dict[str, np.ndarray]:
+        shard = index // self.envs_per_server
+        return self.clients[shard].reset(index % self.envs_per_server, seed)
+
+    def close(self):
+        for c in self.clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self.pool.shutdown(wait=False)
+        for s in self.servers:
+            s.stop()

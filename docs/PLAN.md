@@ -37,9 +37,22 @@ private matches.
   second game on the same map inherits the first game's territory. We bypass
   it with `ofai/env/TerrainCache.ts` (caches raw bins, fresh map per game).
 - Full-game sim throughput: ~3000 ticks/s on a small map (single process).
-  Env throughput currently ~30 decision-steps/s (~300 ticks/s) with 4 envs,
-  dominated by Python round-trips and obs extraction; scale by running more
-  env-server processes.
+- Throughput (measured 2026-08-14, RTX 3090): ~300-370 decision-steps/s with
+  4 env servers x 4 envs. Before the perf pass the same setup managed
+  ~25-45 env-steps/s with obs extraction + wire dominating. Key changes:
+  - Obs planes downsampled to 64x64 (was 128x128): 4x less wire/CPU/GPU.
+  - ObsExtractor maintains per-bin counters incrementally from the sim's
+    packed tile deltas (O(changed tiles) per tick instead of O(map)).
+  - ShardedVecEnv: N env-server processes stepped concurrently (threads),
+    one batched GPU forward for all shards.
+  - torch.compile(reduce-overhead) for rollout inference: 12.5ms -> ~1ms
+    per batch of 64 (launch-overhead bound net).
+  - Rollout buffer stores spatial planes as uint8 (values are in [0,1]),
+    4x less RAM; dequantized in update().
+- PPO stability: rollout sampling is mask-consistent with evaluate() (region
+  head conditioned on the sampled action type — a union-mask mismatch here
+  previously produced -1e9 logprobs and exploded KL). Updates use value
+  clipping (±1.0 around rollout values) and KL early-stopping (0.05).
 
 ## Layout
 
@@ -56,7 +69,7 @@ checkpoints/, logs/     training artifacts
 
 ## Observation space (fixed shapes)
 
-- `spatial` [10,128,128] f32 planes: land, mountain, mine, enemy, ally,
+- `spatial` [10,64,64] f32 planes: land, mountain, mine, enemy, ally,
   my border, fallout, defense bonus, my structures, enemy structures.
 - `players` [16,14] f32: slot 0 = agent; others sorted by territory.
   Features: exists, is_self, tiles_frac, log troops, log gold, alive,
@@ -99,8 +112,9 @@ Advance when rolling 100-episode win rate clears the stage threshold.
 ## How to run
 
 ```bash
-# Train (spawns its own env server)
-.venv/bin/python -m agent.train --envs 8 --rollout-len 128 --run-name run1
+# Train (spawns its own env servers: N processes x K games each)
+.venv/bin/python -m agent.train --servers 4 --envs 8 --rollout-len 128 \
+    --run-name run1
 
 # Evaluate a checkpoint
 .venv/bin/python -m agent.eval --ckpt checkpoints/run1/latest.pt \
@@ -111,12 +125,15 @@ cd OpenFrontIO && npx vitest run ofai/tests/env.test.ts
 
 # Python integration test
 .venv/bin/python tests/test_env_client.py
+
+# Throughput micro-profile
+.venv/bin/python tests/profile_pipeline.py
 ```
 
 ## Roadmap (not yet built)
 
-- **Throughput**: shard K envs across N env-server processes; batch obs
-  extraction; consider `Compact` maps for early stages.
+- **Throughput**: async/pipelined collection (overlap GPU forward with env
+  steps); `Compact` maps for early stages; more servers if cores allow.
 - **Imitation pretraining**: replay downloader (`docs/API.md` full-game
   endpoint) -> intent extraction -> behavior cloning before PPO.
 - **Self-play league**: after beating Impossible nations, mix past
