@@ -106,7 +106,7 @@ class Policy(nn.Module):
         nn.init.zeros_(self.head_value.bias)
 
     def _embed(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        return self.trunk(
+        h = self.trunk(
             torch.cat(
                 [
                     self.spatial(obs["spatial"]),
@@ -116,6 +116,10 @@ class Policy(nn.Module):
                 dim=-1,
             )
         )
+        # Bound the embedding so head logits (and their sensitivity to small
+        # input perturbations, e.g. uint8 obs round-trips) cannot grow without
+        # limit; keeps PPO ratio noise small late in training.
+        return torch.tanh(h)
 
     @staticmethod
     def _region_mask(obs: dict[str, torch.Tensor], action_type: torch.Tensor) -> torch.Tensor:

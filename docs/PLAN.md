@@ -37,9 +37,11 @@ private matches.
   second game on the same map inherits the first game's territory. We bypass
   it with `ofai/env/TerrainCache.ts` (caches raw bins, fresh map per game).
 - Full-game sim throughput: ~3000 ticks/s on a small map (single process).
-- Throughput (measured 2026-08-14, RTX 3090): ~300-370 decision-steps/s with
-  4 env servers x 4 envs. Before the perf pass the same setup managed
-  ~25-45 env-steps/s with obs extraction + wire dominating. Key changes:
+- Throughput (measured 2026-08-14, RTX 3090): ~150-350 decision-steps/s
+  with 4 env servers x 4 envs (sim cost scales with in-game activity; a
+  passive policy steps faster than a fighting one). Before the perf pass
+  the same setup managed ~25-45 env-steps/s with obs extraction + wire
+  dominating. Key changes:
   - Obs planes downsampled to 64x64 (was 128x128): 4x less wire/CPU/GPU.
   - ObsExtractor maintains per-bin counters incrementally from the sim's
     packed tile deltas (O(changed tiles) per tick instead of O(map)).
@@ -49,10 +51,24 @@ private matches.
     per batch of 64 (launch-overhead bound net).
   - Rollout buffer stores spatial planes as uint8 (values are in [0,1]),
     4x less RAM; dequantized in update().
-- PPO stability: rollout sampling is mask-consistent with evaluate() (region
-  head conditioned on the sampled action type — a union-mask mismatch here
-  previously produced -1e9 logprobs and exploded KL). Updates use value
-  clipping (±1.0 around rollout values) and KL early-stopping (0.05).
+- PPO stability (debugged over four instrumented runs 2026-08-14):
+  1. Rollout sampling is mask-consistent with evaluate() (region head
+     conditioned on the sampled action type — a union-mask mismatch produced
+     -1e9 logprobs and exploded KL).
+  2. Rollout logprobs are computed on the same uint8-quantized obs stored in
+     the buffer (quantized-vs-raw input mismatch otherwise reads as KL).
+  3. The trunk embedding is tanh-bounded; with an unbounded ReLU trunk the
+     policy eventually drifted enough that the compiled-vs-eager rollout
+     forward micro-divergence (~1e-3) became visible in logprobs, tripping
+     the KL stopper every minibatch and freezing learning (entropy then
+     collapsed via near-clip-boundary noise updates).
+  4. A startup probe compares compiled vs eager logprobs and falls back to
+     eager rollout if they diverge (> 0.02).
+  5. Updates use value clipping (±1.0 around rollout values) and KL
+     early-stopping (0.05). Healthy 150k-step run: entropy stable ~6.9,
+     value_loss ~0.006, KL ~0.02, 16/16 minibatch updates per iter.
+  6. Early curriculum stages use territory-delta shaping (5.0/3.0/2.0) so
+     the reward signal is not ~100% deaths.
 
 ## Layout
 

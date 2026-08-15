@@ -25,7 +25,7 @@ class PPOConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.02
+    ent_coef: float = 0.05
     vf_coef: float = 0.5
     vf_clip: float = 1.0  # value-clipping range around rollout values
     target_kl: float = 0.05  # early-stop an update when exceeded
@@ -89,12 +89,49 @@ class TrainStats:
 class PPOTrainer:
     def __init__(self, policy: Policy, cfg: PPOConfig, rollout_policy=None):
         self.policy = policy.to(cfg.device)
-        # Optional compiled (e.g. torch.compile reduce-overhead) module used
-        # only for rollout inference; shares parameters with self.policy.
-        self.rollout_policy = rollout_policy if rollout_policy is not None else self.policy
         self.cfg = cfg
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
         self.stats = TrainStats()
+        self._rollout_fn = None
+        if rollout_policy is not None:
+            # Sanity: compiled rollout logprobs must match eager evaluate()
+            # logprobs for identical weights/obs/actions, else KL/clip read
+            # garbage. Checked once at startup with a fixed obs batch.
+            probe = self._probe_obs(policy, torch.device(cfg.device))
+            with torch.no_grad():
+                a, lp_c, _ = rollout_policy(probe)
+                lp_e, _, _ = policy.evaluate(probe, a)
+            gap = (lp_c - lp_e).abs().max().item()
+            if gap < 0.02:
+                self._rollout_fn = rollout_policy
+            else:
+                print(
+                    f"[ppo] compiled policy logp gap {gap:.4f} >= 0.02; "
+                    "falling back to eager rollout inference"
+                )
+        if self._rollout_fn is None:
+            self._rollout_fn = self.policy
+
+    @staticmethod
+    def _probe_obs(policy: Policy, device: torch.device) -> dict:
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        s = spaces
+        obs = {
+            "spatial": rng.random((4, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE), dtype=np.float32),
+            "players": rng.random((4, s.NUM_PLAYER_SLOTS, s.PLAYER_FEATURES), dtype=np.float32),
+            "global": rng.random((4, s.GLOBAL_FEATURES), dtype=np.float32),
+            "action_mask": np.ones((4, s.NUM_ACTION_TYPES), np.uint8),
+            "target_mask": np.ones((4, s.NUM_PLAYER_SLOTS), np.uint8),
+            "unit_mask": np.ones((4, s.NUM_UNIT_TYPES), np.uint8),
+            "spawn_regions": np.ones((4, s.NUM_REGIONS), np.uint8),
+            "build_regions": np.ones((4, s.NUM_REGIONS), np.uint8),
+            "boat_regions": np.ones((4, s.NUM_REGIONS), np.uint8),
+        }
+        from .model import obs_to_tensors
+
+        return obs_to_tensors(obs, device)
 
     def collect(self, env, obs: dict, buf: RolloutBuffer) -> dict:
         """Run rollout_len decision steps on the vec env. Returns latest obs."""
@@ -102,14 +139,21 @@ class PPOTrainer:
         device = torch.device(cfg.device)
         ep_returns = np.zeros(env.k, np.float32)
         for step in range(cfg.rollout_len):
-            buf.obs["spatial"][step] = (obs["spatial"] * 255).astype(np.uint8)
+            # Quantize spatial once and feed the *same* values to the policy
+            # and the buffer; otherwise the rollout logprobs (computed on raw
+            # f32) systematically mismatch update-time logprobs (computed on
+            # dequantized obs) and the KL/clip machinery misreads.
+            spatial_u8 = (obs["spatial"] * 255).astype(np.uint8)
+            obs_q = dict(obs)
+            obs_q["spatial"] = spatial_u8.astype(np.float32) / 255.0
+            buf.obs["spatial"][step] = spatial_u8
             for key in buf.obs:
                 if key != "spatial":
                     buf.obs[key][step] = obs[key]
             with torch.no_grad():
-                obs_t = obs_to_tensors(obs, device)
+                obs_t = obs_to_tensors(obs_q, device)
                 torch.compiler.cudagraph_mark_step_begin()
-                actions_t, logp_t, value_t = self.rollout_policy(obs_t)
+                actions_t, logp_t, value_t = self._rollout_fn(obs_t)
             actions = actions_t.cpu().numpy().astype(np.int32)
             batch = env.step(actions)
             buf.actions[step] = actions

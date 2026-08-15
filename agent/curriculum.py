@@ -32,6 +32,7 @@ STAGES: list[Stage] = [
         difficulty="Easy",
         bots=20,
         max_ticks=6000,
+        shaping=5.0,  # dense territory signal; fights degenerate all-death signal
         win_threshold=0.7,
         min_episodes=100,
     ),
@@ -42,6 +43,7 @@ STAGES: list[Stage] = [
         difficulty="Easy",
         bots=20,
         max_ticks=9000,
+        shaping=3.0,
         win_threshold=0.6,
         min_episodes=200,
     ),
@@ -52,6 +54,7 @@ STAGES: list[Stage] = [
         difficulty="Easy",
         bots=40,
         max_ticks=12000,
+        shaping=2.0,
         win_threshold=0.6,
         min_episodes=300,
     ),
