@@ -215,6 +215,21 @@ class VecEnv:
         assert header["type"] == "reset", header
         return _obs_dict(tensors, 1)
 
+    def frame(self, index: int = 0) -> dict:
+        """Full-resolution render of the real game map for the watch viewer."""
+        self.sock.sendall(_encode_frame({"cmd": "frame", "index": index}))
+        header, tensors = _read_frame(self.sock)
+        assert header["type"] == "frame", header
+        w, h = int(header["width"]), int(header["height"])
+        return {
+            "width": w,
+            "height": h,
+            "cells": tensors["cells"].reshape(h, w),
+            "players": header["players"],
+            "units": header["units"],
+            "tick": int(header["tick"]),
+        }
+
     def close(self):
         try:
             self.sock.sendall(_encode_frame({"cmd": "close"}))

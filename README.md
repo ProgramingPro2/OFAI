@@ -32,6 +32,12 @@ python -m agent.train --servers 4 --envs 8 --rollout-len 128 --run-name run1
 # Evaluate
 python -m agent.eval --ckpt checkpoints/run1/latest.pt --episodes 20
 
+# Watch a checkpoint play the real map (full-res territory per player + legend).
+# Interactive window (needs a display):
+python -m agent.watch --ckpt checkpoints/run1/latest.pt --greedy
+# Or render a video (works headless):
+python -m agent.watch --ckpt checkpoints/run1/latest.pt --save match.mp4 --fps 12 --scale 4 --greedy
+
 # Tests
 cd OpenFrontIO && npx vitest run ofai/tests/env.test.ts
 python tests/test_env_client.py
