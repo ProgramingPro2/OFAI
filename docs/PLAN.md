@@ -70,10 +70,19 @@ private matches.
   4. A startup probe compares compiled vs eager logprobs and falls back to
      eager rollout if they diverge (> 0.02).
   5. Updates use value clipping (±1.0 around rollout values) and KL
-     early-stopping (0.05). Healthy 150k-step run: entropy stable ~6.9,
-     value_loss ~0.006, KL ~0.02, 16/16 minibatch updates per iter.
+     early-stopping (0.05).
   6. Early curriculum stages use territory-delta shaping (5.0/3.0/2.0) so
      the reward signal is not ~100% deaths.
+  7. Entropy collapse (run2, 2026-08-15): at ~12.8M steps entropy bled
+     6.9 -> 2.3 over three iterations with per-minibatch KL too small to
+     trip the stopper; once the policy was near-deterministic ratio ≈ 1
+     removed all braking and a 256-minibatch update locked in a degenerate
+     always-die policy for the remaining 27M steps. Fixes: adaptive entropy
+     controller (proportional on `ent_coef` toward `ent_target = 3.0`, the
+     definitive guard against exploration drain) and snapshot-revert on KL
+     spike (a bad update is rolled back, not just stopped). `ent_coef` is
+     checkpointed so resume keeps the tuned value. Recovery point for
+     run2-scale runs: `checkpoints/run2/it700.pt` (pre-collapse).
 
 ## Layout
 

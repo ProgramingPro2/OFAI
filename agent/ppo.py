@@ -25,10 +25,17 @@ class PPOConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.05
+    ent_coef: float = 0.05  # base; adaptively scaled to hold ent_target
     vf_coef: float = 0.5
     vf_clip: float = 1.0  # value-clipping range around rollout values
     target_kl: float = 0.05  # early-stop an update when exceeded
+    # Entropy controller: if measured entropy drifts below ent_target we ramp
+    # ent_coef up (and back down when high). This is what stops the run2-style
+    # exploration collapse (entropy 6.9 -> 2.3 -> dead policy).
+    ent_target: float = 3.0
+    ent_coef_min: float = 0.01
+    ent_coef_max: float = 0.5
+    ent_kp: float = 0.05  # proportional gain per iteration
     lr: float = 1e-4
     max_grad_norm: float = 0.5
     device: str = "cuda"
@@ -92,6 +99,7 @@ class PPOTrainer:
         self.cfg = cfg
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
         self.stats = TrainStats()
+        self.ent_coef = cfg.ent_coef  # adaptive; starts at the base value
         self._rollout_fn = None
         if rollout_policy is not None:
             # Sanity: compiled rollout logprobs must match eager evaluate()
@@ -219,6 +227,10 @@ class PPOTrainer:
         pg_loss = ent = v_loss = None
         n_updates = 0
         stop = False
+        # Snapshot so a KL-blowing update can be reverted instead of just
+        # stopped; the damage then never reaches the live policy.
+        pre_model = {k2: v2.detach().clone() for k2, v2 in self.policy.state_dict().items()}
+        pre_opt = self.opt.state_dict()
         for _ in range(cfg.update_epochs):
             if stop:
                 break
@@ -247,6 +259,10 @@ class PPOTrainer:
                         ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
                     )
                 if approx_kl > cfg.target_kl:
+                    # Revert to the pre-update weights; a step this far off
+                    # the rollout policy corrupts more than it teaches.
+                    self.policy.load_state_dict(pre_model)
+                    self.opt.load_state_dict(pre_opt)
                     stop = True
                     break
                 pg1 = -mb_adv * ratio
@@ -259,13 +275,25 @@ class PPOTrainer:
                     (value - mb_ret) ** 2, (v_clipped - mb_ret) ** 2
                 ).mean()
                 ent = entropy.mean()
-                loss = pg_loss - cfg.ent_coef * ent + cfg.vf_coef * v_loss
+                loss = pg_loss - self.ent_coef * ent + cfg.vf_coef * v_loss
 
                 self.opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
                 self.opt.step()
                 n_updates += 1
+
+        # Adaptive entropy control (SAC-style proportional controller).
+        # Measured entropy below target -> push exploration harder next iter.
+        if ent is not None:
+            err = cfg.ent_target - float(ent.item())
+            self.ent_coef = float(
+                np.clip(
+                    self.ent_coef * (1.0 + cfg.ent_kp * err),
+                    cfg.ent_coef_min,
+                    cfg.ent_coef_max,
+                )
+            )
 
         self.stats.iterations += 1
         return {
@@ -275,6 +303,8 @@ class PPOTrainer:
             "approx_kl": float(approx_kl),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "n_updates": n_updates,
+            "ent_coef": round(self.ent_coef, 5),
+            "reverted": bool(stop),
             "mean_value": float(b_values.mean()),
             "mean_return_target": float(b_returns.mean()),
         }
@@ -285,6 +315,7 @@ class PPOTrainer:
                 "model": self.policy.state_dict(),
                 "optimizer": self.opt.state_dict(),
                 "stats": self.stats.__dict__,
+                "ent_coef": self.ent_coef,
             },
             path,
         )
@@ -295,3 +326,5 @@ class PPOTrainer:
         self.opt.load_state_dict(ckpt["optimizer"])
         for k_, v in ckpt.get("stats", {}).items():
             setattr(self.stats, k_, v)
+        if "ent_coef" in ckpt:
+            self.ent_coef = float(ckpt["ent_coef"])
