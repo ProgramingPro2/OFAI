@@ -32,7 +32,11 @@ STAGES: list[Stage] = [
         difficulty="Easy",
         bots=20,
         max_ticks=6000,
-        shaping=5.0,  # dense territory signal; fights degenerate all-death signal
+        # Territory-delta shaping is now the dominant dense signal (the boat/
+        # build activity bonuses that the policy farmed in run6 were removed).
+        # Bumped 5.0 -> 8.0 so conquering your island is unambiguously the best
+        # dense reward available. See docs/PLAN.md reward section.
+        shaping=8.0,
         win_threshold=0.7,
         min_episodes=100,
     ),

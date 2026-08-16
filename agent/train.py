@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage", type=int, default=0, help="curriculum stage index to start at")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--target-kl", type=float, default=0.3, help="PPO early-stop KL (5-head summed)")
+    p.add_argument("--num-minibatches", type=int, default=8, help="minibatches per epoch; sets minibatch_size")
+    p.add_argument("--update-epochs", type=int, default=4)
+    p.add_argument("--ent-target", type=float, default=3.0, help="adaptive entropy target")
+    p.add_argument("--gamma", type=float, default=0.995, help="discount factor")
     p.add_argument("--eval-every", type=int, default=0, help="iterations between evals (0=off)")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument(
@@ -77,6 +82,10 @@ def main() -> None:
     cfg = PPOConfig(
         rollout_len=args.rollout_len,
         lr=args.lr,
+        target_kl=args.target_kl,
+        update_epochs=args.update_epochs,
+        ent_target=args.ent_target,
+        gamma=args.gamma,
         device=args.device if torch.cuda.is_available() else "cpu",
     )
 
@@ -97,6 +106,15 @@ def main() -> None:
         connect=args.connect,
     )
     total_envs = env.k
+    # Scale minibatch to the rollout batch: num_minibatches per epoch, so
+    # gradient steps/iter = num_minibatches * update_epochs (not 256+). Too
+    # many small-noisy steps per rollout is what blew the KL budget on run5.
+    cfg.minibatch_size = max(1, (cfg.rollout_len * total_envs) // args.num_minibatches)
+    print(
+        f"[train] batch={cfg.rollout_len * total_envs} "
+        f"minibatch={cfg.minibatch_size} (x{args.num_minibatches}/epoch, "
+        f"{args.update_epochs} epochs) target_kl={cfg.target_kl}"
+    )
 
     def reinit_envs() -> dict:
         cfgs = [
@@ -162,7 +180,9 @@ def main() -> None:
                 spawn=f"{st.spawn_rate:.2f}",
                 ret=f"{st.mean_return:.3f}",
                 eps=st.episodes,
-                collect=f"{collect_s:.1f}s",
+                kl=f"{metrics.get('approx_kl', 0.0):.3f}",
+                kept=f"{metrics.get('frac_kept', 0.0) * 100:.0f}%",
+                ev=f"{metrics.get('explained_var', 0.0):.2f}",
                 update=f"{update_s:.1f}s",
             )
             if st.iterations % 5 == 0:

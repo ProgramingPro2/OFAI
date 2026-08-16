@@ -70,7 +70,12 @@ private matches.
   4. A startup probe compares compiled vs eager logprobs and falls back to
      eager rollout if they diverge (> 0.02).
   5. Updates use value clipping (±1.0 around rollout values) and KL
-     early-stopping (0.05).
+     early-stopping. Because the policy is 5-head factorized (logprobs summed
+     across heads), the measured KL is ~5x a single-head policy, so the
+     early-stop budget is target_kl=0.3 (≈0.06/head), not the single-head 0.05.
+     Minibatch size is auto-scaled from the rollout batch
+     (num_minibatches=8 × update_epochs=4 → ≤32 grad steps/iteration) so the
+     KL budget is not blown by sheer step count.
   6. Early curriculum stages use territory-delta shaping (5.0/3.0/2.0) so
      the reward signal is not ~100% deaths.
   7. Entropy collapse (run2, 2026-08-15): at ~12.8M steps entropy bled
@@ -83,6 +88,16 @@ private matches.
      spike (a bad update is rolled back, not just stopped). `ent_coef` is
      checkpointed so resume keeps the tuned value. Recovery point for
      run2-scale runs: `checkpoints/run2/it700.pt` (pre-collapse).
+  8. Update stall (run5, 2026-08-15): 602/611 updates reverted — the 0.05
+     KL budget (5x too tight for a 5-head policy) plus 256 grad
+     steps/iteration blew KL on the first minibatch, and the blanket
+     revert-to-snapshot discarded the critic's learning too (mean_value
+     frozen). Fix: standard PPO early-stop (break the epoch, keep partial
+     updates) for ordinary overshoot, with revert kept only as a
+     *catastrophic* net (KL > target_kl × hard_kl_mult=4.0). Diagnostics
+     added: explained_var (critic health), frac_kept, early_stopped,
+     hard_reverted. Verified on a 400k-step smoke run: frac_kept=1.0, zero
+     reverts, approx_kl ~0.005, mean_return off the -1.0 floor.
 
 ## Layout
 

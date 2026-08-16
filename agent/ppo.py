@@ -28,7 +28,15 @@ class PPOConfig:
     ent_coef: float = 0.05  # base; adaptively scaled to hold ent_target
     vf_coef: float = 0.5
     vf_clip: float = 1.0  # value-clipping range around rollout values
-    target_kl: float = 0.05  # early-stop an update when exceeded
+    # Log-probs are summed across the 5 factorized heads (agent/model.py), so
+    # the measured KL is ~5x a single-head policy. 0.3 here is ~0.06/head,
+    # which is in the normal PPO band. On overshoot we early-stop the epoch
+    # (keeping partial updates), not revert — reverting also discards critic
+    # learning and stalled run5 (602/611 updates thrown away).
+    target_kl: float = 0.3
+    # Safety net only: a KL this far past target means a real divergence
+    # (run2-style blow-up), so revert to the pre-update snapshot.
+    hard_kl_mult: float = 4.0
     # Entropy controller: if measured entropy drifts below ent_target we ramp
     # ent_coef up (and back down when high). This is what stops the run2-style
     # exploration collapse (entropy 6.9 -> 2.3 -> dead policy).
@@ -238,8 +246,10 @@ class PPOTrainer:
         pg_loss = ent = v_loss = None
         n_updates = 0
         stop = False
-        # Snapshot so a KL-blowing update can be reverted instead of just
-        # stopped; the damage then never reaches the live policy.
+        early_stopped = False
+        hard_reverted = False
+        total_minibatches = cfg.update_epochs * max(1, (t * k) // cfg.minibatch_size)
+        # Snapshot retained only as a catastrophic-divergence safety net.
         pre_model = {k2: v2.detach().clone() for k2, v2 in self.policy.state_dict().items()}
         pre_opt = self.opt.state_dict()
         for _ in range(cfg.update_epochs):
@@ -269,11 +279,18 @@ class PPOTrainer:
                     clipfracs.append(
                         ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
                     )
-                if approx_kl > cfg.target_kl:
-                    # Revert to the pre-update weights; a step this far off
-                    # the rollout policy corrupts more than it teaches.
+                if approx_kl > cfg.target_kl * cfg.hard_kl_mult:
+                    # Catastrophic divergence: revert to the pre-update
+                    # snapshot so the damage never reaches the live policy.
                     self.policy.load_state_dict(pre_model)
                     self.opt.load_state_dict(pre_opt)
+                    hard_reverted = True
+                    stop = True
+                    break
+                if approx_kl > cfg.target_kl:
+                    # Standard PPO early-stop: keep the minibatches already
+                    # applied this iteration and stop before the overshoot.
+                    early_stopped = True
                     stop = True
                     break
                 pg1 = -mb_adv * ratio
@@ -307,6 +324,14 @@ class PPOTrainer:
             )
 
         self.stats.iterations += 1
+        # Critic health: fraction of return variance the value fn explains.
+        # ~1.0 = good, ~0 = the critic is no better than predicting the mean.
+        var_ret = float(np.var(b_returns))
+        explained_var = (
+            float(1.0 - np.var(b_returns - b_values) / (var_ret + 1e-8))
+            if var_ret > 0
+            else 0.0
+        )
         return {
             "pg_loss": float(pg_loss.item()) if pg_loss is not None else 0.0,
             "value_loss": float(v_loss.item()) if v_loss is not None else 0.0,
@@ -314,8 +339,11 @@ class PPOTrainer:
             "approx_kl": float(approx_kl),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "n_updates": n_updates,
+            "frac_kept": round(n_updates / max(1, total_minibatches), 4),
             "ent_coef": round(self.ent_coef, 5),
-            "reverted": bool(stop),
+            "early_stopped": bool(early_stopped),
+            "hard_reverted": bool(hard_reverted),
+            "explained_var": round(explained_var, 4),
             "mean_value": float(b_values.mean()),
             "mean_return_target": float(b_returns.mean()),
         }
