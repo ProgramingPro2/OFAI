@@ -38,8 +38,18 @@ python -m agent.train --resume checkpoints/run1/latest.pt --run-name run1 \
 python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 20 \
     --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
 
-# Watch
-python -m agent.watch --ckpt checkpoints/run1/latest.pt --greedy --save match.mp4
+# Watch (sampled policy; recommended fast preview).
+# --frame-skip N still steps the policy every decision but only pulls the
+# full-resolution map / pygame compose every Nth frame (plus first and last).
+# --fps is the display/video rate of those rendered frames, not sim speed.
+# Videos stream to ffmpeg so long 1500x1500 games stay memory-bounded.
+# --greedy is a deterministic diagnostic, not the deployed policy.
+python -m agent.watch --ckpt checkpoints/run1/latest.pt \
+    --scale 1 --fps 60 --frame-skip 5
+
+# Headless video (same sampling)
+python -m agent.watch --ckpt checkpoints/run1/latest.pt \
+    --save match.mp4 --scale 1 --fps 60 --frame-skip 5
 
 # Unit tests (mocked; no EnvServer required)
 python -m pytest tests/test_rl_pipeline.py -q

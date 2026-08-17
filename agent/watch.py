@@ -11,13 +11,16 @@ Legend:
   dots        units (structures, warships, transports)
 
 Examples:
-  # interactive window (needs a display; falls back to a message if none)
-  .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt
+  # interactive window (needs a display; falls back to a message if none).
+  # Sampled policy; --fps is displayed frames, --frame-skip skips full-res
+  # render work between decisions.
+  .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt \
+      --scale 1 --fps 60 --frame-skip 5
 
   # write a video instead (works headless). Default is the sampled policy;
   # --greedy is a deterministic diagnostic, not the deployed policy.
   .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt \
-      --save match.mp4 --episodes 2
+      --save match.mp4 --scale 1 --fps 60 --frame-skip 5 --episodes 2
 
   # specific opponents
   .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt \
@@ -35,6 +38,54 @@ import torch
 from . import spaces
 from .env_client import EnvServerProcess, VecEnv
 from .model import Policy, obs_to_tensors
+
+LEGEND_W = 230  # legend sidebar width in screen px
+STATUS_H = 30  # status bar height in screen px
+
+
+def positive_int(value: str) -> int:
+    """argparse type: integer >= 1."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {parsed}")
+    return parsed
+
+
+def episode_video_path(path: str, ep: int) -> str:
+    """ep 0 keeps the given name; later episodes insert -epN before .mp4."""
+    return path.replace(".mp4", f"-ep{ep}.mp4") if ep > 0 else path
+
+
+def should_render_frame(step: int, done: bool, frame_skip: int) -> bool:
+    """Render the first useful frame, every Nth decision, and the terminal frame."""
+    if step < 1:
+        return False
+    if done:
+        return True
+    return (step - 1) % frame_skip == 0
+
+
+def open_video_writer(path: str, fps: float):
+    """Streaming ffmpeg writer. Caller must close (including on interrupt)."""
+    try:
+        import imageio.v2 as imageio
+    except ImportError:
+        print("imageio not installed; pip install 'imageio[ffmpeg]'")
+        return None
+    return imageio.get_writer(path, fps=max(1, int(fps)), codec="libx264")
+
+
+def close_video_writer(writer) -> None:
+    if writer is None:
+        return
+    try:
+        writer.close()
+    except Exception:
+        pass
+
 
 # Base palette for the color-indexed map. Index 0,1,2 are terrain; 250 is
 # fallout; players start at 3. Colors chosen to read like the OpenFront map.
@@ -59,7 +110,7 @@ def build_palette(n_players: int) -> np.ndarray:
     return pal
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--episodes", type=int, default=1)
@@ -71,11 +122,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bots", type=int, default=20)
     p.add_argument("--max-ticks", type=int, default=12000)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--fps", type=float, default=15.0, help="render speed (decisions/s)")
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=15.0,
+        help="displayed/written frames per second (not simulation decisions)",
+    )
     p.add_argument("--scale", type=int, default=3, help="pixels per map tile")
     p.add_argument("--save", type=str, default="", help="write mp4 instead of a window")
     p.add_argument("--greedy", action="store_true", help="argmax instead of sampling")
-    return p.parse_args()
+    p.add_argument(
+        "--frame-skip",
+        type=positive_int,
+        default=1,
+        metavar="N",
+        help="render every N decisions (always includes first and final frames)",
+    )
+    return p.parse_args(argv)
 
 
 def action_str(a: np.ndarray) -> str:
@@ -130,8 +193,79 @@ def player_centroids(frame: dict) -> dict[int, tuple[float, float]]:
     return {i: (a[0] / a[2], a[1] / a[2]) for i, a in acc.items() if a[2] > 0}
 
 
-def main() -> None:
-    args = parse_args()
+def _load_fonts(pygame, scale: int):
+    """Create fonts once; SysFont is expensive inside the render loop."""
+    return {
+        "name": pygame.font.SysFont("monospace", max(11, scale * 3), bold=True),
+        "legend": pygame.font.SysFont("monospace", 13),
+        "status": pygame.font.SysFont("monospace", 14),
+    }
+
+
+def _draw_scene(pygame, frame: dict, palette: np.ndarray, status: str, scale: int, fonts: dict):
+    """Map + on-map labels + legend sidebar + status bar. Visually unchanged."""
+    rgb = compose_rgb(frame, palette)
+    overlay_units(rgb, frame, palette)
+    centroids = player_centroids(frame)
+
+    mw, mh = frame["width"] * scale, frame["height"] * scale
+    scene = pygame.Surface((mw + LEGEND_W, mh + STATUS_H))
+    scene.fill((15, 15, 20))
+    surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
+    surf = pygame.transform.scale(surf, (mw, mh))
+    scene.blit(surf, (0, 0))
+
+    name_font = fonts["name"]
+    for p in frame["players"]:
+        if p["idx"] not in centroids or not p["alive"]:
+            continue
+        cx, cy = centroids[p["idx"]]
+        label = ("* " if p["isAgent"] else "") + p["name"]
+        text = name_font.render(label, True, (255, 255, 255))
+        shadow = name_font.render(label, True, (0, 0, 0))
+        tx, ty = int(cx * scale), int(cy * scale)
+        rect = text.get_rect(center=(tx, ty))
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            scene.blit(shadow, rect.move(dx, dy))
+        scene.blit(text, rect)
+
+    leg_font = fonts["legend"]
+    y = 8
+    for p in frame["players"]:
+        if y > mh - 18:
+            break
+        swatch = pygame.Rect(mw + 8, y, 14, 14)
+        pygame.draw.rect(scene, palette[3 + p["idx"]].tolist(), swatch)
+        if not p["alive"]:
+            pygame.draw.line(scene, (200, 200, 200), swatch.topleft, swatch.bottomright, 2)
+        marker = "* " if p["isAgent"] else "  "
+        txt = f"{marker}{p['name'][:16]:16} {p['tiles']:>6}"
+        scene.blit(leg_font.render(txt, True, (220, 220, 220)), (mw + 26, y))
+        y += 17
+
+    scene.blit(fonts["status"].render(status, True, (235, 235, 235)), (6, mh + 6))
+    return scene
+
+
+def _obs_status(ep: int, step: int, acts: np.ndarray, obs: dict, tick: int | None = None) -> str:
+    g = obs["global"][0]
+    tick_part = f" tick{tick}" if tick is not None else ""
+    return (
+        f"ep{ep} step{step}{tick_part} | {action_str(acts)}"
+        f" | myTiles={g[2]:.3f} troops={np.expm1(g[3] * 15):.0f}"
+        f" gold={np.expm1(g[4] * 20):.0f}"
+    )
+
+
+def _pump_quit(pygame) -> bool:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return True
+    return False
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     policy = Policy().to(device)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -166,142 +300,109 @@ def main() -> None:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     pygame.init()
     pygame.font.init()
+    fonts = _load_fonts(pygame, args.scale)
 
     server = EnvServerProcess(args.port)
     env = VecEnv("127.0.0.1", args.port)
-    LEGEND_W = 230  # legend sidebar width in screen px
-    STATUS_H = 30   # status bar height in screen px
+    writer = None
+    out_name = ""
 
     try:
         for ep in range(args.episodes):
-            obs = env.init(
-                [
-                    {
-                        "map": args.map,
-                        "mapSize": args.map_size,
-                        "nations": nations,
-                        "difficulty": args.difficulty,
-                        "bots": args.bots,
-                        "seed": f"watch-{ep}-{int(time.time())}",
-                        "maxTicks": args.max_ticks,
-                        "decisionInterval": 10,
-                        "shaping": 0,
-                    }
-                ]
-            )
-            frames = []
-            done = False
-            step = 0
-            legend_printed = False
-            while not done:
-                with torch.no_grad():
-                    obs_t = obs_to_tensors(obs, device)
-                    a, _, _ = policy.act(obs_t, deterministic=args.greedy)
-                    acts = a[0].cpu().numpy().astype(np.int32)
-
-                batch = env.step(acts[None, :])
-                obs = batch.obs
-                done = bool(batch.dones[0])
-                step += 1
-
-                frame = env.frame(0)
-                if not legend_printed:
-                    print(f"--- map {frame['width']}x{frame['height']} players ---")
-                    for p in frame["players"]:
-                        tag = " <== AGENT" if p["isAgent"] else ""
-                        print(f"  color#{p['idx']}: {p['name']}{tag}")
-                    legend_printed = True
-
-                palette = build_palette(len(frame["players"]))
-                rgb = compose_rgb(frame, palette)
-                overlay_units(rgb, frame, palette)
-                centroids = player_centroids(frame)
-
-                g = obs["global"][0]
-                status = (
-                    f"ep{ep} step{step} tick{frame['tick']} | {action_str(acts)}"
-                    f" | myTiles={g[2]:.3f} troops={np.expm1(g[3] * 15):.0f}"
-                    f" gold={np.expm1(g[4] * 20):.0f}"
+            writer = None
+            out_name = episode_video_path(args.save, ep) if args.save else ""
+            try:
+                obs = env.init(
+                    [
+                        {
+                            "map": args.map,
+                            "mapSize": args.map_size,
+                            "nations": nations,
+                            "difficulty": args.difficulty,
+                            "bots": args.bots,
+                            "seed": f"watch-{ep}-{int(time.time())}",
+                            "maxTicks": args.max_ticks,
+                            "decisionInterval": 10,
+                            "shaping": 0,
+                        }
+                    ]
                 )
-                if step % 20 == 0 or done:
-                    print(status)
+                done = False
+                step = 0
+                legend_printed = False
+                batch = None
+                while not done:
+                    with torch.no_grad():
+                        obs_t = obs_to_tensors(obs, device)
+                        a, _, _ = policy.act(obs_t, deterministic=args.greedy)
+                        acts = a[0].cpu().numpy().astype(np.int32)
 
-                # Compose the full scene: map + on-map name labels + legend
-                # sidebar + status bar. One surface, used by both window & video.
-                mw, mh = frame["width"] * args.scale, frame["height"] * args.scale
-                scene = pygame.Surface((mw + LEGEND_W, mh + STATUS_H))
-                scene.fill((15, 15, 20))
-                surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
-                surf = pygame.transform.scale(surf, (mw, mh))
-                scene.blit(surf, (0, 0))
+                    batch = env.step(acts[None, :])
+                    obs = batch.obs
+                    done = bool(batch.dones[0])
+                    step += 1
 
-                # On-map player name at territory centroid (outline for contrast).
-                name_font = pygame.font.SysFont("monospace", max(11, args.scale * 3), bold=True)
-                for p in frame["players"]:
-                    if p["idx"] not in centroids or not p["alive"]:
-                        continue
-                    cx, cy = centroids[p["idx"]]
-                    label = ("* " if p["isAgent"] else "") + p["name"]
-                    text = name_font.render(label, True, (255, 255, 255))
-                    shadow = name_font.render(label, True, (0, 0, 0))
-                    tx, ty = int(cx * args.scale), int(cy * args.scale)
-                    rect = text.get_rect(center=(tx, ty))
-                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        scene.blit(shadow, rect.move(dx, dy))
-                    scene.blit(text, rect)
-
-                # Legend sidebar: color swatch + name + tiles, sorted by size.
-                leg_font = pygame.font.SysFont("monospace", 13)
-                y = 8
-                for p in frame["players"]:
-                    if y > mh - 18:
-                        break
-                    swatch = pygame.Rect(mw + 8, y, 14, 14)
-                    pygame.draw.rect(scene, palette[3 + p["idx"]].tolist(), swatch)
-                    if not p["alive"]:
-                        pygame.draw.line(scene, (200, 200, 200), swatch.topleft, swatch.bottomright, 2)
-                    marker = "* " if p["isAgent"] else "  "
-                    txt = f"{marker}{p['name'][:16]:16} {p['tiles']:>6}"
-                    scene.blit(leg_font.render(txt, True, (220, 220, 220)), (mw + 26, y))
-                    y += 17
-
-                # Status bar at the bottom.
-                scene.blit(
-                    pygame.font.SysFont("monospace", 14).render(
-                        status, True, (235, 235, 235)
-                    ),
-                    (6, mh + 6),
-                )
-
-                if args.save:
-                    arr = pygame.surfarray.array3d(scene)  # [W,H,3]
-                    frames.append(np.transpose(arr, (1, 0, 2)))
-                if interactive:
-                    if screen is None:
-                        screen = pygame.display.set_mode((mw + LEGEND_W, mh + STATUS_H))
-                        pygame.display.set_caption("OFAI watch")
-                    screen.blit(scene, (0, 0))
-                    pygame.display.flip()
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
+                    if not should_render_frame(step, done, args.frame_skip):
+                        if step % 20 == 0:
+                            print(_obs_status(ep, step, acts, obs))
+                        if interactive and _pump_quit(pygame):
                             done = True
-                    time.sleep(1.0 / max(1e-6, args.fps))
+                        continue
 
-            info = batch.infos[0]
-            if info.get("win"):
-                result = "WIN"
-            elif info.get("stageSuccess") or info.get("terminalCause") == "curriculum_success":
-                result = "STAGE"
-            elif info.get("dead"):
-                result = "DEAD"
-            else:
-                result = str(info.get("terminalCause") or "timeout")
-            print(
-                f"episode {ep}: {result} tick={info.get('tick')} "
-                f"kills={info.get('kills')} tilesFrac={info.get('tilesFrac'):.3f}"
-            )
-            if args.save and frames:
-                _write_video(args.save, frames, args.fps, ep)
+                    frame = env.frame(0)
+                    if not legend_printed:
+                        print(f"--- map {frame['width']}x{frame['height']} players ---")
+                        for p in frame["players"]:
+                            tag = " <== AGENT" if p["isAgent"] else ""
+                            print(f"  color#{p['idx']}: {p['name']}{tag}")
+                        legend_printed = True
+
+                    palette = build_palette(len(frame["players"]))
+                    status = _obs_status(ep, step, acts, obs, tick=frame["tick"])
+                    if step % 20 == 0 or done:
+                        print(status)
+
+                    scene = _draw_scene(pygame, frame, palette, status, args.scale, fonts)
+
+                    if args.save:
+                        if writer is None:
+                            writer = open_video_writer(out_name, args.fps)
+                        if writer is not None:
+                            arr = pygame.surfarray.array3d(scene)  # [W,H,3]
+                            writer.append_data(np.transpose(arr, (1, 0, 2)))
+                    if interactive:
+                        if screen is None:
+                            mw = frame["width"] * args.scale
+                            mh = frame["height"] * args.scale
+                            screen = pygame.display.set_mode((mw + LEGEND_W, mh + STATUS_H))
+                            pygame.display.set_caption("OFAI watch")
+                        screen.blit(scene, (0, 0))
+                        pygame.display.flip()
+                        if _pump_quit(pygame):
+                            done = True
+                        time.sleep(1.0 / max(1e-6, args.fps))
+
+                if batch is not None:
+                    info = batch.infos[0]
+                    if info.get("win"):
+                        result = "WIN"
+                    elif info.get("stageSuccess") or info.get("terminalCause") == "curriculum_success":
+                        result = "STAGE"
+                    elif info.get("dead"):
+                        result = "DEAD"
+                    else:
+                        result = str(info.get("terminalCause") or "timeout")
+                    print(
+                        f"episode {ep}: {result} tick={info.get('tick')} "
+                        f"kills={info.get('kills')} tilesFrac={info.get('tilesFrac'):.3f}"
+                    )
+            finally:
+                if writer is not None:
+                    close_video_writer(writer)
+                    print(f"wrote {out_name}")
+                    writer = None
+    except KeyboardInterrupt:
+        print("\n[watch] interrupted", flush=True)
     finally:
         env.close()
         server.stop()
@@ -311,16 +412,8 @@ def main() -> None:
             pass
 
 
-def _write_video(path: str, frames: list[np.ndarray], fps: float, ep: int) -> None:
-    try:
-        import imageio.v2 as imageio
-    except ImportError:
-        print("imageio not installed; pip install 'imageio[ffmpeg]'")
-        return
-    name = path.replace(".mp4", f"-ep{ep}.mp4") if ep > 0 else path
-    imageio.mimsave(name, frames, fps=max(1, int(fps)), codec="libx264")
-    print(f"wrote {name}")
-
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[watch] interrupted", flush=True)
