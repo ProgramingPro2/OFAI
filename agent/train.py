@@ -121,6 +121,11 @@ def _set_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([_byte_rng(s) for s in state["cuda"]])
 
 
+# Bounded retries for shard death mid-eval. Healthy shards may already
+# have stepped, so a partial attempt is never resumed or merged.
+FIXED_SEED_EVAL_RETRIES = 3
+
+
 def run_fixed_seed_eval(
     policy: Policy,
     env: ShardedVecEnv,
@@ -133,7 +138,39 @@ def run_fixed_seed_eval(
 
     Milestone termination is omitted (`objective=True`) so `win_rate` is the
     core 80% FFA outcome. Stage success is inferred from peak tiles.
+
+    `RolloutInterrupted` is recoverable: discard the entire attempt (do not
+    mix finished episodes or mid-step healthy shards), re-init every eval
+    env with the same fixed seeds, and retry from the beginning.
     """
+    last_exc: RolloutInterrupted | None = None
+    for attempt in range(1, FIXED_SEED_EVAL_RETRIES + 1):
+        try:
+            return _fixed_seed_eval_attempt(
+                policy, env, curriculum, device, n_episodes, seed_prefix
+            )
+        except RolloutInterrupted as exc:
+            last_exc = exc
+            print(
+                f"[eval] {exc}; discarding partial eval "
+                f"(attempt {attempt}/{FIXED_SEED_EVAL_RETRIES}) "
+                f"and retrying from fixed seeds"
+            )
+    raise RuntimeError(
+        f"fixed-seed eval failed after {FIXED_SEED_EVAL_RETRIES} "
+        f"shard-restart attempts ({last_exc})"
+    ) from last_exc
+
+
+def _fixed_seed_eval_attempt(
+    policy: Policy,
+    env: ShardedVecEnv,
+    curriculum: Curriculum,
+    device: torch.device,
+    n_episodes: int,
+    seed_prefix: str,
+) -> dict:
+    """One clean eval pass. Accumulators are local; callers retry wholesale."""
     stage = curriculum.stage
     k = min(env.k, n_episodes)
     results = {"deterministic": {}, "sampled": {}}
@@ -531,7 +568,9 @@ def main() -> None:
                         + "\n"
                     )
                 finally:
-                    # Eval re-inits the shared shards; always restore train envs.
+                    # Eval (including retries/failure) re-inits the shared
+                    # shards; always restore train envs and zero episode
+                    # trackers so GAE/returns cannot leak across the eval.
                     obs = reinit_envs()
 
             record = {

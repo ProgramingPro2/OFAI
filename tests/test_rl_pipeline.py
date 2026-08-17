@@ -39,7 +39,13 @@ from agent.ppo import (
     TrainStats,
     classify_outcome,
 )
-from agent.train import _byte_rng, _eval_score, _set_rng_state
+from agent.train import (
+    FIXED_SEED_EVAL_RETRIES,
+    _byte_rng,
+    _eval_score,
+    _set_rng_state,
+    run_fixed_seed_eval,
+)
 
 
 def _fake_info(**kwargs):
@@ -1178,3 +1184,190 @@ def test_old_mastery_version_resets_eval_passes():
     cur3 = Curriculum()
     cur3.load_state_dict(sd)
     assert cur3.consecutive_eval_passes == 1
+
+
+class _EvalInterruptEnv:
+    """Mock ShardedVecEnv: one shard dies after a partial episode finish.
+
+    First attempt, first step: env 0 completes a win (would leak if kept).
+    First attempt, second step: raise RolloutInterrupted.
+    Later inits (retries) finish every env on the first step.
+    """
+
+    def __init__(self, k: int):
+        self.k = k
+        self.init_calls: list[list[str]] = []
+        self.step_calls = 0
+        self._steps_since_init = 0
+        self._interrupted_once = False
+
+    def init(self, cfgs):
+        self.init_calls.append([c["seed"] for c in cfgs])
+        self._steps_since_init = 0
+        return _numpy_obs(self.k)
+
+    def step(self, actions):
+        self.step_calls += 1
+        self._steps_since_init += 1
+        if not self._interrupted_once and self._steps_since_init == 2:
+            self._interrupted_once = True
+            raise RolloutInterrupted([0])
+        win_info = _fake_info(
+            terminalCause="win", win=True, tick=10, peakTilesFrac=0.5, tilesFrac=0.5
+        )
+        if not self._interrupted_once and self._steps_since_init == 1:
+            dones = np.zeros(self.k, dtype=bool)
+            dones[0] = True
+            infos = [win_info, _fake_info(terminalCause="none", win=False, tick=5)]
+            if self.k > 2:
+                infos.extend([_fake_info(terminalCause="none", win=False)] * (self.k - 2))
+                dones = np.zeros(self.k, dtype=bool)
+                dones[0] = True
+        else:
+            dones = np.ones(self.k, dtype=bool)
+            infos = [win_info] * self.k
+        return StepBatch(
+            obs=_numpy_obs(self.k),
+            rewards=np.ones(self.k, np.float32),
+            dones=dones,
+            infos=infos,
+        )
+
+
+class _AlwaysInterruptEnv:
+    def __init__(self, k: int):
+        self.k = k
+        self.init_calls = 0
+        self.step_calls = 0
+
+    def init(self, cfgs):
+        self.init_calls += 1
+        return _numpy_obs(self.k)
+
+    def step(self, actions):
+        self.step_calls += 1
+        raise RolloutInterrupted([1])
+
+
+def test_fixed_seed_eval_retries_same_seeds_no_double_count():
+    """One shard interrupt mid-eval: replay exact seeds, do not keep the
+    finished env-0 win from the discarded attempt."""
+    env = _EvalInterruptEnv(k=2)
+    policy = Policy()
+    cur = Curriculum(start=0)
+    prefix = "v2run1-eval-it140"
+    ev = run_fixed_seed_eval(
+        policy, env, cur, torch.device("cpu"), n_episodes=2, seed_prefix=prefix
+    )
+    assert env._interrupted_once
+    det_seeds = [f"{prefix}-deterministic-0", f"{prefix}-deterministic-1"]
+    samp_seeds = [f"{prefix}-sampled-0", f"{prefix}-sampled-1"]
+    # Failed attempt + full retry both start at deterministic with same seeds.
+    assert env.init_calls[0] == det_seeds
+    assert env.init_calls[1] == det_seeds
+    assert env.init_calls[2] == samp_seeds
+    assert env.init_calls.count(det_seeds) == 2
+    for mode in ("deterministic", "sampled"):
+        assert ev[mode]["episodes"] == 2
+        assert ev[mode]["win_rate"] == pytest.approx(1.0)
+        assert ev[mode]["terminal_causes"] == {"win": 2}
+
+
+def test_fixed_seed_eval_exhausts_retries():
+    env = _AlwaysInterruptEnv(k=2)
+    with pytest.raises(RuntimeError, match="failed after 3 shard-restart"):
+        run_fixed_seed_eval(
+            Policy(),
+            env,
+            Curriculum(start=0),
+            torch.device("cpu"),
+            n_episodes=2,
+            seed_prefix="eval-fail",
+        )
+    assert env.init_calls == FIXED_SEED_EVAL_RETRIES
+    assert env.step_calls == FIXED_SEED_EVAL_RETRIES
+
+
+def test_eval_finally_restores_training_envs_and_trackers():
+    """Shared train shards + episode trackers are restored after eval
+    success, retry, or exhaustion — matching main()'s finally."""
+    env = _EvalInterruptEnv(k=2)
+    trainer = PPOTrainer(
+        Policy(), PPOConfig(rollout_len=2, device="cpu", num_minibatches=1)
+    )
+    trainer._ensure_trackers(2)
+    trainer._trackers[0].ret = 99.0
+    train_cfgs = [{"seed": f"train-e{i}"} for i in range(2)]
+    try:
+        run_fixed_seed_eval(
+            Policy(),
+            env,
+            Curriculum(start=0),
+            torch.device("cpu"),
+            n_episodes=2,
+            seed_prefix="eval-restore",
+        )
+    finally:
+        env.init(train_cfgs)
+        trainer._ensure_trackers(2)
+        trainer.reset_episode_trackers()
+    assert env.init_calls[-1] == ["train-e0", "train-e1"]
+    assert trainer._trackers[0].ret == 0.0
+    assert trainer._trackers[1].ret == 0.0
+
+    fail_env = _AlwaysInterruptEnv(k=2)
+    trainer._trackers[0].ret = 7.0
+    try:
+        run_fixed_seed_eval(
+            Policy(),
+            fail_env,
+            Curriculum(start=0),
+            torch.device("cpu"),
+            n_episodes=2,
+            seed_prefix="eval-restore-fail",
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("exhausted eval must raise")
+    finally:
+        fail_env.init(train_cfgs)
+        trainer.reset_episode_trackers()
+    assert trainer._trackers[0].ret == 0.0
+
+
+def test_collect_interrupt_discards_partial_and_retries():
+    """Training collect path: discard partial rollout / tracker leakage."""
+    cfg = PPOConfig(rollout_len=3, device="cpu", num_minibatches=1, update_epochs=1)
+    trainer = PPOTrainer(Policy(), cfg)
+
+    class CollectInterruptEnv:
+        def __init__(self):
+            self.k = 1
+            self.steps = 0
+            self.interrupted = False
+
+        def step(self, actions):
+            self.steps += 1
+            if not self.interrupted and self.steps == 2:
+                self.interrupted = True
+                raise RolloutInterrupted([0])
+            return StepBatch(
+                obs=_numpy_obs(1),
+                rewards=np.array([1.0], np.float32),
+                dones=np.array([False]),
+                infos=[_fake_info()],
+            )
+
+    env = CollectInterruptEnv()
+    buf = RolloutBuffer(cfg.rollout_len, 1)
+    obs = _numpy_obs(1)
+    with pytest.raises(RolloutInterrupted):
+        trainer.collect(env, obs, buf)
+    assert trainer._trackers[0].ret == pytest.approx(1.0)
+    trainer.reset_episode_trackers()
+    assert trainer._trackers[0].ret == 0.0
+    obs, completed = trainer.collect(env, obs, buf)
+    assert env.interrupted
+    assert completed == []
+    assert trainer._trackers[0].ret == pytest.approx(3.0)
