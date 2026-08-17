@@ -5,7 +5,7 @@ game's built-in AI (Nations/Tribes) using the deterministic TypeScript core
 as the environment and a PyTorch PPO stack as the learner.
 
 See `docs/PLAN.md` for architecture, observation/action spaces, reward
-design, curriculum, and roadmap.
+protocol, curriculum, checkpoint schema, and roadmap.
 
 ## Clone
 
@@ -22,29 +22,34 @@ cd OpenFrontIO && npm install && cd ..
 ## Quick start
 
 ```bash
-# Python deps live in .venv (torch, numpy, msgpack, tqdm, ...)
 source .venv/bin/activate
 
-# Train: --servers N env-server processes x --envs K games each, stepped in
-# parallel. A tqdm progress bar shows sps / winrate / stage live.
-python -m agent.train --servers 4 --envs 8 --rollout-len 128 --run-name run1
+# Train (N env-server processes x K games each). Fresh runs truncate their
+# JSONL logs; resume appends. Episode-level metrics go to logs/<run>.episodes.jsonl.
+python -m agent.train --servers 4 --envs 8 --rollout-len 128 --run-name run1 \
+    --eval-every 25 --total-steps 2000000
 
-# Evaluate
-python -m agent.eval --ckpt checkpoints/run1/latest.pt --episodes 20
+# Resume with an absolute step ceiling, or add more steps beyond the checkpoint:
+python -m agent.train --resume checkpoints/run1/latest.pt --run-name run1 \
+    --additional-steps 1000000
 
-# Watch a checkpoint play the real map (full-res territory per player + legend).
-# Interactive window (needs a display):
-python -m agent.watch --ckpt checkpoints/run1/latest.pt --greedy
-# Or render a video (works headless):
-python -m agent.watch --ckpt checkpoints/run1/latest.pt --save match.mp4 --fps 12 --scale 4 --greedy
+# Evaluate true 80% FFA objective (no milestone termination).
+# Sampled is the deployed policy; --mode deterministic is a greedy diagnostic.
+python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 20 \
+    --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
 
-# Tests
-cd OpenFrontIO && npx vitest run ofai/tests/env.test.ts
+# Watch
+python -m agent.watch --ckpt checkpoints/run1/latest.pt --greedy --save match.mp4
+
+# Unit tests (mocked; no EnvServer required)
+python -m pytest tests/test_rl_pipeline.py -q
+
+# Live env smoke (requires OpenFrontIO env server)
 python tests/test_env_client.py
-
-# Throughput micro-profile (env step vs policy forward)
-python tests/profile_pipeline.py
 ```
 
-Key flags: `--compile cudagraph|inductor|off` (CUDA-graph rollout inference,
-default on), `--servers`, `--envs`, `--total-steps`, `--resume`, `--stage`.
+Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
+`--resume`, `--stage` / `--force-stage`, `--eval-every`, `--target-kl`
+(default 0.03 active-joint), `--ent-target` (default 0.6 mask-normalized
+action-type entropy in [0, 1]). There is no `--compile` path; rollout
+always uses the eager policy.

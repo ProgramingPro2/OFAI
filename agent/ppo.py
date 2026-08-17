@@ -1,12 +1,11 @@
-"""PPO trainer with GAE, clipping, and entropy bonus.
-
-Rollouts are collected on the vectorized env (K games), stored as numpy, and
-consumed in minibatches on GPU. Action logprobs are summed across the five
-factorized heads (standard for factorized discrete policies).
+"""PPO trainer with GAE, clipping, active-head KL/entropy, and truthful
+episode metrics that persist across collect() calls.
 """
 
 from __future__ import annotations
 
+import copy
+from collections import Counter, deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -16,54 +15,59 @@ import torch.nn as nn
 from . import spaces
 from .model import Policy, obs_to_tensors
 
+CHECKPOINT_SCHEMA_VERSION = 2
+
 
 @dataclass
 class PPOConfig:
-    rollout_len: int = 128  # decision steps per env per iteration
-    minibatch_size: int = 256
+    rollout_len: int = 128
+    num_minibatches: int = 8
     update_epochs: int = 4
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.05  # base; adaptively scaled to hold ent_target
+    ent_coef: float = 0.05
     vf_coef: float = 0.5
-    vf_clip: float = 1.0  # value-clipping range around rollout values
-    # Log-probs are summed across the 5 factorized heads (agent/model.py), so
-    # the measured KL is ~5x a single-head policy. 0.3 here is ~0.06/head,
-    # which is in the normal PPO band. On overshoot we early-stop the epoch
-    # (keeping partial updates), not revert — reverting also discards critic
-    # learning and stalled run5 (602/611 updates thrown away).
-    target_kl: float = 0.3
-    # Safety net only: a KL this far past target means a real divergence
-    # (run2-style blow-up), so revert to the pre-update snapshot.
+    vf_clip: float = 1.0
+    # Active-joint KL (action + conditional heads only). Old 5-head summed
+    # target of 0.3 maps to ~0.03 here.
+    target_kl: float = 0.03
     hard_kl_mult: float = 4.0
-    # Entropy controller: if measured entropy drifts below ent_target we ramp
-    # ent_coef up (and back down when high). This is what stops the run2-style
-    # exploration collapse (entropy 6.9 -> 2.3 -> dead policy).
-    ent_target: float = 3.0
+    # Target is mask-normalized action-type entropy in [0, 1]:
+    # H(action) / log(n_legal), averaged over samples with >1 legal
+    # actions. Raw nats are unattainable on land stages (2-4 legal =>
+    # max 0.69-1.39); a 1.5 nat target races ent_coef to the ceiling.
+    # Conditional region entropy is logged only — no bonus.
+    ent_target: float = 0.6
     ent_coef_min: float = 0.01
     ent_coef_max: float = 0.5
-    ent_kp: float = 0.05  # proportional gain per iteration
-    lr: float = 1e-4
+    ent_kp: float = 0.05
+    lr: float = 3e-4
     max_grad_norm: float = 0.5
     device: str = "cuda"
 
 
 class RolloutBuffer:
-    """Rollout storage. Spatial planes are quantized to uint8 (values are all
-    in [0, 1]) so a (T, K, 10, 64, 64) buffer costs T*K*40KiB instead of 4x
-    that; update() dequantizes back to f32."""
+    """Rollout storage. Spatial planes are float16 (values in [0,1])."""
 
     def __init__(self, rollout_len: int, k: int):
         self.t = rollout_len
         self.k = k
         s = spaces
         self.obs = {
-            "spatial": np.zeros((rollout_len, k, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE), np.uint8),
-            "players": np.zeros((rollout_len, k, s.NUM_PLAYER_SLOTS, s.PLAYER_FEATURES), np.float32),
+            "spatial": np.zeros(
+                (rollout_len, k, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE),
+                np.float16,
+            ),
+            "players": np.zeros(
+                (rollout_len, k, s.NUM_PLAYER_SLOTS, s.PLAYER_FEATURES), np.float32
+            ),
             "global": np.zeros((rollout_len, k, s.GLOBAL_FEATURES), np.float32),
             "action_mask": np.zeros((rollout_len, k, s.NUM_ACTION_TYPES), np.uint8),
-            "target_mask": np.zeros((rollout_len, k, s.NUM_PLAYER_SLOTS), np.uint8),
+            "target_masks": np.zeros(
+                (rollout_len, k, s.NUM_ACTION_TYPES, s.NUM_PLAYER_SLOTS), np.uint8
+            ),
+            "quantity_mask": np.zeros((rollout_len, k, s.NUM_QUANTITIES), np.uint8),
             "unit_mask": np.zeros((rollout_len, k, s.NUM_UNIT_TYPES), np.uint8),
             "spawn_regions": np.zeros((rollout_len, k, s.NUM_REGIONS), np.uint8),
             "build_regions": np.zeros((rollout_len, k, s.NUM_REGIONS), np.uint8),
@@ -77,107 +81,403 @@ class RolloutBuffer:
 
 
 @dataclass
+class EpisodeRecord:
+    """One completed episode (spans any number of collect() calls)."""
+
+    env_index: int
+    ret: float
+    decisions: int
+    ticks: int
+    terminal_cause: str
+    win: bool
+    stage_success: bool
+    kills: int
+    final_tiles_frac: float
+    peak_tiles_frac: float
+    spawned: bool
+    reward_terms: dict
+    action_hist: dict
+    accepted: int
+    fizzled: int
+    intent_count: int
+
+
+@dataclass
+class _EnvTracker:
+    ret: float = 0.0
+    decisions: int = 0
+    reward_terms: dict = field(
+        default_factory=lambda: {
+            "terminal": 0.0,
+            "spawn": 0.0,
+            "territory": 0.0,
+            "elimination": 0.0,
+            "total": 0.0,
+        }
+    )
+    action_hist: Counter = field(default_factory=Counter)
+    accepted: int = 0
+    fizzled: int = 0
+    intent_count: int = 0
+
+
+def _empty_tracker() -> _EnvTracker:
+    return _EnvTracker()
+
+
+@dataclass
 class TrainStats:
     iterations: int = 0
     env_steps: int = 0
     episodes: int = 0
     wins: int = 0
+    stage_successes: int = 0
     deaths: int = 0
+    timeouts: int = 0
     kills: int = 0
-    spawns: int = 0  # episodes where the agent actually took land
-    recent_returns: list = field(default_factory=list)
-    recent_wins: list = field(default_factory=list)
-    recent_spawned: list = field(default_factory=list)
+    spawns: int = 0
+    actions_accepted: int = 0
+    actions_total: int = 0
+    # Bounded rolling histories (exact windows, not unbounded lists)
+    ret_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    ret_100: deque = field(default_factory=lambda: deque(maxlen=100))
+    ret_500: deque = field(default_factory=lambda: deque(maxlen=500))
+    wins_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    wins_100: deque = field(default_factory=lambda: deque(maxlen=100))
+    wins_500: deque = field(default_factory=lambda: deque(maxlen=500))
+    stage_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    stage_100: deque = field(default_factory=lambda: deque(maxlen=100))
+    stage_500: deque = field(default_factory=lambda: deque(maxlen=500))
+    kills_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    kills_100: deque = field(default_factory=lambda: deque(maxlen=100))
+    kills_500: deque = field(default_factory=lambda: deque(maxlen=500))
+    len_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    len_100: deque = field(default_factory=lambda: deque(maxlen=100))
+    death_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    timeout_20: deque = field(default_factory=lambda: deque(maxlen=20))
+    accept_20: deque = field(default_factory=lambda: deque(maxlen=20))
     sps: float = 0.0
+
+    def _mean(self, d: deque) -> float:
+        if not d:
+            return 0.0
+        return float(np.mean(d))
 
     @property
     def win_rate(self) -> float:
-        if not self.recent_wins:
-            return 0.0
-        return float(np.mean(self.recent_wins[-100:]))
+        return self._mean(self.wins_100)
+
+    @property
+    def win_rate_20(self) -> float:
+        return self._mean(self.wins_20)
+
+    @property
+    def stage_success_rate(self) -> float:
+        return self._mean(self.stage_100)
+
+    @property
+    def stage_success_rate_20(self) -> float:
+        return self._mean(self.stage_20)
 
     @property
     def mean_return(self) -> float:
-        if not self.recent_returns:
-            return 0.0
-        return float(np.mean(self.recent_returns[-100:]))
+        return self._mean(self.ret_100)
+
+    @property
+    def mean_return_20(self) -> float:
+        return self._mean(self.ret_20)
+
+    @property
+    def kills_per_ep_20(self) -> float:
+        return self._mean(self.kills_20)
+
+    @property
+    def mean_ep_len_20(self) -> float:
+        return self._mean(self.len_20)
+
+    @property
+    def death_rate_20(self) -> float:
+        return self._mean(self.death_20)
+
+    @property
+    def timeout_rate_20(self) -> float:
+        return self._mean(self.timeout_20)
+
+    @property
+    def accept_rate_20(self) -> float:
+        return self._mean(self.accept_20)
 
     @property
     def spawn_rate(self) -> float:
-        if not self.recent_spawned:
+        # Approximate from recent returns window size vs spawn counter rate
+        if self.episodes == 0:
             return 0.0
-        return float(np.mean(self.recent_spawned[-100:]))
+        return self.spawns / self.episodes
+
+    def record_episode(self, ep: EpisodeRecord) -> None:
+        self.episodes += 1
+        cause = ep.terminal_cause
+        won = cause == "win" or (bool(ep.win) and cause != "curriculum_success")
+        stage_ok = bool(ep.stage_success) or cause in ("win", "curriculum_success")
+        if won:
+            stage_ok = True
+        dead = cause == "death"
+        timeout = cause == "timeout"
+        if won:
+            self.wins += 1
+        if stage_ok:
+            self.stage_successes += 1
+        if dead:
+            self.deaths += 1
+        if timeout:
+            self.timeouts += 1
+        self.kills += int(ep.kills)
+        if ep.spawned:
+            self.spawns += 1
+        self.actions_accepted += int(ep.accepted)
+        self.actions_total += int(ep.accepted + ep.fizzled)
+
+        self.ret_20.append(ep.ret)
+        self.ret_100.append(ep.ret)
+        self.ret_500.append(ep.ret)
+        self.wins_20.append(1.0 if won else 0.0)
+        self.wins_100.append(1.0 if won else 0.0)
+        self.wins_500.append(1.0 if won else 0.0)
+        self.stage_20.append(1.0 if stage_ok else 0.0)
+        self.stage_100.append(1.0 if stage_ok else 0.0)
+        self.stage_500.append(1.0 if stage_ok else 0.0)
+        self.kills_20.append(float(ep.kills))
+        self.kills_100.append(float(ep.kills))
+        self.kills_500.append(float(ep.kills))
+        self.len_20.append(float(ep.decisions))
+        self.len_100.append(float(ep.decisions))
+        self.death_20.append(1.0 if dead else 0.0)
+        self.timeout_20.append(1.0 if timeout else 0.0)
+        total_a = ep.accepted + ep.fizzled
+        self.accept_20.append(ep.accepted / total_a if total_a else 1.0)
+
+    def rolling_snapshot(self) -> dict:
+        return {
+            "return_20": round(self.mean_return_20, 4),
+            "return_100": round(self.mean_return, 4),
+            "return_500": round(self._mean(self.ret_500), 4),
+            "kills_ep_20": round(self.kills_per_ep_20, 3),
+            "kills_ep_100": round(self._mean(self.kills_100), 3),
+            "win_20": round(self.win_rate_20, 4),
+            "win_100": round(self.win_rate, 4),
+            "win_500": round(self._mean(self.wins_500), 4),
+            "stage_success_20": round(self.stage_success_rate_20, 4),
+            "stage_success_100": round(self.stage_success_rate, 4),
+            "stage_success_500": round(self._mean(self.stage_500), 4),
+            "death_20": round(self.death_rate_20, 4),
+            "timeout_20": round(self.timeout_rate_20, 4),
+            "ep_len_20": round(self.mean_ep_len_20, 1),
+            "accept_20": round(self.accept_rate_20, 4),
+        }
+
+    def state_dict(self) -> dict:
+        d = {
+            "iterations": self.iterations,
+            "env_steps": self.env_steps,
+            "episodes": self.episodes,
+            "wins": self.wins,
+            "stage_successes": self.stage_successes,
+            "deaths": self.deaths,
+            "timeouts": self.timeouts,
+            "kills": self.kills,
+            "spawns": self.spawns,
+            "actions_accepted": self.actions_accepted,
+            "actions_total": self.actions_total,
+            "sps": self.sps,
+        }
+        for name in (
+            "ret_20",
+            "ret_100",
+            "ret_500",
+            "wins_20",
+            "wins_100",
+            "wins_500",
+            "stage_20",
+            "stage_100",
+            "stage_500",
+            "kills_20",
+            "kills_100",
+            "kills_500",
+            "len_20",
+            "len_100",
+            "death_20",
+            "timeout_20",
+            "accept_20",
+        ):
+            d[name] = list(getattr(self, name))
+        return d
+
+    def load_state_dict(self, d: dict) -> None:
+        for key in (
+            "iterations",
+            "env_steps",
+            "episodes",
+            "wins",
+            "stage_successes",
+            "deaths",
+            "timeouts",
+            "kills",
+            "spawns",
+            "actions_accepted",
+            "actions_total",
+            "sps",
+        ):
+            if key in d:
+                setattr(self, key, d[key])
+        maxlen = {
+            "ret_20": 20,
+            "ret_100": 100,
+            "ret_500": 500,
+            "wins_20": 20,
+            "wins_100": 100,
+            "wins_500": 500,
+            "stage_20": 20,
+            "stage_100": 100,
+            "stage_500": 500,
+            "kills_20": 20,
+            "kills_100": 100,
+            "kills_500": 500,
+            "len_20": 20,
+            "len_100": 100,
+            "death_20": 20,
+            "timeout_20": 20,
+            "accept_20": 20,
+        }
+        for name, ml in maxlen.items():
+            if name in d:
+                setattr(self, name, deque(d[name], maxlen=ml))
+
+
+def _normalize_advantages(adv: torch.Tensor) -> torch.Tensor:
+    adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
+    std = adv.std()
+    if not torch.isfinite(std) or float(std) < 1e-6:
+        return adv - adv.mean()
+    return (adv - adv.mean()) / (std + 1e-8)
+
+
+def _terminal_cause(info: dict) -> str:
+    cause = info.get("terminalCause") or info.get("terminal_cause")
+    if cause in spaces.TERMINAL_CAUSES:
+        return str(cause)
+    if info.get("stageSuccess") or info.get("stage_success"):
+        # Legacy servers that labeled a milestone as win=true.
+        if not info.get("win"):
+            return "curriculum_success"
+    if info.get("win"):
+        return "win"
+    if info.get("dead"):
+        return "death"
+    if info.get("spawned") is False or info.get("noSpawn"):
+        return "no_spawn"
+    return "timeout"
+
+
+def classify_outcome(
+    info: dict, stage_tiles_frac: float = 0.0
+) -> tuple[str, bool, bool]:
+    """Return (cause, core_win, stage_success).
+
+    `core_win` is a real FFA win only. A curriculum tile milestone is
+    `curriculum_success` / stage_success and never counts as a win.
+    When eval omits milestone termination, stage_success is also true if
+    peak tiles reached `stage_tiles_frac`.
+    """
+    cause = _terminal_cause(info)
+    win = cause == "win"
+    if cause == "curriculum_success":
+        win = False
+    elif bool(info.get("win")) and cause not in (
+        "curriculum_success",
+        "death",
+        "loss_alive",
+        "timeout",
+        "no_spawn",
+    ):
+        win = True
+        cause = "win"
+    peak = float(info.get("peakTilesFrac", info.get("peak_tiles_frac", 0.0)))
+    stage = (
+        bool(info.get("stageSuccess") or info.get("stage_success"))
+        or cause in ("win", "curriculum_success")
+        or (stage_tiles_frac > 0.0 and peak >= stage_tiles_frac)
+        or win
+    )
+    return cause, win, stage
+
+
+def _reward_terms(info: dict, step_reward: float) -> dict:
+    rt = info.get("rewardTerms") or info.get("reward_terms") or {}
+    return {
+        "terminal": float(rt.get("terminal", 0.0)),
+        "spawn": float(rt.get("spawn", 0.0)),
+        "territory": float(rt.get("territory", 0.0)),
+        "elimination": float(rt.get("elimination", 0.0)),
+        "total": float(rt.get("total", step_reward)),
+    }
 
 
 class PPOTrainer:
-    def __init__(self, policy: Policy, cfg: PPOConfig, rollout_policy=None):
+    def __init__(self, policy: Policy, cfg: PPOConfig):
         self.policy = policy.to(cfg.device)
         self.cfg = cfg
-        self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
+        self.opt = torch.optim.Adam(
+            policy.parameters(), lr=cfg.lr, betas=(0.9, 0.95), eps=1e-5
+        )
         self.stats = TrainStats()
-        self.ent_coef = cfg.ent_coef  # adaptive; starts at the base value
-        self._rollout_fn = None
-        if rollout_policy is not None:
-            # Sanity: compiled rollout logprobs must match eager evaluate()
-            # logprobs for identical weights/obs/actions, else KL/clip read
-            # garbage. Checked once at startup with a fixed obs batch.
-            probe = self._probe_obs(policy, torch.device(cfg.device))
-            with torch.no_grad():
-                a, lp_c, _ = rollout_policy(probe)
-                lp_e, _, _ = policy.evaluate(probe, a)
-            gap = (lp_c - lp_e).abs().max().item()
-            if gap < 0.02:
-                self._rollout_fn = rollout_policy
-            else:
-                print(
-                    f"[ppo] compiled policy logp gap {gap:.4f} >= 0.02; "
-                    "falling back to eager rollout inference"
-                )
-        if self._rollout_fn is None:
-            self._rollout_fn = self.policy
+        self.ent_coef = cfg.ent_coef
+        self._trackers: list[_EnvTracker] = []
+        self._k = 0
+        self._legal_counts = np.zeros(spaces.NUM_ACTION_TYPES, np.int64)
+        self._legal_n = 0
 
-    @staticmethod
-    def _probe_obs(policy: Policy, device: torch.device) -> dict:
-        import numpy as np
+    def _ensure_trackers(self, k: int) -> None:
+        if self._k != k or len(self._trackers) != k:
+            self._trackers = [_empty_tracker() for _ in range(k)]
+            self._k = k
 
-        rng = np.random.default_rng(0)
-        s = spaces
-        obs = {
-            "spatial": rng.random((4, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE), dtype=np.float32),
-            "players": rng.random((4, s.NUM_PLAYER_SLOTS, s.PLAYER_FEATURES), dtype=np.float32),
-            "global": rng.random((4, s.GLOBAL_FEATURES), dtype=np.float32),
-            "action_mask": np.ones((4, s.NUM_ACTION_TYPES), np.uint8),
-            "target_mask": np.ones((4, s.NUM_PLAYER_SLOTS), np.uint8),
-            "unit_mask": np.ones((4, s.NUM_UNIT_TYPES), np.uint8),
-            "spawn_regions": np.ones((4, s.NUM_REGIONS), np.uint8),
-            "build_regions": np.ones((4, s.NUM_REGIONS), np.uint8),
-            "boat_regions": np.ones((4, s.NUM_REGIONS), np.uint8),
+    def reset_episode_trackers(self) -> None:
+        """Call after env reinit or RolloutInterrupted."""
+        self._trackers = [_empty_tracker() for _ in range(self._k)] if self._k else []
+
+    def take_legal_frac(self) -> dict[str, float]:
+        """Per-iteration fraction of decisions where each action type was legal."""
+        n = max(1, int(self._legal_n))
+        out = {
+            spaces.ACTION_NAMES[i]: round(float(self._legal_counts[i]) / n, 4)
+            for i in range(spaces.NUM_ACTION_TYPES)
         }
-        from .model import obs_to_tensors
+        self._legal_counts[:] = 0
+        self._legal_n = 0
+        return out
 
-        return obs_to_tensors(obs, device)
+    def collect(self, env, obs: dict, buf: RolloutBuffer) -> tuple[dict, list[EpisodeRecord]]:
+        """Run rollout_len decision steps. Returns (latest_obs, completed episodes).
 
-    def collect(self, env, obs: dict, buf: RolloutBuffer) -> dict:
-        """Run rollout_len decision steps on the vec env. Returns latest obs."""
+        Raises RolloutInterrupted from the env; caller must discard the partial
+        buffer and reset episode trackers.
+        """
         cfg = self.cfg
         device = torch.device(cfg.device)
-        ep_returns = np.zeros(env.k, np.float32)
+        self._ensure_trackers(env.k)
+        completed: list[EpisodeRecord] = []
+
         for step in range(cfg.rollout_len):
-            # Quantize spatial once and feed the *same* values to the policy
-            # and the buffer; otherwise the rollout logprobs (computed on raw
-            # f32) systematically mismatch update-time logprobs (computed on
-            # dequantized obs) and the KL/clip machinery misreads.
-            spatial_u8 = (obs["spatial"] * 255).astype(np.uint8)
+            spatial_f16 = obs["spatial"].astype(np.float16)
             obs_q = dict(obs)
-            obs_q["spatial"] = spatial_u8.astype(np.float32) / 255.0
-            buf.obs["spatial"][step] = spatial_u8
+            obs_q["spatial"] = spatial_f16.astype(np.float32)
+            buf.obs["spatial"][step] = spatial_f16
             for key in buf.obs:
                 if key != "spatial":
                     buf.obs[key][step] = obs[key]
             with torch.no_grad():
                 obs_t = obs_to_tensors(obs_q, device)
-                torch.compiler.cudagraph_mark_step_begin()
-                actions_t, logp_t, value_t = self._rollout_fn(obs_t)
+                actions_t, logp_t, value_t = self.policy.act(obs_t, deterministic=False)
             actions = actions_t.cpu().numpy().astype(np.int32)
             batch = env.step(actions)
             buf.actions[step] = actions
@@ -185,35 +485,72 @@ class PPOTrainer:
             buf.values[step] = value_t.cpu().numpy()
             buf.rewards[step] = batch.rewards
             buf.dones[step] = batch.dones.astype(np.float32)
+            mask = np.asarray(obs["action_mask"], dtype=np.int64).reshape(
+                env.k, spaces.NUM_ACTION_TYPES
+            )
+            self._legal_n += env.k
+            self._legal_counts += mask.sum(axis=0)
 
-            ep_returns += batch.rewards
-            for i, done in enumerate(batch.dones):
-                if done:
-                    info = batch.infos[i]
-                    self.stats.episodes += 1
-                    self.stats.recent_returns.append(float(ep_returns[i]))
-                    self.stats.recent_wins.append(1.0 if info.get("win") else 0.0)
-                    spawned = 1.0 if info.get("spawned") else 0.0
-                    self.stats.recent_spawned.append(spawned)
-                    self.stats.spawns += int(spawned)
-                    self.stats.kills += int(info.get("kills", 0))
-                    if info.get("dead"):
-                        self.stats.deaths += 1
-                    ep_returns[i] = 0.0
+            for i in range(env.k):
+                tr = self._trackers[i]
+                info = batch.infos[i]
+                r = float(batch.rewards[i])
+                tr.ret += r
+                tr.decisions += 1
+                terms = _reward_terms(info, r)
+                for k_, v_ in terms.items():
+                    tr.reward_terms[k_] = tr.reward_terms.get(k_, 0.0) + v_
+                at = int(actions[i, 0])
+                tr.action_hist[spaces.ACTION_NAMES[at]] += 1
+                accepted = info.get("actionAccepted")
+                if accepted is None:
+                    accepted = info.get("action_accepted", True)
+                if accepted:
+                    tr.accepted += 1
+                else:
+                    tr.fizzled += 1
+                tr.intent_count += int(info.get("intentCount", info.get("intent_count", 1)))
+
+                if batch.dones[i]:
+                    cause, won, stage_ok = classify_outcome(info)
+                    ep = EpisodeRecord(
+                        env_index=i,
+                        ret=float(tr.ret),
+                        decisions=int(tr.decisions),
+                        ticks=int(info.get("tick", 0)),
+                        terminal_cause=cause,
+                        win=won,
+                        stage_success=stage_ok,
+                        kills=int(info.get("kills", 0)),
+                        final_tiles_frac=float(info.get("tilesFrac", info.get("tiles_frac", 0.0))),
+                        peak_tiles_frac=float(
+                            info.get("peakTilesFrac", info.get("peak_tiles_frac", 0.0))
+                        ),
+                        spawned=bool(info.get("spawned", True)),
+                        reward_terms=dict(tr.reward_terms),
+                        action_hist=dict(tr.action_hist),
+                        accepted=tr.accepted,
+                        fizzled=tr.fizzled,
+                        intent_count=tr.intent_count,
+                    )
+                    self.stats.record_episode(ep)
+                    completed.append(ep)
+                    self._trackers[i] = _empty_tracker()
             obs = batch.obs
+
         self.stats.env_steps += cfg.rollout_len * env.k
-        return obs
+        return obs, completed
 
     def update(self, buf: RolloutBuffer, last_obs: dict) -> dict:
         cfg = self.cfg
         device = torch.device(cfg.device)
         t, k = buf.actions.shape[:2]
+        n = t * k
 
         with torch.no_grad():
             last_obs_t = obs_to_tensors(last_obs, device)
             last_value = self.policy.logits(last_obs_t)["value"].cpu().numpy()
 
-        # GAE (buf.dones[s] marks the transition after step s's action)
         advantages = np.zeros((t, k), np.float32)
         lastgaelam = np.zeros(k, np.float32)
         for step in reversed(range(t)):
@@ -228,71 +565,92 @@ class PPOTrainer:
             advantages[step] = lastgaelam
         returns = advantages + buf.values
 
-        # Flatten (T, K, ...) -> (T*K, ...)
         flat_obs = {
-            key: buf.obs[key].reshape((t * k,) + buf.obs[key].shape[2:])
-            for key in buf.obs
+            key: buf.obs[key].reshape((n,) + buf.obs[key].shape[2:]) for key in buf.obs
         }
-        flat_spatial_u8 = flat_obs.pop("spatial")
-        b_actions = buf.actions.reshape(t * k, 5)
-        b_logprobs = buf.logprobs.reshape(t * k)
-        b_advantages = advantages.reshape(t * k)
-        b_returns = returns.reshape(t * k)
-        b_values = buf.values.reshape(t * k)
+        flat_spatial_f16 = flat_obs.pop("spatial")
+        b_actions = buf.actions.reshape(n, 5)
+        b_logprobs = buf.logprobs.reshape(n)
+        b_advantages = advantages.reshape(n)
+        b_returns = returns.reshape(n)
+        b_values = buf.values.reshape(n)
 
-        idxs = np.arange(t * k)
-        clipfracs = []
+        idxs = np.arange(n)
+        clipfracs: list[float] = []
         approx_kl = 0.0
+        running_kl_sum = 0.0
+        running_kl_count = 0
         pg_loss = ent = v_loss = None
+        action_ent = cond_ent = action_ent_norm = action_ent_max = measured_norm = None
         n_updates = 0
         stop = False
         early_stopped = False
         hard_reverted = False
-        total_minibatches = cfg.update_epochs * max(1, (t * k) // cfg.minibatch_size)
-        # Snapshot retained only as a catastrophic-divergence safety net.
+        total_minibatches = cfg.update_epochs * max(1, cfg.num_minibatches)
+
         pre_model = {k2: v2.detach().clone() for k2, v2 in self.policy.state_dict().items()}
-        pre_opt = self.opt.state_dict()
+        pre_opt = copy.deepcopy(self.opt.state_dict())
+        pre_ent_coef = self.ent_coef
+
         for _ in range(cfg.update_epochs):
             if stop:
                 break
             np.random.shuffle(idxs)
-            for start in range(0, t * k, cfg.minibatch_size):
-                mb = idxs[start : start + cfg.minibatch_size]
+            # Exact requested partition (covers all samples even when n % mb != 0)
+            mb_splits = np.array_split(idxs, cfg.num_minibatches)
+            epoch_kl_sum = 0.0
+            epoch_kl_count = 0
+            for mb in mb_splits:
+                if stop:
+                    break
+                if len(mb) == 0:
+                    continue
                 mb_obs = {
                     key: torch.as_tensor(flat_obs[key][mb], dtype=torch.float32, device=device)
                     for key in flat_obs
                 }
                 mb_obs["spatial"] = torch.as_tensor(
-                    flat_spatial_u8[mb], dtype=torch.float32, device=device
-                ).div_(255.0)
+                    flat_spatial_f16[mb], dtype=torch.float32, device=device
+                )
                 mb_actions = torch.as_tensor(b_actions[mb], device=device)
-                mb_adv = torch.as_tensor(b_advantages[mb], device=device)
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                mb_adv = _normalize_advantages(
+                    torch.as_tensor(b_advantages[mb], device=device)
+                )
                 mb_ret = torch.as_tensor(b_returns[mb], device=device)
                 mb_old_logp = torch.as_tensor(b_logprobs[mb], device=device)
                 mb_old_value = torch.as_tensor(b_values[mb], device=device)
 
-                logp, entropy, value = self.policy.evaluate(mb_obs, mb_actions)
+                logp, entropy, value, extras = self.policy.evaluate(mb_obs, mb_actions)
                 ratio = (logp - mb_old_logp).exp()
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - (logp - mb_old_logp)).mean().item()
                     clipfracs.append(
                         ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
                     )
+                    epoch_kl_sum += approx_kl * len(mb)
+                    epoch_kl_count += len(mb)
+                    running_kl_sum += approx_kl * len(mb)
+                    running_kl_count += len(mb)
+
                 if approx_kl > cfg.target_kl * cfg.hard_kl_mult:
-                    # Catastrophic divergence: revert to the pre-update
-                    # snapshot so the damage never reaches the live policy.
                     self.policy.load_state_dict(pre_model)
                     self.opt.load_state_dict(pre_opt)
+                    self.ent_coef = pre_ent_coef
                     hard_reverted = True
+                    n_updates = 0
                     stop = True
                     break
-                if approx_kl > cfg.target_kl:
-                    # Standard PPO early-stop: keep the minibatches already
-                    # applied this iteration and stop before the overshoot.
+
+                agg_kl = (
+                    running_kl_sum / max(1, running_kl_count)
+                    if running_kl_count
+                    else approx_kl
+                )
+                if agg_kl > cfg.target_kl:
                     early_stopped = True
                     stop = True
                     break
+
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
                 pg_loss = torch.max(pg1, pg2).mean()
@@ -303,7 +661,20 @@ class PPOTrainer:
                     (value - mb_ret) ** 2, (v_clipped - mb_ret) ** 2
                 ).mean()
                 ent = entropy.mean()
-                loss = pg_loss - self.ent_coef * ent + cfg.vf_coef * v_loss
+                action_ent = extras["action_entropy"].mean()
+                cond_ent = extras["cond_entropy"].mean()
+                multi = extras["action_entropy_multi"]
+                if bool(multi.any()):
+                    measured_norm = extras["action_entropy_norm"][multi].mean()
+                    action_ent_max = extras["action_entropy_max"][multi].mean()
+                else:
+                    # No multi-choice samples: fully satisfied, do not demand
+                    # more exploration.
+                    measured_norm = extras["action_entropy_norm"].new_tensor(1.0)
+                    action_ent_max = extras["action_entropy_max"].new_tensor(0.0)
+                # Bonus the multi-sample normalized action-type head only.
+                # Raw nats and 1024-way region entropy must not drive this.
+                loss = pg_loss - self.ent_coef * measured_norm + cfg.vf_coef * v_loss
 
                 self.opt.zero_grad()
                 loss.backward()
@@ -311,10 +682,11 @@ class PPOTrainer:
                 self.opt.step()
                 n_updates += 1
 
-        # Adaptive entropy control (SAC-style proportional controller).
-        # Measured entropy below target -> push exploration harder next iter.
-        if ent is not None:
-            err = cfg.ent_target - float(ent.item())
+        if hard_reverted:
+            n_updates = 0
+        elif action_ent is not None and not hard_reverted:
+            measured = float(measured_norm.item())
+            err = cfg.ent_target - measured
             self.ent_coef = float(
                 np.clip(
                     self.ent_coef * (1.0 + cfg.ent_kp * err),
@@ -324,19 +696,24 @@ class PPOTrainer:
             )
 
         self.stats.iterations += 1
-        # Critic health: fraction of return variance the value fn explains.
-        # ~1.0 = good, ~0 = the critic is no better than predicting the mean.
         var_ret = float(np.var(b_returns))
         explained_var = (
             float(1.0 - np.var(b_returns - b_values) / (var_ret + 1e-8))
             if var_ret > 0
             else 0.0
         )
+        final_kl = (
+            running_kl_sum / max(1, running_kl_count) if running_kl_count else float(approx_kl)
+        )
         return {
             "pg_loss": float(pg_loss.item()) if pg_loss is not None else 0.0,
             "value_loss": float(v_loss.item()) if v_loss is not None else 0.0,
             "entropy": float(ent.item()) if ent is not None else 0.0,
-            "approx_kl": float(approx_kl),
+            "action_entropy": float(action_ent.item()) if action_ent is not None else 0.0,
+            "action_entropy_norm": float(measured_norm.item()) if measured_norm is not None else 0.0,
+            "action_entropy_max": float(action_ent_max.item()) if action_ent_max is not None else 0.0,
+            "cond_entropy": float(cond_ent.item()) if cond_ent is not None else 0.0,
+            "approx_kl": float(final_kl),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "n_updates": n_updates,
             "frac_kept": round(n_updates / max(1, total_minibatches), 4),
@@ -348,22 +725,60 @@ class PPOTrainer:
             "mean_return_target": float(b_returns.mean()),
         }
 
-    def save(self, path: str):
-        torch.save(
-            {
-                "model": self.policy.state_dict(),
-                "optimizer": self.opt.state_dict(),
-                "stats": self.stats.__dict__,
-                "ent_coef": self.ent_coef,
+    def save(self, path: str, extra: dict | None = None):
+        payload = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "model": self.policy.state_dict(),
+            "optimizer": self.opt.state_dict(),
+            "stats": self.stats.state_dict(),
+            "ent_coef": self.ent_coef,
+            "hyperparameters": {
+                "lr": self.cfg.lr,
+                "gamma": self.cfg.gamma,
+                "gae_lambda": self.cfg.gae_lambda,
+                "clip_coef": self.cfg.clip_coef,
+                "target_kl": self.cfg.target_kl,
+                "ent_target": self.cfg.ent_target,
+                "vf_coef": self.cfg.vf_coef,
+                "update_epochs": self.cfg.update_epochs,
+                "num_minibatches": self.cfg.num_minibatches,
+                "rollout_len": self.cfg.rollout_len,
             },
-            path,
-        )
+            "metrics": self.stats.rolling_snapshot(),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
 
-    def load(self, path: str):
+    def load(self, path: str) -> dict:
         ckpt = torch.load(path, map_location=self.cfg.device, weights_only=False)
-        self.policy.load_state_dict(ckpt["model"])
-        self.opt.load_state_dict(ckpt["optimizer"])
-        for k_, v in ckpt.get("stats", {}).items():
-            setattr(self.stats, k_, v)
+        ver = int(ckpt.get("schema_version", 1))
+        if ver < CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"checkpoint {path!r} is schema v{ver}; this trainer requires "
+                f"schema v{CHECKPOINT_SCHEMA_VERSION} (pointer target head + "
+                "active-head policy). Start a fresh run."
+            )
+        try:
+            self.policy.load_state_dict(ckpt["model"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"checkpoint {path!r} does not match the current policy "
+                f"architecture (pointer target + active-head). {exc}"
+            ) from exc
+        if "optimizer" in ckpt:
+            self.opt.load_state_dict(ckpt["optimizer"])
+        if "stats" in ckpt:
+            stats = ckpt["stats"]
+            if isinstance(stats, dict) and "ret_20" in stats:
+                self.stats.load_state_dict(stats)
+            else:
+                # Legacy flat TrainStats.__dict__
+                for k_, v in stats.items():
+                    if hasattr(self.stats, k_) and not isinstance(
+                        getattr(self.stats, k_), deque
+                    ):
+                        setattr(self.stats, k_, v)
         if "ent_coef" in ckpt:
             self.ent_coef = float(ckpt["ent_coef"])
+        return ckpt

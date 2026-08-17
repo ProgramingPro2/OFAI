@@ -14,7 +14,8 @@ Examples:
   # interactive window (needs a display; falls back to a message if none)
   .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt
 
-  # write a video instead (works headless)
+  # write a video instead (works headless). Default is the sampled policy;
+  # --greedy is a deterministic diagnostic, not the deployed policy.
   .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt \
       --save match.mp4 --episodes 2
 
@@ -195,15 +196,8 @@ def main() -> None:
             while not done:
                 with torch.no_grad():
                     obs_t = obs_to_tensors(obs, device)
-                    logits = policy.logits(obs_t)
-                    if args.greedy:
-                        heads = ["action", "target", "region", "quantity", "unit"]
-                        acts = torch.stack(
-                            [logits[h].argmax(dim=-1) for h in heads], dim=1
-                        )[0].cpu().numpy().astype(np.int32)
-                    else:
-                        a, _, _ = policy(obs_t)
-                        acts = a[0].cpu().numpy().astype(np.int32)
+                    a, _, _ = policy.act(obs_t, deterministic=args.greedy)
+                    acts = a[0].cpu().numpy().astype(np.int32)
 
                 batch = env.step(acts[None, :])
                 obs = batch.obs
@@ -294,7 +288,14 @@ def main() -> None:
                     time.sleep(1.0 / max(1e-6, args.fps))
 
             info = batch.infos[0]
-            result = "WIN" if info.get("win") else "DEAD" if info.get("dead") else "timeout"
+            if info.get("win"):
+                result = "WIN"
+            elif info.get("stageSuccess") or info.get("terminalCause") == "curriculum_success":
+                result = "STAGE"
+            elif info.get("dead"):
+                result = "DEAD"
+            else:
+                result = str(info.get("terminalCause") or "timeout")
             print(
                 f"episode {ep}: {result} tick={info.get('tick')} "
                 f"kills={info.get('kills')} tilesFrac={info.get('tilesFrac'):.3f}"

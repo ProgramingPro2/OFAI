@@ -46,6 +46,14 @@ def main() -> None:
         assert obs["players"].shape == (2, spaces.NUM_PLAYER_SLOTS, spaces.PLAYER_FEATURES)
         assert obs["global"].shape == (2, spaces.GLOBAL_FEATURES)
         assert obs["action_mask"].shape == (2, spaces.NUM_ACTION_TYPES)
+        assert obs["target_masks"].shape == (
+            2,
+            spaces.NUM_ACTION_TYPES,
+            spaces.NUM_PLAYER_SLOTS,
+        )
+        assert obs["target_masks"].dtype == np.uint8
+        assert obs["quantity_mask"].shape == (2, spaces.NUM_QUANTITIES)
+        assert obs["quantity_mask"].dtype == np.uint8
         assert obs["spawn_regions"].shape == (2, spaces.NUM_REGIONS)
         # Spawn phase: spawn action must be legal.
         assert obs["action_mask"][:, spaces.ACTION_SPAWN].all()
@@ -75,6 +83,33 @@ def main() -> None:
             batch = env.step(actions)
             assert batch.rewards.shape == (k,)
             assert batch.obs["spatial"].shape[0] == k
+            assert batch.obs["target_masks"].shape == (
+                k,
+                spaces.NUM_ACTION_TYPES,
+                spaces.NUM_PLAYER_SLOTS,
+            )
+            for info in batch.infos:
+                assert "terminalCause" in info
+                assert "peakTilesFrac" in info
+                assert "stageSuccess" in info
+                assert "rewardTerms" in info
+                if info.get("terminalCause") == "curriculum_success":
+                    assert info.get("win") is False
+                    assert info.get("stageSuccess") is True
+                if info.get("win"):
+                    assert info.get("terminalCause") == "win"
+                terms = info["rewardTerms"]
+                assert abs(
+                    terms["total"]
+                    - (
+                        terms["terminal"]
+                        + terms["spawn"]
+                        + terms["territory"]
+                        + terms["elimination"]
+                    )
+                ) < 1e-5
+                assert "intentCount" in info
+                assert "actionAccepted" in info
             dones_seen |= batch.dones
             steps += 1
             if dones_seen.all():

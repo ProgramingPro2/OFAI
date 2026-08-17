@@ -6,9 +6,9 @@ touch any running training shard):
   Phase A  run the policy with sampled actions (as in training) and report the
            action-type histogram plus, for every ATTACK-wilderness decision,
            whether territory actually grew afterwards (i.e. the attack fired).
-  Phase B  controlled probe: force ATTACK-wilderness at specific regions and
-           measure which regions actually expand the agent. This isolates the
-           region-gate (`regionHasAdjacentWilderness`) from policy learning.
+  Phase B  controlled probe: force ATTACK-wilderness. ATTACK ignores the
+           region head (global wilderness / player targeting); this isolates
+           whether the invasion mechanic itself expands territory.
 
 Example:
   .venv/bin/python -m agent.trace --ckpt checkpoints/run6/latest.pt --port 9500
@@ -46,7 +46,7 @@ def tribes_cfg(seed: str) -> dict:
         "seed": seed,
         "maxTicks": 6000,
         "decisionInterval": 10,
-        "shaping": 5.0,
+        "shaping": 0.0,
     }
 
 
@@ -67,7 +67,9 @@ def bot_action(obs: dict, i: int) -> np.ndarray:
         sr = np.flatnonzero(obs["spawn_regions"][i])
         return np.array([SPAWN, 0, int(sr[0]) if sr.size else 0, 0, 0], dtype=np.int32)
     troops = region_troops(obs, i)
-    if obs["action_mask"][i][ATTACK] and obs["target_mask"][i][0] and troops > 3000:
+    tm = obs.get("target_masks", obs.get("target_mask"))
+    attack_ok = bool(tm[i, ATTACK, 0]) if tm is not None and getattr(tm, "ndim", 0) == 3 else bool(tm[i][0]) if tm is not None else False
+    if obs["action_mask"][i][ATTACK] and attack_ok and troops > 3000:
         own = own_regions(obs, i)
         region = int(own[0]) if own.size else 0
         return np.array([ATTACK, 0, region, 4, 0], dtype=np.int32)  # 80%
@@ -95,7 +97,7 @@ def phase_a(policy: Policy, env: VecEnv, device: torch.device, decisions: int, b
         else:
             obs_t = obs_to_tensors(obs_global[0], device)
             with torch.no_grad():
-                acts, _, _ = policy(obs_t)
+                acts, _, _ = policy.act(obs_t, deterministic=False)
             actions = acts.cpu().numpy().astype(np.int32)
         step = env.step(actions)
         for i in range(k):
@@ -305,7 +307,11 @@ def phase_d(env: VecEnv, decisions: int) -> None:
     for t in range(decisions):
         acts = np.stack([bot_action(obs_global[0], i) for i in range(k)]).astype(np.int32)
         pre_troops = region_troops(obs_global[0], 0)
-        borders_wild = bool(obs_global[0]["target_mask"][0][0])
+        tm = obs_global[0].get("target_masks", obs_global[0].get("target_mask"))
+        if tm is not None and tm.ndim == 3:
+            borders_wild = bool(tm[0, ATTACK, 0])
+        else:
+            borders_wild = bool(tm[0][0]) if tm is not None else False
         step = env.step(acts)
         tiles = float(step.infos[0]["tilesFrac"]) * land[0]
         a = acts[0]

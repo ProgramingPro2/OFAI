@@ -3,6 +3,15 @@
 Frames: [4B LE totalLen][4B LE headerLen][headerJson][blobs...]; the header
 carries a `tensors` table (dtype/shape/offset/length) mapping names onto the
 concatenated blob region. Zero-copy decode into numpy via frombuffer.
+
+Wire contract (observation tensors):
+  spatial, players, global, action_mask, target_masks [K,A,S], quantity_mask [K,Q],
+  unit_mask, spawn_regions, build_regions, boat_regions.
+
+Step infos may include terminalCause, peakTilesFrac, rewardTerms,
+intentCount, actionAccepted, stageSuccess
+(plus legacy win/dead/kills/tick/tilesFrac).
+`win` is a core FFA win only; a tile milestone is curriculum_success.
 """
 
 from __future__ import annotations
@@ -25,6 +34,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent / "OpenFrontIO"
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 _DTYPES = {"f32": np.float32, "u8": np.uint8, "i32": np.int32}
+
+
+class RolloutInterrupted(Exception):
+    """Raised after a shard failure/restart. The partial rollout must be
+    discarded and per-env episode trackers reset; healthy shards were NOT
+    re-stepped (retry-all would double-step them).
+    """
+
+    def __init__(self, failed_shards: list[int], message: str = ""):
+        self.failed_shards = list(failed_shards)
+        super().__init__(
+            message
+            or f"rollout interrupted after restarting shards {self.failed_shards}"
+        )
 
 
 @dataclass
@@ -96,17 +119,37 @@ def _encode_frame(header: dict, tensors: dict[str, np.ndarray] | None = None) ->
 
 def _obs_dict(tensors: dict[str, np.ndarray], k: int) -> dict[str, np.ndarray]:
     s = spaces
-    return {
-        "spatial": tensors["spatial"].reshape(k, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE),
+    out = {
+        "spatial": tensors["spatial"].reshape(
+            k, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE
+        ),
         "players": tensors["players"].reshape(k, s.NUM_PLAYER_SLOTS, s.PLAYER_FEATURES),
         "global": tensors["global"].reshape(k, s.GLOBAL_FEATURES),
         "action_mask": tensors["action_mask"].reshape(k, s.NUM_ACTION_TYPES),
-        "target_mask": tensors["target_mask"].reshape(k, s.NUM_PLAYER_SLOTS),
         "unit_mask": tensors["unit_mask"].reshape(k, s.NUM_UNIT_TYPES),
         "spawn_regions": tensors["spawn_regions"].reshape(k, s.NUM_REGIONS),
         "build_regions": tensors["build_regions"].reshape(k, s.NUM_REGIONS),
         "boat_regions": tensors["boat_regions"].reshape(k, s.NUM_REGIONS),
     }
+    # Preferred: action-conditioned target_masks [K, A, S]
+    if "target_masks" in tensors:
+        out["target_masks"] = tensors["target_masks"].reshape(
+            k, s.NUM_ACTION_TYPES, s.NUM_PLAYER_SLOTS
+        )
+    elif "target_mask" in tensors:
+        # Optional compat for older traces that still emit a flat union mask.
+        legacy = tensors["target_mask"].reshape(k, s.NUM_PLAYER_SLOTS)
+        out["target_masks"] = np.broadcast_to(
+            legacy[:, None, :], (k, s.NUM_ACTION_TYPES, s.NUM_PLAYER_SLOTS)
+        ).copy()
+    else:
+        raise KeyError("observation missing target_masks/target_mask")
+
+    if "quantity_mask" in tensors:
+        out["quantity_mask"] = tensors["quantity_mask"].reshape(k, s.NUM_QUANTITIES)
+    else:
+        out["quantity_mask"] = np.ones((k, s.NUM_QUANTITIES), dtype=np.uint8)
+    return out
 
 
 class EnvServerProcess:
@@ -115,7 +158,7 @@ class EnvServerProcess:
     stdout/stderr are drained on a background thread into a log file. The
     OpenFront core (and tsx) write to console during play; if those pipes
     fill (~64KiB) the Node process blocks forever and the Python client
-    times out. That is what killed the first long run1.
+    times out.
     """
 
     def __init__(self, port: int, cwd: Path = REPO_ROOT, timeout_s: float = 120.0):
@@ -246,9 +289,8 @@ class ShardedVecEnv:
     """Several EnvServer processes stepped in parallel behind one VecEnv-like
     interface. Env index i lives on server i // envs_per_server.
 
-    Stepping is I/O-bound on sockets, so a thread pool gives real parallelism
-    despite the GIL; obs from all shards are concatenated so the policy still
-    sees a single batched forward per step.
+    On shard failure: restart the dead shard(s) and raise RolloutInterrupted.
+    Healthy shards are never re-stepped (retry-all would double-step them).
     """
 
     def __init__(
@@ -300,26 +342,36 @@ class ShardedVecEnv:
         assert actions.shape == (self.k, 5)
         eps = self.envs_per_server
         chunks = [actions[i * eps : (i + 1) * eps] for i in range(len(self.clients))]
-        try:
-            batches = list(
-                self.pool.map(lambda t: t[0].step(t[1]), zip(self.clients, chunks))
-            )
-        except (TimeoutError, ConnectionError, OSError) as exc:
+        futures = [
+            self.pool.submit(client.step, chunk)
+            for client, chunk in zip(self.clients, chunks)
+        ]
+        batches: list[StepBatch | None] = [None] * len(self.clients)
+        errors: list[tuple[int, BaseException]] = []
+        for i, fut in enumerate(futures):
+            try:
+                batches[i] = fut.result()
+            except (TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
+                errors.append((i, exc))
+        if errors:
             if self.connect:
-                raise
-            dead = [i for i, s in enumerate(self.servers) if not s.alive()]
-            if not dead:
-                dead = list(range(len(self.clients)))
-            for i in dead:
+                raise errors[0][1]
+            failed = [i for i, _ in errors]
+            # Also restart any process that is already dead but whose future
+            # may have raised a different client.
+            for i, s in enumerate(self.servers):
+                if not s.alive() and i not in failed:
+                    failed.append(i)
+            for i in failed:
                 self._restart_shard(i)
-            batches = list(
-                self.pool.map(lambda t: t[0].step(t[1]), zip(self.clients, chunks))
-            )
+            raise RolloutInterrupted(failed)
+
+        assert all(b is not None for b in batches)
         return StepBatch(
-            obs=_concat_obs([b.obs for b in batches]),
-            rewards=np.concatenate([b.rewards for b in batches]),
-            dones=np.concatenate([b.dones for b in batches]),
-            infos=[info for b in batches for info in b.infos],
+            obs=_concat_obs([b.obs for b in batches]),  # type: ignore[union-attr]
+            rewards=np.concatenate([b.rewards for b in batches]),  # type: ignore[union-attr]
+            dones=np.concatenate([b.dones for b in batches]),  # type: ignore[union-attr]
+            infos=[info for b in batches for info in b.infos],  # type: ignore[union-attr]
         )
 
     def reset(self, index: int, seed: str | None = None) -> dict[str, np.ndarray]:
