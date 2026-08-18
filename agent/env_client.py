@@ -17,6 +17,7 @@ intentCount, actionAccepted, stageSuccess
 from __future__ import annotations
 
 import json
+import math
 import socket
 import struct
 import subprocess
@@ -70,19 +71,33 @@ def _recv_exactly(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _recv_into(sock: socket.socket, buf: bytearray, n: int) -> None:
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+        nread = sock.recv_into(view[got:], min(n - got, 1 << 20))
+        if not nread:
+            raise ConnectionError("env server closed the connection")
+        got += nread
+
+
 def _read_frame(sock: socket.socket) -> tuple[dict, dict[str, np.ndarray]]:
     (total_len,) = struct.unpack("<I", _recv_exactly(sock, 4))
-    payload = _recv_exactly(sock, total_len)
-    (header_len,) = struct.unpack("<I", payload[:4])
-    header = json.loads(payload[4 : 4 + header_len])
-    blobs = payload[4 + header_len :]
+    # Own the payload in a bytearray so frombuffer views stay valid without
+    # an extra bytes() copy of the blob region.
+    payload = bytearray(total_len)
+    _recv_into(sock, payload, total_len)
+    (header_len,) = struct.unpack_from("<I", payload, 0)
+    header = json.loads(bytes(payload[4 : 4 + header_len]))
+    blob_off = 4 + header_len
     tensors: dict[str, np.ndarray] = {}
     for name, spec in header.pop("tensors", {}).items():
+        itemsize = np.dtype(_DTYPES[spec["dtype"]]).itemsize
         arr = np.frombuffer(
-            blobs,
+            payload,
             dtype=_DTYPES[spec["dtype"]],
-            count=spec["length"] // np.dtype(_DTYPES[spec["dtype"]]).itemsize,
-            offset=spec["offset"],
+            count=spec["length"] // itemsize,
+            offset=blob_off + spec["offset"],
         )
         tensors[name] = arr
     return header, tensors
@@ -235,9 +250,8 @@ class VecEnv:
     def step(self, actions: np.ndarray) -> StepBatch:
         """actions: int32 [K, 5] in (action_type, target, region, quantity, unit)."""
         assert actions.shape == (self.k, 5)
-        self.sock.sendall(
-            _encode_frame({"cmd": "step"}, {"actions": actions.astype(np.int32)})
-        )
+        acts = np.ascontiguousarray(actions, dtype=np.int32)
+        self.sock.sendall(_encode_frame({"cmd": "step"}, {"actions": acts}))
         header, tensors = _read_frame(self.sock)
         if header.get("type") == "error":
             raise RuntimeError(f"env server error: {header.get('error')}")
@@ -281,8 +295,28 @@ class VecEnv:
             self.sock.close()
 
 
-def _concat_obs(obses: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
-    return {key: np.concatenate([o[key] for o in obses], axis=0) for key in obses[0]}
+def _concat_obs(
+    obses: list[dict[str, np.ndarray]],
+    out: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """Concatenate shard obs along env axis. Reuses `out` when shapes match."""
+    k = sum(o[next(iter(o))].shape[0] for o in obses)
+    first = obses[0]
+    if out is None or any(
+        key not in out or out[key].shape[0] != k or out[key].shape[1:] != first[key].shape[1:]
+        for key in first
+    ):
+        out = {
+            key: np.empty((k,) + first[key].shape[1:], dtype=first[key].dtype)
+            for key in first
+        }
+    offset = 0
+    for o in obses:
+        n = o[next(iter(first))].shape[0]
+        for key in out:
+            out[key][offset : offset + n] = o[key]
+        offset += n
+    return out
 
 
 class ShardedVecEnv:
@@ -310,6 +344,9 @@ class ShardedVecEnv:
         self.clients = [VecEnv("127.0.0.1", p) for p in self.ports]
         self.pool = ThreadPoolExecutor(max_workers=num_servers)
         self._configs: list[dict] = []
+        self._obs_buf: dict[str, np.ndarray] | None = None
+        self._leading_shards = 0
+        self._leading_n = 0
 
     def init(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
         assert len(env_configs) == self.k
@@ -322,7 +359,42 @@ class ShardedVecEnv:
             self._configs[i * eps : (i + 1) * eps] for i in range(len(self.clients))
         ]
         obses = list(self.pool.map(lambda t: t[0].init(t[1]), zip(self.clients, chunks)))
-        return _concat_obs(obses)
+        self._obs_buf = _concat_obs(obses, self._obs_buf)
+        self._leading_shards = len(self.clients)
+        self._leading_n = self.k
+        return self._obs_buf
+
+    def init_leading(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
+        """Init the minimum leading shards covering these configs.
+
+        Other shards are left untouched so eval cannot double-step them.
+        Returns obs for ``len(env_configs)`` envs (trailing shard slots are
+        padded internally and sliced off).
+        """
+        n = len(env_configs)
+        if n == self.k:
+            return self.init(env_configs)
+        if n <= 0:
+            raise ValueError("init_leading requires at least one env config")
+        eps = self.envs_per_server
+        n_shards = min(len(self.clients), max(1, math.ceil(n / eps)))
+        width = n_shards * eps
+        padded = list(env_configs)
+        while len(padded) < width:
+            base = dict(env_configs[-1])
+            base["seed"] = f"{env_configs[-1].get('seed', 'p')}-leadpad-{len(padded)}"
+            padded.append(base)
+        chunks = [padded[i * eps : (i + 1) * eps] for i in range(n_shards)]
+        obses = list(
+            self.pool.map(
+                lambda t: t[0].init(t[1]),
+                zip(self.clients[:n_shards], chunks),
+            )
+        )
+        stacked = _concat_obs(obses)
+        self._leading_shards = n_shards
+        self._leading_n = n
+        return {key: stacked[key][:n] for key in stacked}
 
     def _restart_shard(self, i: int) -> None:
         port = self.ports[i]
@@ -367,11 +439,62 @@ class ShardedVecEnv:
             raise RolloutInterrupted(failed)
 
         assert all(b is not None for b in batches)
+        ready: list[StepBatch] = batches  # type: ignore[assignment]
+        self._obs_buf = _concat_obs([b.obs for b in ready], self._obs_buf)
         return StepBatch(
-            obs=_concat_obs([b.obs for b in batches]),  # type: ignore[union-attr]
-            rewards=np.concatenate([b.rewards for b in batches]),  # type: ignore[union-attr]
-            dones=np.concatenate([b.dones for b in batches]),  # type: ignore[union-attr]
-            infos=[info for b in batches for info in b.infos],  # type: ignore[union-attr]
+            obs=self._obs_buf,
+            rewards=np.concatenate([b.rewards for b in ready]),
+            dones=np.concatenate([b.dones for b in ready]),
+            infos=[info for b in ready for info in b.infos],
+        )
+
+    def step_leading(self, actions: np.ndarray) -> StepBatch:
+        """Step only shards covering ``init_leading`` envs."""
+        n = self._leading_n
+        if n <= 0 or self._leading_shards <= 0:
+            raise RuntimeError("step_leading requires a prior init_leading")
+        if actions.shape != (n, 5):
+            raise ValueError(f"step_leading expected actions ({n}, 5), got {actions.shape}")
+        eps = self.envs_per_server
+        width = self._leading_shards * eps
+        if n < width:
+            full = np.zeros((width, 5), dtype=np.int32)
+            full[:n] = np.ascontiguousarray(actions, dtype=np.int32)
+        else:
+            full = np.ascontiguousarray(actions, dtype=np.int32)
+        chunks = [full[i * eps : (i + 1) * eps] for i in range(self._leading_shards)]
+        futures = [
+            self.pool.submit(client.step, chunk)
+            for client, chunk in zip(self.clients[: self._leading_shards], chunks)
+        ]
+        batches: list[StepBatch | None] = [None] * self._leading_shards
+        errors: list[tuple[int, BaseException]] = []
+        for i, fut in enumerate(futures):
+            try:
+                batches[i] = fut.result()
+            except (TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
+                errors.append((i, exc))
+        if errors:
+            if self.connect:
+                raise errors[0][1]
+            failed = [i for i, _ in errors]
+            for i, s in enumerate(self.servers):
+                if not s.alive() and i not in failed:
+                    failed.append(i)
+            for i in failed:
+                self._restart_shard(i)
+            raise RolloutInterrupted(failed)
+        assert all(b is not None for b in batches)
+        ready: list[StepBatch] = batches  # type: ignore[assignment]
+        obs = _concat_obs([b.obs for b in ready])
+        rewards = np.concatenate([b.rewards for b in ready])
+        dones = np.concatenate([b.dones for b in ready])
+        infos = [info for b in ready for info in b.infos]
+        return StepBatch(
+            obs={key: obs[key][:n] for key in obs},
+            rewards=rewards[:n],
+            dones=dones[:n],
+            infos=infos[:n],
         )
 
     def reset(self, index: int, seed: str | None = None) -> dict[str, np.ndarray]:

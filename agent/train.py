@@ -211,9 +211,16 @@ def _fixed_seed_eval_attempt(
             ]
             for c in pad:
                 c["shaping"] = 0.0
-            obs = env.init(cfgs + pad)
-            ep_ret = np.zeros(env.k, np.float32)
-            active = np.zeros(env.k, dtype=bool)
+            use_leading = hasattr(env, "init_leading") and hasattr(
+                env, "step_leading"
+            )
+            if use_leading:
+                obs = env.init_leading(cfgs)
+            else:
+                obs = env.init(cfgs + pad)
+            work_k = int(obs["spatial"].shape[0])
+            ep_ret = np.zeros(work_k, np.float32)
+            active = np.zeros(work_k, dtype=bool)
             active[:batch_n] = True
             finished = 0
             while active[:batch_n].any():
@@ -221,7 +228,7 @@ def _fixed_seed_eval_attempt(
                     obs_t = obs_to_tensors(obs, device)
                     acts, _, _ = policy.act(obs_t, deterministic=(mode == "deterministic"))
                 actions = acts.cpu().numpy().astype(np.int32)
-                step = env.step(actions)
+                step = env.step_leading(actions) if use_leading else env.step(actions)
                 ep_ret += step.rewards
                 for i in range(batch_n):
                     if not active[i]:
@@ -435,6 +442,7 @@ def main() -> None:
         dynamic_ncols=True,
         desc=curriculum.stage.name,
     )
+    eval_s = 0.0
 
     try:
         while trainer.stats.env_steps < args.total_steps:
@@ -520,6 +528,7 @@ def main() -> None:
                     f"stage={curriculum.stage.name} n={args.eval_episodes} "
                     f"modes=deterministic,sampled"
                 )
+                t_eval = time.time()
                 try:
                     ev = run_fixed_seed_eval(
                         policy,
@@ -568,10 +577,13 @@ def main() -> None:
                         + "\n"
                     )
                 finally:
+                    eval_s = time.time() - t_eval
                     # Eval (including retries/failure) re-inits the shared
                     # shards; always restore train envs and zero episode
                     # trackers so GAE/returns cannot leak across the eval.
                     obs = reinit_envs()
+            else:
+                eval_s = 0.0
 
             record = {
                 "it": st.iterations,
@@ -582,6 +594,10 @@ def main() -> None:
                 "stage_success_rate": round(curriculum.stage_success_rate, 4),
                 "stage_win_rate": round(curriculum.stage_success_rate, 4),
                 "sps": round(sps, 1),
+                "stage_sps": round(sps, 1),
+                "collect_s": round(collect_s, 3),
+                "update_s": round(update_s, 3),
+                "eval_s": round(eval_s, 3),
                 **st.rolling_snapshot(),
                 **{
                     k: round(v, 5) if isinstance(v, float) else v
@@ -594,6 +610,9 @@ def main() -> None:
             pbar.update(steps_per_iter)
             pbar.set_postfix(
                 sps=f"{sps:.0f}",
+                collect_s=f"{collect_s:.1f}",
+                update_s=f"{update_s:.1f}",
+                eval_s=f"{eval_s:.1f}",
                 win20=f"{st.win_rate_20:.3f}",
                 ss20=f"{st.stage_success_rate_20:.3f}",
                 kill20=f"{st.kills_per_ep_20:.2f}",

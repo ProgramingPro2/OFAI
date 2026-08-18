@@ -360,14 +360,34 @@ class Policy(nn.Module):
 
 
 def obs_to_tensors(obs: dict, device: torch.device) -> dict[str, torch.Tensor]:
-    """Numpy obs batch -> float tensors on device (copies: wire buffers are
-    read-only views into the socket payload)."""
+    """Numpy obs batch -> float32 tensors on device.
+
+    Uses as_tensor (no np.array always-copy). Read-only frombuffer views are
+    copied once on transfer. float16 spatial (rollout storage) is cast to
+    float32 so collect logprobs match PPO evaluate().
+    """
     import numpy as np
 
-    return {
-        k: torch.as_tensor(np.array(v), dtype=torch.float32, device=device)
-        for k, v in obs.items()
-    }
+    device = torch.device(device)
+    pin = device.type == "cuda"
+    out: dict[str, torch.Tensor] = {}
+    for key, val in obs.items():
+        arr = np.asarray(val)
+        if not arr.flags["WRITEABLE"]:
+            arr = np.array(arr, copy=True)
+        tensor = torch.as_tensor(arr)
+        if (
+            pin
+            and tensor.device.type == "cpu"
+            and tensor.dtype == torch.float32
+            and key == "spatial"
+            and tensor.numel() > 0
+        ):
+            tensor = tensor.pin_memory()
+        out[key] = tensor.to(
+            device=device, dtype=torch.float32, non_blocking=pin
+        )
+    return out
 
 
 def make_dummy_obs(batch: int = 4, device: str | torch.device = "cpu") -> dict[str, torch.Tensor]:

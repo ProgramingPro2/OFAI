@@ -468,15 +468,21 @@ class PPOTrainer:
         completed: list[EpisodeRecord] = []
 
         for step in range(cfg.rollout_len):
-            spatial_f16 = obs["spatial"].astype(np.float16)
-            obs_q = dict(obs)
-            obs_q["spatial"] = spatial_f16.astype(np.float32)
+            # Store f16 spatial (same quantization evaluate() sees). Pass the
+            # f16 view to obs_to_tensors so GPU does the f16->f32 cast once;
+            # do not round-trip through a CPU float32 copy.
+            spatial_f16 = np.asarray(obs["spatial"], dtype=np.float16)
             buf.obs["spatial"][step] = spatial_f16
             for key in buf.obs:
                 if key != "spatial":
                     buf.obs[key][step] = obs[key]
             with torch.no_grad():
-                obs_t = obs_to_tensors(obs_q, device)
+                if obs["spatial"].dtype == np.float16:
+                    obs_t = obs_to_tensors(obs, device)
+                else:
+                    obs_q = dict(obs)
+                    obs_q["spatial"] = spatial_f16
+                    obs_t = obs_to_tensors(obs_q, device)
                 actions_t, logp_t, value_t = self.policy.act(obs_t, deterministic=False)
             actions = actions_t.cpu().numpy().astype(np.int32)
             batch = env.step(actions)

@@ -28,9 +28,17 @@ from agent.curriculum import (
     Stage,
     wilson_lower_bound,
 )
-from agent.env_client import RolloutInterrupted, ShardedVecEnv, StepBatch, _obs_dict
+from agent.env_client import (
+    RolloutInterrupted,
+    ShardedVecEnv,
+    StepBatch,
+    _concat_obs,
+    _encode_frame,
+    _obs_dict,
+    _read_frame,
+)
 from agent.eval import scripted_expander_action
-from agent.model import Policy, make_dummy_obs, normalized_action_entropy
+from agent.model import Policy, make_dummy_obs, normalized_action_entropy, obs_to_tensors
 from agent.ppo import (
     EpisodeRecord,
     PPOConfig,
@@ -1371,3 +1379,145 @@ def test_collect_interrupt_discards_partial_and_retries():
     assert env.interrupted
     assert completed == []
     assert trainer._trackers[0].ret == pytest.approx(3.0)
+
+
+def test_obs_to_tensors_readonly_frombuffer_matches_copy():
+    s = spaces
+    payload = np.random.default_rng(0).random(
+        s.SPATIAL_CHANNELS * s.SPATIAL_SIZE * s.SPATIAL_SIZE, dtype=np.float32
+    )
+    raw = payload.tobytes()
+    view = np.frombuffer(raw, dtype=np.float32).reshape(
+        1, s.SPATIAL_CHANNELS, s.SPATIAL_SIZE, s.SPATIAL_SIZE
+    )
+    assert not view.flags["WRITEABLE"]
+    obs = _numpy_obs(1)
+    obs["spatial"] = view
+    copied = {k: np.array(v) for k, v in obs.items()}
+    device = torch.device("cpu")
+    t_view = obs_to_tensors(obs, device)
+    t_copy = {
+        k: torch.as_tensor(np.array(v), dtype=torch.float32, device=device)
+        for k, v in copied.items()
+    }
+    for key in obs:
+        assert torch.equal(t_view[key], t_copy[key]), key
+
+
+def test_obs_to_tensors_float16_spatial_matches_evaluate_cast():
+    """Collect stores f16 spatial; transfer must match update's f16->f32."""
+    torch.manual_seed(4)
+    policy = Policy()
+    obs = _numpy_obs(4)
+    rng = np.random.default_rng(1)
+    obs["spatial"] = rng.random(obs["spatial"].shape, dtype=np.float32)
+    spatial_f16 = np.asarray(obs["spatial"], dtype=np.float16)
+    obs_q = dict(obs)
+    obs_q["spatial"] = spatial_f16
+    device = torch.device("cpu")
+    t_new = obs_to_tensors(obs_q, device)
+    t_legacy = torch.as_tensor(
+        spatial_f16.astype(np.float32), dtype=torch.float32, device=device
+    )
+    assert torch.equal(t_new["spatial"], t_legacy)
+    with torch.no_grad():
+        actions, logp_act, _ = policy.act(t_new, deterministic=False)
+        logp_eval, _, _, _ = policy.evaluate(t_new, actions)
+    assert torch.allclose(logp_act, logp_eval, atol=1e-5)
+
+
+def test_read_frame_bytearray_frombuffer_roundtrip():
+    import socket
+
+    actions = np.arange(10, dtype=np.int32)
+    payload = _encode_frame({"cmd": "step"}, {"actions": actions})
+    a, b = socket.socketpair()
+    try:
+        a.sendall(payload)
+        header, tensors = _read_frame(b)
+        assert header["cmd"] == "step"
+        assert np.array_equal(tensors["actions"], actions)
+        assert tensors["actions"].flags["OWNDATA"] is False
+    finally:
+        a.close()
+        b.close()
+
+
+def test_concat_obs_reuse_matches_allocate():
+    a = _numpy_obs(2)
+    b = _numpy_obs(3)
+    a["spatial"][0, 0, 0, 0] = 0.3
+    b["global"][1, 0] = 0.7
+    fresh = _concat_obs([a, b])
+    reuse = _concat_obs([a, b], None)
+    again = _concat_obs([a, b], reuse)
+    assert again is reuse
+    for key in fresh:
+        assert np.array_equal(fresh[key], again[key]), key
+
+
+def test_eval_leading_shards_skips_idle_envs():
+    """Eval with 8 episodes on a 16-env mock must not pad-init all shards."""
+
+    class LeadingEnv:
+        def __init__(self):
+            self.k = 16
+            self.envs_per_server = 8
+            self.init_n = []
+            self.step_n = []
+            self.full_init = 0
+
+        def init(self, cfgs):
+            self.full_init += 1
+            return _numpy_obs(self.k)
+
+        def init_leading(self, cfgs):
+            self.init_n.append(len(cfgs))
+            return _numpy_obs(len(cfgs))
+
+        def step_leading(self, actions):
+            self.step_n.append(actions.shape[0])
+            n = actions.shape[0]
+            info = _fake_info(
+                terminalCause="win", win=True, tick=4, peakTilesFrac=0.4, tilesFrac=0.4
+            )
+            return StepBatch(
+                obs=_numpy_obs(n),
+                rewards=np.ones(n, np.float32),
+                dones=np.ones(n, dtype=bool),
+                infos=[info] * n,
+            )
+
+        def step(self, actions):
+            raise AssertionError("full step should not run when leading exists")
+
+    env = LeadingEnv()
+    ev = run_fixed_seed_eval(
+        Policy(),
+        env,
+        Curriculum(start=0),
+        torch.device("cpu"),
+        n_episodes=8,
+        seed_prefix="lead-eval",
+    )
+    assert env.full_init == 0
+    assert env.init_n == [8, 8]
+    assert env.step_n == [8, 8]
+    assert ev["deterministic"]["episodes"] == 8
+    assert ev["sampled"]["episodes"] == 8
+
+
+def test_progress_timing_fields_round():
+    collect_s, update_s, eval_s = 10.1234, 1.96, 0.0
+    steps = 16384
+    rec = {
+        "collect_s": round(collect_s, 3),
+        "update_s": round(update_s, 3),
+        "eval_s": round(eval_s, 3),
+        "sps": round(steps / (collect_s + update_s), 1),
+        "stage_sps": round(steps / (collect_s + update_s), 1),
+    }
+    assert rec["collect_s"] == 10.123
+    assert rec["update_s"] == 1.96
+    assert rec["eval_s"] == 0.0
+    assert rec["sps"] == rec["stage_sps"]
