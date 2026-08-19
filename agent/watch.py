@@ -12,6 +12,7 @@ Legend:
 
 Examples:
   # fullscreen pygame UI (needs a display; falls back to a message if none).
+  # Configuration uses clickable dropdowns; replay has a draggable timeline.
   # Sampled policy; --fps is displayed frames, --frame-skip skips full-res
   # render work between decisions. Playback speed is separate ([ ] in-window).
   .venv/bin/python -m agent.watch --ckpt checkpoints/run3/latest.pt \
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +53,7 @@ STATUS_H = 30  # status bar height in saved-video / native scene px
 DESKTOP_RESERVE = (32, 96)
 HUD_TOP_H = 40
 HUD_BOTTOM_H = 56
+HUD_REPLAY_BOTTOM_H = 108
 LEGEND_SCREEN_W = 260
 DIFFICULTIES = ("Easy", "Medium", "Hard", "Impossible")
 MAP_SIZES = ("Compact", "Normal")
@@ -197,21 +200,29 @@ def usable_display_size(pygame, display: int) -> tuple[int, int]:
     return max(1, width - reserve_w), max(1, height - reserve_h)
 
 
-def overlay_layout(window_size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]]:
+def overlay_layout(
+    window_size: tuple[int, int], *, replay: bool = False
+) -> dict[str, tuple[int, int, int, int]]:
     """Fixed screen-space HUD regions. Independent of map zoom."""
     width, height = window_size
     if min(width, height) < 1:
         raise ValueError("window dimensions must be positive")
     legend_w = min(LEGEND_SCREEN_W, max(0, width // 4))
     top_h = min(HUD_TOP_H, max(1, height // 12))
-    bottom_h = min(HUD_BOTTOM_H, max(1, height // 10))
+    bottom_base = HUD_REPLAY_BOTTOM_H if replay else HUD_BOTTOM_H
+    bottom_frac = 6 if replay else 10
+    bottom_h = min(bottom_base, max(1, height // bottom_frac))
     map_w = max(1, width - legend_w)
     map_h = max(1, height - top_h - bottom_h)
+    bottom_y = top_h + map_h
+    track_h = 18 if replay else 0
+    track_y = bottom_y + max(8, bottom_h - track_h - 10) if replay else bottom_y
     return {
         "top": (0, 0, width, top_h),
-        "bottom": (0, top_h + map_h, width, bottom_h),
+        "bottom": (0, bottom_y, width, bottom_h),
         "legend": (map_w, top_h, legend_w, map_h),
         "map": (0, top_h, map_w, map_h),
+        "timeline": (16, track_y, max(1, width - 32), track_h),
     }
 
 
@@ -429,8 +440,32 @@ def compact_frame(frame: dict, status: str) -> dict:
     }
 
 
+def timeline_frame_index(frac: float, count: int) -> int:
+    """Map a 0..1 scrollbar position onto a frame index without overshooting."""
+    if count <= 1:
+        return 0
+    frac = max(0.0, min(1.0, float(frac)))
+    if frac >= 1.0:
+        return count - 1
+    return min(count - 1, int(frac * count))
+
+
+def timeline_thumb_frac(index: int, count: int) -> float:
+    """Place the playhead in the center of its frame bucket."""
+    if count <= 1:
+        return 0.0
+    index = max(0, min(int(index), count - 1))
+    return (float(index) + 0.5) / float(count)
+
+
+def timeline_jump(index: int, count: int, delta: int) -> int:
+    if count <= 0:
+        return 0
+    return max(0, min(count - 1, int(index) + int(delta)))
+
+
 class ReplayTape:
-    """Bounded recording: every action, plus frames until a memory cap."""
+    """Bounded recording: every action, plus a sliding window of frames."""
 
     def __init__(
         self,
@@ -440,7 +475,8 @@ class ReplayTape:
         self.max_bytes = int(max_bytes)
         self.max_frames = int(max_frames)
         self.actions: list[np.ndarray] = []
-        self.frames: list[dict] | None = []
+        self.frames: deque[dict] = deque()
+        self.dropped_count = 0
         self.bytes_used = 0
         self.seed = ""
         self.env_config: dict = {}
@@ -452,26 +488,88 @@ class ReplayTape:
         return bool(self.frames)
 
     @property
+    def recorded_count(self) -> int:
+        return self.dropped_count + len(self.frames)
+
+    @property
+    def first_kept(self) -> int:
+        return self.dropped_count
+
+    @property
+    def last_kept(self) -> int:
+        return self.dropped_count + len(self.frames) - 1 if self.frames else -1
+
+    @property
     def replay_mode(self) -> str:
-        return "frames" if self.has_frames else "actions"
+        if not self.has_frames:
+            return "actions"
+        if self.dropped_count:
+            return "window"
+        return "frames"
+
+    def can_seek_instant(self, index: int) -> bool:
+        return bool(self.frames) and self.first_kept <= int(index) <= self.last_kept
+
+    def frame_at(self, index: int) -> dict | None:
+        if not self.can_seek_instant(index):
+            return None
+        return self.frames[int(index) - self.dropped_count]
 
     def record_action(self, action: np.ndarray) -> None:
         self.actions.append(np.array(action, dtype=np.int32, copy=True))
 
-    def record_frame(self, frame: dict, status: str) -> None:
-        if self.frames is None:
+    def _evict_oldest(self) -> None:
+        if not self.frames:
             return
+        old = self.frames.popleft()
+        self.bytes_used = max(0, self.bytes_used - frame_snapshot_bytes(old))
+        self.dropped_count += 1
+
+    def record_frame(self, frame: dict, status: str) -> None:
         snapshot = compact_frame(frame, status)
         size = frame_snapshot_bytes(snapshot)
-        if (
-            self.bytes_used + size > self.max_bytes
-            or len(self.frames) >= self.max_frames
+        while self.frames and (
+            len(self.frames) >= self.max_frames
+            or self.bytes_used + size > self.max_bytes
         ):
-            self.frames = None
-            self.bytes_used = 0
+            self._evict_oldest()
+        if size > self.max_bytes or (
+            self.max_frames <= 0
+            or (self.bytes_used + size > self.max_bytes and not self.frames)
+        ):
+            self.dropped_count += 1
             return
         self.frames.append(snapshot)
         self.bytes_used += size
+
+
+def resolve_seek_target(
+    tape: ReplayTape, requested: int, has_env: bool
+) -> tuple[int, str]:
+    """Decide how a timeline seek should be satisfied.
+
+    Returns (index, mode) where mode is buffer, rebuild, clamp, actions, or none.
+    Evicted frames are never treated as instantly seekable.
+    """
+    requested = int(requested)
+    if tape.has_frames:
+        count = tape.recorded_count
+        if count <= 0:
+            return 0, "none"
+        requested = max(0, min(requested, count - 1))
+        if tape.can_seek_instant(requested):
+            return requested, "buffer"
+        if requested < tape.first_kept:
+            if has_env and tape.actions:
+                return requested, "rebuild"
+            return tape.first_kept, "clamp"
+        return max(tape.first_kept, tape.last_kept), "clamp"
+    if tape.actions:
+        requested = max(0, min(requested, len(tape.actions)))
+        if has_env:
+            return requested, "actions"
+        return requested, "none"
+    return 0, "none"
 
 
 def infer_game_type(nations: int | str, bots: int) -> str:

@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from agent.watch import (
     Camera,
+    PaletteCache,
     PlaybackControl,
     ReplayTape,
     SPEED_STEPS,
@@ -41,12 +42,16 @@ from agent.watch import (
     present_map,
     positive_float,
     positive_int,
+    resolve_seek_target,
     restore_policy_rng,
     scene_size,
     seed_policy_rng,
     should_render_frame,
     snap_speed,
     snapshot_policy_rng,
+    timeline_frame_index,
+    timeline_jump,
+    timeline_thumb_frac,
     usable_display_size,
     viewport_rect,
     window_size_for_scene,
@@ -341,6 +346,14 @@ def test_overlay_layout_is_independent_of_zoom_and_covers_window():
     assert top[2] == 1920
     assert mapped[2] + legend[2] == 1920
     assert top[3] + mapped[3] + bottom[3] == 1080
+    replay = overlay_layout((1920, 1080), replay=True)
+    assert replay["bottom"][3] > first["bottom"][3]
+    assert replay["timeline"][3] > 0
+    assert replay["top"][3] + replay["map"][3] + replay["bottom"][3] == 1080
+    tx, ty, tw, th = replay["timeline"]
+    bx, by, bw, bh = replay["bottom"]
+    assert tx >= 0 and tw <= 1920
+    assert by <= ty < by + bh
 
 
 def test_view_transform_preserves_aspect_and_letterboxes_at_fit_zoom():
@@ -400,7 +413,7 @@ def test_playback_pause_step_and_speed_do_not_invent_actions():
     assert PlaybackControl(1.0).render_interval_ms(10) == 100
 
 
-def test_replay_tape_keeps_actions_and_drops_frames_at_the_cap():
+def test_replay_tape_keeps_actions_and_a_sliding_window_at_the_cap():
     tape = ReplayTape(max_bytes=8_000, max_frames=4)
     frame = {
         "width": 40,
@@ -412,12 +425,22 @@ def test_replay_tape_keeps_actions_and_drops_frames_at_the_cap():
     }
     for step in range(12):
         tape.record_action(np.array([0, 0, 0, 0, 0], dtype=np.int32))
+        frame["tick"] = step
         tape.record_frame(frame, f"step {step}")
     assert len(tape.actions) == 12
-    assert tape.frames is None
-    assert tape.has_frames is False
-    assert tape.replay_mode == "actions"
-    assert tape.bytes_used == 0
+    assert tape.has_frames is True
+    assert len(tape.frames) == 4
+    assert tape.dropped_count == 8
+    assert tape.recorded_count == 12
+    assert tape.first_kept == 8
+    assert tape.last_kept == 11
+    assert tape.replay_mode == "window"
+    assert tape.can_seek_instant(8)
+    assert tape.can_seek_instant(11)
+    assert not tape.can_seek_instant(7)
+    assert tape.frame_at(8)["status"] == "step 8"
+    assert tape.frame_at(11)["status"] == "step 11"
+    assert tape.frame_at(0) is None
 
 
 def test_replay_tape_keeps_compact_frames_under_the_cap():
@@ -848,6 +871,255 @@ def test_dummy_sdl_windowed_display_and_config(monkeypatch, tmp_path):
         assert full.fullscreen is False
         full.toggle_fullscreen()
         assert full.fullscreen is True
+    finally:
+        pygame.quit()
+
+
+def test_timeline_index_mapping_has_no_off_by_one():
+    assert timeline_frame_index(0.0, 10) == 0
+    assert timeline_frame_index(1.0, 10) == 9
+    assert timeline_frame_index(0.99, 10) == 9
+    assert timeline_frame_index(-1.0, 10) == 0
+    assert timeline_frame_index(2.0, 1) == 0
+    assert timeline_frame_index(0.5, 0) == 0
+    for count in (1, 2, 3, 8, 360):
+        for i in range(count):
+            frac = timeline_thumb_frac(i, count)
+            assert timeline_frame_index(frac, count) == i
+    assert timeline_jump(0, 10, -1) == 0
+    assert timeline_jump(9, 10, 1) == 9
+    assert timeline_jump(4, 10, 10) == 9
+
+
+def test_resolve_seek_target_is_honest_about_evicted_frames():
+    tape = ReplayTape(max_bytes=1_000_000, max_frames=3)
+    frame = {
+        "width": 4,
+        "height": 3,
+        "cells": np.zeros((3, 4), dtype=np.uint8),
+        "players": [{"idx": 0, "name": "A", "tiles": 1, "alive": True, "isAgent": True}],
+        "units": [],
+        "tick": 0,
+    }
+    for step in range(6):
+        tape.record_action(np.array([0, 0, 0, 0, 0], dtype=np.int32))
+        tape.record_frame(frame, f"step {step}")
+    assert tape.dropped_count == 3
+    assert resolve_seek_target(tape, 4, False) == (4, "buffer")
+    assert resolve_seek_target(tape, 0, False) == (3, "clamp")
+    assert resolve_seek_target(tape, 0, True) == (0, "rebuild")
+    assert resolve_seek_target(tape, 99, False)[0] == tape.last_kept
+    empty = ReplayTape()
+    for _ in range(5):
+        empty.record_action(np.array([0], dtype=np.int32))
+    assert resolve_seek_target(empty, 3, True) == (3, "actions")
+    assert resolve_seek_target(empty, 3, False) == (3, "none")
+
+
+def test_dropdown_menu_geometry_clamps_onscreen():
+    from agent.watch_ui import dropdown_menu_geometry
+
+    below = dropdown_menu_geometry((20, 20, 200, 30), 4, 24, (800, 600))
+    assert below[1] >= 50
+    assert below[0] + below[2] <= 800
+    flipped = dropdown_menu_geometry((20, 560, 200, 30), 20, 24, (800, 600))
+    assert flipped[1] + flipped[3] <= 600
+    assert flipped[1] >= 0
+    right = dropdown_menu_geometry((700, 40, 200, 30), 3, 24, (800, 600))
+    assert right[0] + right[2] <= 800
+    tiny = dropdown_menu_geometry((10, 10, 120, 24), 50, 22, (320, 200))
+    assert tiny[0] >= 0
+    assert tiny[1] >= 0
+    assert tiny[0] + tiny[2] <= 320
+    assert tiny[1] + tiny[3] <= 200
+
+
+def test_apply_choice_sets_dropdown_values():
+    from agent.watch_ui import apply_choice, field_options, field_kind
+
+    rt = _runtime()
+    assert field_kind("preset") == "dropdown"
+    assert field_kind("bots") == "stepper"
+    assert field_kind("seed") == "text"
+    names = [label for _, label in field_options(rt, "preset")]
+    assert "custom" in names and "tribes20" in names
+    assert apply_choice(rt, "game_type", "nations") is None
+    assert rt.settings.nations == "default"
+    assert rt.settings.bots == 0
+    assert apply_choice(rt, "difficulty", "Hard") is None
+    assert rt.settings.difficulty == "Hard"
+    assert apply_choice(rt, "speed", 2.0) is None
+    assert rt.settings.speed == 2.0
+    assert apply_choice(rt, "greedy", True) is None
+    assert rt.settings.greedy is True
+
+
+def test_seek_replay_clamps_evicted_frames_without_env():
+    from agent.watch_ui import seek_replay, start_replay
+
+    tape = ReplayTape(max_bytes=1_000_000, max_frames=3)
+    for tick in range(6):
+        tape.record_action(np.array([0, 0, 0, 0, 0], dtype=np.int32))
+        tape.record_frame(
+            {
+                "width": 4,
+                "height": 3,
+                "cells": np.zeros((3, 4), dtype=np.uint8),
+                "players": [{"idx": 0, "name": "A", "tiles": 1, "alive": True, "isAgent": True}],
+                "units": [],
+                "tick": tick,
+            },
+            f"frame {tick}",
+        )
+    rt = _runtime(tape=tape)
+    start_replay(rt)
+    assert rt.mode == "replay"
+    assert rt.replay_index == tape.first_kept
+    seek_replay(rt, 5)
+    assert rt.replay_index == 5
+    assert rt.last_status == "frame 5"
+    seek_replay(rt, 0)
+    assert rt.replay_index == tape.first_kept
+    assert "evicted" in rt.last_status.lower()
+
+
+def test_seek_replay_buffered_ends_are_exact():
+    from agent.watch_ui import seek_replay, start_replay
+
+    tape = ReplayTape(max_bytes=1_000_000, max_frames=8)
+    for tick in range(5):
+        tape.record_frame(
+            {
+                "width": 4,
+                "height": 3,
+                "cells": np.zeros((3, 4), dtype=np.uint8),
+                "players": [{"idx": 0, "name": "A", "tiles": 1, "alive": True, "isAgent": True}],
+                "units": [],
+                "tick": tick,
+            },
+            f"frame {tick}",
+        )
+    rt = _runtime(tape=tape)
+    start_replay(rt)
+    seek_replay(rt, 0)
+    assert rt.replay_index == 0
+    seek_replay(rt, 4)
+    assert rt.replay_index == 4
+    seek_replay(rt, 99)
+    assert rt.replay_index == 4
+
+
+def test_dropdown_keyboard_selects_and_escape_closes():
+    from agent.watch_ui import (
+        close_dropdown,
+        handle_config_event,
+        open_dropdown,
+        select_dropdown_index,
+    )
+
+    rt = _runtime()
+    open_dropdown(rt, "difficulty", (40, 80, 200, 32), (800, 600), row_h=24)
+    assert rt.dropdown_key == "difficulty"
+    assert rt.dropdown_menu is not None
+    assert rt.dropdown_menu[0] >= 0
+    assert rt.dropdown_menu[1] + rt.dropdown_menu[3] <= 600
+
+    class Event:
+        def __init__(self, key, unicode="", mod=0):
+            self.key = key
+            self.unicode = unicode
+            self.mod = mod
+
+    class Keys:
+        K_ESCAPE = 1
+        K_DOWN = 2
+        K_UP = 3
+        K_LEFT = 4
+        K_RIGHT = 5
+        K_RETURN = 6
+        K_TAB = 7
+        K_HOME = 8
+        K_END = 9
+        K_PAGEUP = 10
+        K_PAGEDOWN = 11
+        K_SPACE = 12
+        K_BACKSPACE = 13
+        KMOD_SHIFT = 1
+
+    handle_config_event(rt, Keys, Event(Keys.K_DOWN))
+    handle_config_event(rt, Keys, Event(Keys.K_RETURN))
+    assert rt.dropdown_key is None
+    assert rt.settings.difficulty in ("Easy", "Medium", "Hard", "Impossible")
+    open_dropdown(rt, "map_size", (40, 80, 200, 32), (800, 600))
+    handle_config_event(rt, Keys, Event(Keys.K_ESCAPE))
+    assert rt.dropdown_key is None
+    select_dropdown_index(rt, 0)
+    close_dropdown(rt)
+    assert rt.dropdown_key is None
+
+
+def test_dummy_sdl_config_dropdown_and_replay_timeline(monkeypatch, tmp_path):
+    pygame = _dummy_pygame(monkeypatch)
+    try:
+        from agent.watch_ui import (
+            DisplayState,
+            draw_config,
+            draw_play_view,
+            open_dropdown,
+            start_replay,
+        )
+
+        ckpt = tmp_path / "ok.pt"
+        ckpt.write_bytes(b"pt")
+        settings = WatchSettings(
+            ckpt=str(ckpt),
+            windowed=True,
+            window_size=(960, 540),
+        )
+        display = DisplayState(pygame, settings)
+        fonts = {
+            "title": pygame.font.SysFont("monospace", 18, bold=True),
+            "heading": pygame.font.SysFont("monospace", 14, bold=True),
+            "body": pygame.font.SysFont("monospace", 13),
+            "small": pygame.font.SysFont("monospace", 12),
+            "tiny": pygame.font.SysFont("monospace", 11),
+        }
+        rt = _runtime(settings)
+        hits = draw_config(pygame, display.screen, fonts, rt)
+        kinds = [kind for kind, _ in hits]
+        assert "start" in kinds and "quit" in kinds
+        assert "field" in kinds and "chevron" in kinds and "step" in kinds
+        open_dropdown(rt, "preset", rt.field_rects["preset"], display.size())
+        hits = draw_config(pygame, display.screen, fonts, rt)
+        assert any(kind == "option" for kind, _ in hits)
+        assert any(kind == "dropdown_menu" for kind, _ in hits)
+
+        tape = ReplayTape(max_bytes=1_000_000, max_frames=8)
+        for tick in range(4):
+            tape.record_frame(
+                {
+                    "width": 8,
+                    "height": 6,
+                    "cells": np.zeros((6, 8), dtype=np.uint8),
+                    "players": [
+                        {"idx": 0, "name": "Agent", "tiles": 1, "alive": True, "isAgent": True}
+                    ],
+                    "units": [],
+                    "tick": tick,
+                },
+                f"frame {tick}",
+            )
+        play = _runtime(settings, tape=tape, palettes=PaletteCache())
+        play.map_fonts = _load_fonts(pygame, 1)
+        start_replay(play)
+        play.hold_frame = False
+        layout = draw_play_view(pygame, display.screen, fonts, play)
+        assert layout["timeline"][3] > 0
+        assert play.timeline_hits
+        hit_kinds = [kind for kind, _ in play.timeline_hits]
+        assert "replay_timeline" in hit_kinds
+        assert "replay_play" in hit_kinds
+        assert "replay_speed" in hit_kinds
     finally:
         pygame.quit()
 

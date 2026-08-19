@@ -39,9 +39,10 @@ python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 20 \
     --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
 
 # Watch (sampled policy; recommended fast preview).
-# Interactive: one fullscreen pygame window for configuration, playback,
-# and post-match replay. --frame-skip N still steps the policy every
-# decision but only pulls the full-resolution map every Nth frame (plus
+# Interactive: one fullscreen pygame window for dropdown configuration,
+# playback, and a timeline-scrubbed post-match replay. --frame-skip N
+# still steps the policy every decision but only pulls the full-resolution
+# map every Nth frame (plus
 # first and last). --fps is the display/video rate of those rendered
 # frames; in-window [ ] changes playback speed only. Videos stream to
 # ffmpeg so long 1500x1500 games stay memory-bounded.
@@ -86,10 +87,11 @@ The interactive viewer is a single pygame window. It starts in true
 fullscreen on `--display N` (default 0) and stays fullscreen during play.
 CLI flags prepopulate the in-window form (checkpoint, preset, game type,
 difficulty, map, nations/bots, seeds, max ticks, episodes, scale, fps,
-frame skip, speed). Start and Quit are on that form. `--save` remains
-headless and does not open the UI. `--episodes` is the headless video
-count; the window plays one match, stays open, and uses New for the next
-seed.
+frame skip, speed). Finite choices use clickable dropdowns (hover,
+keyboard, scroll, click-away / Esc). Numbers stay text boxes or steppers.
+Start and Quit are on that form. `--save` remains headless and does not
+open the UI. `--episodes` is the headless video count; the window plays
+one match, stays open, and uses New for the next seed.
 
 Playback and camera (HUD stays fixed in screen pixels; only the map zooms):
 - Space pause/resume; `.` or `n` step one decision while paused
@@ -100,11 +102,17 @@ Playback and camera (HUD stays fixed in screen pixels; only the map zooms):
   F11 or Alt+Enter leave or re-enter fullscreen; Q confirms quit; the
   window close button exits. The mouse is never grabbed.
 
-After a match the window stays open. Replay uses recorded frames when they
-fit a 96MB / 360-frame cap, otherwise it reapplies the recorded action tape
-without running the policy. Restart uses the same game seed and the policy
-RNG from match start; New increments the episode suffix (`watch-1`, …);
-Configure returns to the form.
+After a match the window stays open. Replay keeps a bounded sliding window
+of frames (96MB / 360-frame cap) so the end of a long match stays
+seekable. A timeline scrollbar shows progress, the buffered window, and
+any evicted prefix. Click or drag to seek in buffered frames; PageUp /
+PageDown jump; `,` / `.` step; End jumps to the last frame. Evicted
+frames are not instant-seekable: clicking that region rebuilds from the
+recorded action tape when the env is still up, otherwise seek clamps to
+the earliest buffered frame. Play/pause and speed chips sit on the replay
+bar. Restart uses the same game seed and the policy RNG from match start;
+New increments the episode suffix (`watch-1`, …); Configure returns to
+the form.
 
 Use `--windowed` or `--window-size WIDTHxHEIGHT` to start windowed
 (oversized requests are clamped to the usable display). `--scale` controls
