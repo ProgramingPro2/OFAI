@@ -11,7 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .curriculum import Curriculum, CurriculumRestoreError, STAGES
+from .curriculum import (
+    Curriculum,
+    CurriculumRestoreError,
+    STAGES,
+    sampled_binomial,
+    wilson_interval,
+)
 
 BEST_SCORE_SENTINEL: tuple[float, float, float, float] = (-1.0, -1.0, -1.0, -1.0)
 
@@ -38,6 +44,19 @@ def is_sentinel_score(score: tuple) -> bool:
 
 def stage_best_filename(stage_name: str) -> str:
     return f"best-{stage_name}.pt"
+
+
+STAGE_ENTRY_FILENAME = "stage-entry.pt"
+
+# Holdout regression vs the stage-entry / stage-best sampled bar.
+# Tuned to the observed v3run1 collapse (baseline ~0.69 → 0.156 / 0.0)
+# without halting on ordinary transfer noise (0.69 → 0.50).
+REGRESSION_RELATIVE_FLOOR = 0.50
+REGRESSION_ABS_DROP = 0.30
+REGRESSION_MIN_BASELINE = 0.25
+REGRESSION_MIN_EPISODES = 32
+TRANSFER_EVAL_EVERY = 5
+TRANSFER_LR = 1e-4
 
 
 def _sampled_block(ev: dict | None) -> dict:
@@ -179,6 +198,10 @@ def resume_event_record(
     forced_stage: str | None = None,
     windows_reset: bool = False,
     seed_stream_reset: bool = False,
+    reset_optimizer: bool = False,
+    keep_optimizer: bool = False,
+    need_baseline_eval: bool = False,
+    cli_lr: float | None = None,
 ) -> dict:
     return {
         "event": "resume",
@@ -191,6 +214,10 @@ def resume_event_record(
         "forced_stage": forced_stage,
         "windows_reset": bool(windows_reset),
         "seed_stream_reset": bool(seed_stream_reset),
+        "reset_optimizer": bool(reset_optimizer),
+        "keep_optimizer": bool(keep_optimizer),
+        "need_baseline_eval": bool(need_baseline_eval),
+        "cli_lr": cli_lr,
     }
 
 
@@ -324,6 +351,75 @@ def training_budget_warning(env_steps: int, total_steps: int) -> str | None:
     return None
 
 
+def transfer_eval_cadence_warning(eval_every: int, *, force_stage: bool) -> str | None:
+    """Zero eval cadence disables post-baseline unlock and regression halt."""
+    if force_stage and int(eval_every) == 0:
+        return (
+            "[train] --force-stage with --eval-every 0: map unlock/relock "
+            "and the holdout regression guard will not run after the "
+            f"pre-update baseline. Use --eval-every {TRANSFER_EVAL_EVERY} "
+            "for transfer recovery."
+        )
+    return None
+
+
+def should_rewrite_halt_checkpoint(committed: bool) -> bool:
+    """False once a regression restore has already written latest.pt."""
+    return not bool(committed)
+
+
+def write_touches_foreign_source(
+    dest: str | Path,
+    run_dir: str | Path,
+    source_checkpoint: str | Path | None,
+) -> bool:
+    """True when dest would write into another run's checkpoint directory."""
+    if not source_checkpoint:
+        return False
+    dest_p = Path(dest).resolve()
+    run_p = Path(run_dir).resolve()
+    src_p = Path(source_checkpoint).resolve().parent
+    try:
+        dest_p.relative_to(run_p)
+    except ValueError:
+        return True
+    if src_p == run_p:
+        return False
+    try:
+        dest_p.relative_to(src_p)
+        return True
+    except ValueError:
+        return False
+
+
+def restore_runtime_from_snapshot(
+    ckpt: dict,
+    *,
+    curriculum,
+    seed_stream=None,
+    set_rng=None,
+) -> list[str]:
+    """Restore curriculum / seed stream / RNG from a stage snapshot.
+
+    Trainer stats and env_steps stay with the caller. Missing fields are
+    skipped so older stage-entry files remain loadable.
+    """
+    applied: list[str] = []
+    raw_cur = ckpt.get("curriculum")
+    if isinstance(raw_cur, dict):
+        curriculum.load_state_dict(raw_cur)
+        applied.append("curriculum")
+    raw_stream = ckpt.get("seed_stream")
+    if seed_stream is not None and isinstance(raw_stream, dict):
+        seed_stream.load_state_dict(raw_stream)
+        applied.append("seed_stream")
+    raw_rng = ckpt.get("rng")
+    if set_rng is not None and isinstance(raw_rng, dict):
+        set_rng(raw_rng)
+        applied.append("rng")
+    return applied
+
+
 @dataclass
 class ResumePlan:
     curriculum: Curriculum
@@ -339,6 +435,10 @@ class ResumePlan:
     force_stage: bool
     forced_stage_name: str | None
     same_run: bool
+    reset_optimizer: bool
+    keep_optimizer: bool
+    need_baseline_eval: bool
+    pending_stage_baseline: bool
     event: dict
     warnings: list[str] = field(default_factory=list)
 
@@ -353,6 +453,9 @@ def plan_resume(
     force_stage: bool,
     allow_collapsed: bool = False,
     default_start: int = 0,
+    keep_optimizer: bool = False,
+    cli_lr: float | None = None,
+    eval_every: int | None = None,
 ) -> ResumePlan:
     """Build resume/force-stage state from checkpoint metadata.
 
@@ -360,6 +463,8 @@ def plan_resume(
     """
     if force_stage and stage_idx is None:
         raise SystemExit("[train] --force-stage requires --stage")
+    if keep_optimizer and not force_stage:
+        raise SystemExit("[train] --keep-optimizer requires --force-stage")
 
     source = str(resume_path)
     same_run = same_run_directory(resume_path, run_dir)
@@ -398,6 +503,11 @@ def plan_resume(
         )
 
     start = default_start if stage_idx is None else int(stage_idx)
+    reset_optimizer = bool(force_stage) and not bool(keep_optimizer)
+    pending_stage_baseline = bool(
+        force_stage or ckpt.get("pending_stage_baseline")
+    )
+    need_baseline_eval = pending_stage_baseline
     if force_stage:
         curriculum = Curriculum(start=int(stage_idx))
         global_best = loaded_global if same_run else BEST_SCORE_SENTINEL
@@ -408,6 +518,36 @@ def plan_resume(
         stage_baseline: dict = {}
         last_eval: dict = {}
         forced_name = curriculum.stage.name
+        if keep_optimizer:
+            warnings.append(
+                "[train] --keep-optimizer: inheriting Adam moments/step from "
+                "the source checkpoint (advanced; default force-stage resets)"
+            )
+        else:
+            warnings.append(
+                "[train] --force-stage: fresh Adam (no inherited moments/step); "
+                f"using CLI lr={cli_lr}"
+            )
+        warnings.append(
+            "[train] --force-stage: pre-update frozen sampled holdout will "
+            "run before the first PPO collect/update; it does not advance "
+            "the stage or write best.pt"
+        )
+        warnings.append(
+            "[train] --force-stage: extra train maps stay locked on the "
+            "canonical map until a sampled holdout clears the unlock bar"
+        )
+        warnings.append(
+            "[train] --force-stage: holdout regression guard will "
+            "restore stage-entry/stage-best weights and halt on a "
+            "confirmed collapse (no rollback loop)"
+        )
+        if eval_every is not None:
+            cadence = transfer_eval_cadence_warning(
+                int(eval_every), force_stage=True
+            )
+            if cadence:
+                warnings.append(cadence)
     else:
         curriculum = Curriculum(start=start)
         if "curriculum" in ckpt:
@@ -440,6 +580,10 @@ def plan_resume(
         forced_stage=forced_name,
         windows_reset=reset_windows,
         seed_stream_reset=force_stage,
+        reset_optimizer=reset_optimizer,
+        keep_optimizer=keep_optimizer,
+        need_baseline_eval=need_baseline_eval,
+        cli_lr=cli_lr,
     )
     return ResumePlan(
         curriculum=curriculum,
@@ -455,12 +599,22 @@ def plan_resume(
         force_stage=force_stage,
         forced_stage_name=forced_name,
         same_run=same_run,
+        reset_optimizer=reset_optimizer,
+        keep_optimizer=bool(keep_optimizer),
+        need_baseline_eval=need_baseline_eval,
+        pending_stage_baseline=pending_stage_baseline,
         event=event,
         warnings=warnings,
     )
 
 
-def format_resume_plan(plan: ResumePlan, *, env_steps: int, total_steps: int) -> str:
+def format_resume_plan(
+    plan: ResumePlan,
+    *,
+    env_steps: int,
+    total_steps: int,
+    eval_every: int | None = None,
+) -> str:
     stage = plan.curriculum.stage
     lines = [
         f"[dry-run] source={plan.source_checkpoint}",
@@ -476,11 +630,38 @@ def format_resume_plan(plan: ResumePlan, *, env_steps: int, total_steps: int) ->
         f"reset_windows={plan.reset_windows} "
         f"restore_seed_stream={plan.restore_seed_stream} "
         f"restore_rng={plan.restore_rng}",
+        f"[dry-run] reset_optimizer={plan.reset_optimizer} "
+        f"keep_optimizer={plan.keep_optimizer} "
+        f"need_baseline_eval={plan.need_baseline_eval}",
+        f"[dry-run] maps_unlocked={plan.curriculum.maps_unlocked} "
+        f"(canonical until sampled holdout unlock; not episode-count)",
+        (
+            "[dry-run] pre_update_baseline=frozen sampled holdout before "
+            "first collect/update; no stage advance; no global-best write"
+            if plan.need_baseline_eval
+            else "[dry-run] pre_update_baseline=skip"
+        ),
+        (
+            "[dry-run] regression_guard=halt+restore vs "
+            "stage-entry/stage-best holdout"
+            if plan.force_stage
+            else "[dry-run] regression_guard=stage-local holdout vs baseline"
+        ),
         f"[dry-run] global_best={list(plan.global_best_score)} "
         f"stage_best={list(plan.stage_best_score)} "
         f"source_best={list(plan.source_best_score)}",
         f"[dry-run] env_steps={env_steps} total_steps={total_steps}",
     ]
+    if eval_every is not None:
+        lines.append(
+            f"[dry-run] eval_every={eval_every} "
+            f"(0=off; transfer recovery uses {TRANSFER_EVAL_EVERY})"
+        )
+        cadence = transfer_eval_cadence_warning(
+            int(eval_every), force_stage=plan.force_stage
+        )
+        if cadence:
+            lines.append(cadence)
     budget = training_budget_warning(env_steps, total_steps)
     if budget:
         lines.append(budget)
@@ -497,3 +678,198 @@ def stage_index_by_name(name: str) -> int:
         if stage.name == name:
             return i
     raise KeyError(name)
+
+
+def holdout_reference_from_baseline(baseline: dict | None) -> dict:
+    """Normalize a persisted stage baseline to sampled holdout fields."""
+    raw = dict(baseline or {})
+    if "sampled" in raw or "deterministic" in raw:
+        samp = _sampled_block(raw)
+        wins, n, wr = sampled_binomial(samp)
+        peak = float(samp.get("mean_peak_tiles") or 0.0)
+    else:
+        wr = float(raw.get("win_rate") or 0.0)
+        n = int(raw.get("episodes") or raw.get("sampled_episodes") or 0)
+        wins = int(round(wr * n)) if n else 0
+        peak = float(raw.get("mean_peak_tiles") or 0.0)
+    lb, ub = wilson_interval(wins, n) if n else (0.0, 1.0)
+    return {
+        "win_rate": wr,
+        "episodes": n,
+        "wins": wins,
+        "mean_peak_tiles": peak,
+        "wilson_lower": lb,
+        "wilson_upper": ub,
+        "kind": raw.get("kind") or "holdout",
+        "stage": raw.get("stage") or "",
+        "iterations": int(raw.get("iterations") or 0),
+        "env_steps": int(raw.get("env_steps") or 0),
+    }
+
+
+def build_stage_baseline(
+    ev: dict,
+    *,
+    iterations: int,
+    env_steps: int,
+    stage: str,
+    kind: str = "pre_update_holdout",
+) -> dict:
+    """Persist a frozen sampled holdout as the stage-local reference."""
+    samp = _sampled_block(ev)
+    wins, n, wr = sampled_binomial(samp)
+    lb, ub = wilson_interval(wins, n) if n else (0.0, 1.0)
+    return {
+        "kind": kind,
+        "stage": stage,
+        "win_rate": wr,
+        "episodes": n,
+        "wins": wins,
+        "mean_peak_tiles": float(samp.get("mean_peak_tiles") or 0.0),
+        "wilson_lower": round(lb, 4),
+        "wilson_upper": round(ub, 4),
+        "env_steps": int(env_steps),
+        "iterations": int(iterations),
+        "seeds": list(samp.get("seeds") or ev.get("seeds") or []),
+        "eval": ev,
+    }
+
+
+def judge_holdout_regression(
+    current_ev: dict | None,
+    baseline: dict | None,
+    *,
+    relative_floor: float = REGRESSION_RELATIVE_FLOOR,
+    abs_drop: float = REGRESSION_ABS_DROP,
+    min_baseline_wr: float = REGRESSION_MIN_BASELINE,
+    min_episodes: int = REGRESSION_MIN_EPISODES,
+) -> dict:
+    """Severe confirmed holdout drop vs stage-entry / stage-best baseline.
+
+    Uses frozen sampled holdout evidence only. Rolling train windows
+    never enter this decision. Halt+restore (not continue-after-rollback)
+    is the lowest-loop-risk action: the observed collapse had healthy
+    per-update KL, so retrying the same settings would loop.
+    """
+    cur_samp = _sampled_block(current_ev)
+    cur_wins, cur_n, cur_wr = sampled_binomial(cur_samp)
+    cur_lb, cur_ub = wilson_interval(cur_wins, cur_n) if cur_n else (0.0, 1.0)
+    ref = holdout_reference_from_baseline(baseline)
+    base_wr = float(ref["win_rate"])
+    base_n = int(ref["episodes"])
+    base_lb = float(ref["wilson_lower"])
+    competent = base_n >= min_episodes and base_wr >= min_baseline_wr
+    enough = cur_n >= min_episodes
+    zero_win = enough and cur_wr <= 0.0
+    relative = enough and cur_wr <= base_wr * relative_floor
+    dropped = enough and (base_wr - cur_wr) >= abs_drop
+    confirmed = enough and cur_n > 0 and cur_ub < base_lb
+    severe = bool(
+        competent
+        and enough
+        and (
+            zero_win
+            or (relative and dropped and confirmed)
+        )
+    )
+    if not competent:
+        reason = "no_competent_baseline"
+    elif not enough:
+        reason = "current_holdout_too_small"
+    elif severe and zero_win:
+        reason = "zero_win_collapse"
+    elif severe:
+        reason = "confirmed_holdout_drop"
+    else:
+        reason = "within_tolerance"
+    return {
+        "severe": severe,
+        "reason": reason,
+        "action": "restore_and_halt" if severe else "continue",
+        "baseline_win_rate": round(base_wr, 4),
+        "baseline_episodes": base_n,
+        "baseline_wilson_lower": round(base_lb, 4),
+        "current_win_rate": round(cur_wr, 4),
+        "current_episodes": cur_n,
+        "current_wilson_upper": round(cur_ub, 4),
+        "current_wilson_lower": round(cur_lb, 4),
+        "relative_floor": relative_floor,
+        "abs_drop": abs_drop,
+        "min_baseline_wr": min_baseline_wr,
+    }
+
+
+def choose_restore_snapshot(
+    *,
+    stage_entry_exists: bool,
+    stage_best_exists: bool,
+    stage_best_score: tuple,
+    baseline_wr: float,
+) -> str:
+    """Prefer stage-best weights when they beat the entry holdout."""
+    if stage_best_exists and float(stage_best_score[0]) > float(baseline_wr):
+        return "stage-best"
+    if stage_entry_exists:
+        return "stage-entry"
+    if stage_best_exists:
+        return "stage-best"
+    return "none"
+
+
+def baseline_event_record(
+    *,
+    it: int,
+    env_steps: int,
+    stage: str,
+    baseline: dict,
+    unlock: dict | None = None,
+) -> dict:
+    return {
+        "event": "stage_baseline",
+        "it": int(it),
+        "env_steps": int(env_steps),
+        "stage": stage,
+        "kind": baseline.get("kind"),
+        "win_rate": baseline.get("win_rate"),
+        "episodes": baseline.get("episodes"),
+        "seeds": list(baseline.get("seeds") or []),
+        "unlock": unlock or {},
+        "wrote_global_best": False,
+        "advanced_stage": False,
+    }
+
+
+def map_unlock_event_record(
+    *,
+    it: int,
+    stage: str,
+    judgment: dict,
+) -> dict:
+    return {
+        "event": "map_unlock",
+        "it": int(it),
+        "stage": stage,
+        **judgment,
+    }
+
+
+def regression_event_record(
+    *,
+    it: int,
+    env_steps: int,
+    stage: str,
+    judgment: dict,
+    restored_from: str,
+) -> dict:
+    return {
+        "event": "stage_regression",
+        "it": int(it),
+        "env_steps": int(env_steps),
+        "stage": stage,
+        "restored_from": restored_from,
+        **judgment,
+    }
+
+
+class StageRegressionHalt(Exception):
+    """Severe holdout regression; weights already restored. Stop the run."""

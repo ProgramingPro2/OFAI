@@ -101,7 +101,11 @@ until the agent has land); a never-spawn at `maxTicks` is `no_spawn`.
 ### PPO / recovery
 
 - Adam `(β1,β2)=(0.9,0.95)`, `eps=1e-5`, default `lr=3e-4` (1e-4 left
-  active-head KL near 1e-4); spatial buffer **float16** (not uint8).
+  active-head KL near 1e-4). `--force-stage` loads policy/value weights
+  then **resets Adam** (empty moments, step 0) at the CLI `--lr`.
+  Ordinary same-stage resume still restores optimizer exactly.
+  `--keep-optimizer` is an advanced override only. Spatial buffer
+  **float16** (not uint8).
 - Deep-copied optimizer snapshot; hard revert restores model+optimizer,
   does **not** adapt `ent_coef`, reports **zero** kept updates.
 - Advantages NaN-guarded + std-floor normalized.
@@ -127,10 +131,11 @@ until the agent has land); a never-spawn at `maxTicks` is `no_spawn`.
 model, optimizer, ent_coef, stats (bounded windows + cumulatives),
 hyperparameters, metrics snapshot,
 curriculum {idx, stage (name), stage_episodes, stage_successes,
-last_eval_passed, consecutive_eval_passes, mastery_version},
+last_eval_passed, consecutive_eval_passes, maps_unlocked, mastery_version},
 seed_stream {run_name, master_seed, n_envs, episode_index[]},
 curriculum_suite {canonical_map, train_maps, holdout_map, ood_maps, gate},
-stage_baseline, best_score (sampled true win, det true win, sampled peak,
+stage_baseline (sampled holdout at stage entry), pending_stage_baseline,
+best_score (sampled true win, det true win, sampled peak,
 det peak), rng {python, numpy, torch, cuda}
 ```
 
@@ -179,12 +184,47 @@ in later stages. `REWARD_CURRICULUM_SUCCESS=1.0` is reserved below
 `REWARD_WIN=3.0` if a discrete milestone bonus is ever reintroduced;
 it must not create a positive non-win return.
 
-**Map sets.** Early stages stay on one canonical map. After
-`map_burn_in` (`min_episodes/4`) island and later stages sample a small
-validated set (FourIslands/Hawaii/Caribbean/FaroeIslands, then
-Halkidiki/Balkans/Britannia, then World/Europe/NorthAmerica). Selection
-is deterministic from the episode seed. Arcade, tournament, The Box, and
-Giant World are never used. Tensor/action schema does not change.
+**Map sets.** Early stages stay on one canonical map. Extra train maps
+(FourIslands/Hawaii/Caribbean/FaroeIslands, then Halkidiki/Balkans,
+then World/Europe/NorthAmerica) unlock only after a **sampled frozen
+holdout** clears a stage-local unlock bar: `win_rate >= 0.50` and
+Wilson lower bound `>= 0.30` (16/32). That is below 26/32 mastery so
+maps can enter before stage advance, but it is not an episode-count
+lottery. Peninsula Balkans therefore cannot enter at 55/75 episodes
+with a 19% train window. Relock uses hysteresis (`win_rate < 0.35`,
+about 11/32) so 0.35–0.50 noise does not flip-flop. `map_burn_in`
+remains in suite metadata only. Selection among unlocked maps is
+deterministic from the episode seed. Holdout stays on the canonical
+map. Arcade, tournament, The Box, and Giant World are never used.
+Tensor/action schema does not change.
+
+**Force-stage transfer.** `--force-stage` with a new `--run-name` is
+isolated from the source directory. It resets stage-local curriculum,
+windows, and seed stream; keeps global-best metadata for same-run
+only; **does not inherit Adam moments**. Before the first PPO
+collect/update it runs a frozen sampled holdout, writes
+`stage-entry.pt` plus `stage_baseline`, and must not increment
+`iterations`/`env_steps`, advance the stage, or write `best.pt`.
+A stage-local holdout regression guard compares later evals to that
+baseline (or a better stage-best). On a confirmed collapse (the
+observed ~0.69 → 0.156 / 0-win pattern: current `<= 50%` of baseline,
+absolute drop `>= 0.30`, and Wilson intervals disjoint, or zero-win
+against a competent bar) the run restores `stage-entry.pt` /
+`best-<stage>.pt` policy/value, optimizer, `ent_coef`, RNG,
+curriculum, and seed-stream, writes `latest.pt` atomically, and
+**halts**. The outer `finally` must not rewrite that snapshot from
+in-memory weights. Restore-and-continue would loop: per-update KL
+stayed healthy while the policy drifted. Source checkpoints and
+run-global `best.pt` are never overwritten; writes stay inside the
+new `--run-name` directory. A weak or undersized baseline never
+halts. `--eval-every 0` skips later unlock/regression after the
+pre-update baseline and is warned on `--force-stage`. Missing
+`maps_unlocked` / `stage_baseline` on old schema-v2 metadata loads
+as locked / empty. Recommended recovery uses the source **16×8**
+farm (128 envs, batch 16384) with `--lr 1e-4`, `--eval-every 5`,
+`--additional-steps`, and a free `--port`; global defaults for
+fresh training stay `3e-4` and `eval-every 0`. A 4×8 farm would
+cut the minibatch 4× and change PPO noise/KL.
 
 **Holdout gate.** `--eval-every` plays the true objective on a **frozen
 per-stage holdout** (canonical map; blake2 mix of

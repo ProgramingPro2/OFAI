@@ -25,15 +25,28 @@ from tqdm import tqdm
 from .checkpoint import (
     BEST_SCORE_SENTINEL,
     CollapsedCheckpointError,
+    STAGE_ENTRY_FILENAME,
+    StageRegressionHalt,
+    TRANSFER_EVAL_EVERY,
+    TRANSFER_LR,
     _eval_score,
-    _mode_collapsed,
+    baseline_event_record,
+    build_stage_baseline,
+    choose_restore_snapshot,
     finalize_event_record,
     eval_is_passive_collapse,
     eval_is_zero_win,
     format_resume_plan,
+    is_sentinel_score,
+    judge_holdout_regression,
+    map_unlock_event_record,
     on_stage_advance_scores,
     plan_resume,
+    regression_event_record,
+    restore_runtime_from_snapshot,
+    should_rewrite_halt_checkpoint,
     should_write_global_best,
+    write_touches_foreign_source,
     should_write_stage_best,
     stage_advance_event_record,
     stage_best_filename,
@@ -49,7 +62,14 @@ from .curriculum import (
 from .env_client import RolloutInterrupted, ShardedVecEnv
 from .model import Policy, obs_to_tensors
 from . import spaces
-from .ppo import PPOConfig, PPOTrainer, RolloutBuffer, classify_outcome
+from .ppo import (
+    PPOConfig,
+    PPOTrainer,
+    RolloutBuffer,
+    apply_optimizer_lr,
+    classify_outcome,
+    optimizer_is_fresh,
+)
 from .seeds import SeedStream, holdout_seed, ood_seed
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -121,6 +141,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "current table; v2 checkpoints migrate idx through V2_STAGE_NAMES.",
     )
     p.add_argument("--force-stage", action="store_true", help="apply --stage even when resuming")
+    p.add_argument(
+        "--keep-optimizer",
+        action="store_true",
+        help="advanced: with --force-stage, keep source Adam moments/step "
+        "(default force-stage is a fresh optimizer at --lr)",
+    )
     p.add_argument(
         "--allow-collapsed-resume",
         action="store_true",
@@ -447,6 +473,63 @@ def _fixed_seed_eval_attempt(
     return results
 
 
+def run_pre_update_baseline(
+    *,
+    policy: Policy,
+    env: ShardedVecEnv,
+    curriculum: Curriculum,
+    trainer: PPOTrainer,
+    device: torch.device,
+    n_sampled: int,
+    n_det: int,
+    n_ood: int,
+) -> tuple[dict, dict, dict | None, dict]:
+    """Frozen holdout before the first PPO collect/update.
+
+    Does not increment trainer iterations/env_steps, does not call
+    note_eval / maybe_advance, and does not write a global-best score.
+    """
+    it0 = int(trainer.stats.iterations)
+    steps0 = int(trainer.stats.env_steps)
+    ev = run_fixed_seed_eval(
+        policy,
+        env,
+        curriculum,
+        device,
+        n_sampled,
+        n_det=n_det,
+        n_sampled=n_sampled,
+        suite="holdout",
+    )
+    ood_ev = None
+    if n_ood > 0 and curriculum.stage.ood_maps:
+        ood_ev = run_fixed_seed_eval(
+            policy,
+            env,
+            curriculum,
+            device,
+            n_ood,
+            n_det=0,
+            n_sampled=n_ood,
+            suite="ood",
+        )
+    if trainer.stats.iterations != it0 or trainer.stats.env_steps != steps0:
+        raise RuntimeError(
+            "pre-update baseline advanced trainer counters "
+            f"(it {it0}->{trainer.stats.iterations}, "
+            f"env_steps {steps0}->{trainer.stats.env_steps})"
+        )
+    baseline = build_stage_baseline(
+        ev,
+        iterations=it0,
+        env_steps=steps0,
+        stage=curriculum.stage.name,
+        kind="pre_update_holdout",
+    )
+    unlock = curriculum.apply_unlock(ev)
+    return baseline, ev, ood_ev, unlock
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
@@ -482,11 +565,15 @@ def main(argv: list[str] | None = None) -> None:
     stage_baseline: dict = {}
     last_eval: dict = {}
     last_mastery: dict = {}
+    pending_stage_baseline = False
+    halt_reason = ""
+    halt_checkpoint_committed = False
     resume_plan = None
     ckpt: dict = {}
 
     if resume_path:
-        ckpt = trainer.load(resume_path)
+        restore_opt = not (args.force_stage and not args.keep_optimizer)
+        ckpt = trainer.load(resume_path, restore_optimizer=restore_opt)
         print(f"resumed from {resume_path} (schema={ckpt.get('schema_version', 1)})")
         try:
             resume_plan = plan_resume(
@@ -498,6 +585,9 @@ def main(argv: list[str] | None = None) -> None:
                 force_stage=args.force_stage,
                 allow_collapsed=args.allow_collapsed_resume,
                 default_start=start_stage,
+                keep_optimizer=args.keep_optimizer,
+                cli_lr=args.lr,
+                eval_every=args.eval_every,
             )
         except CollapsedCheckpointError:
             raise
@@ -507,10 +597,24 @@ def main(argv: list[str] | None = None) -> None:
         source_best_score = resume_plan.source_best_score
         stage_baseline = resume_plan.stage_baseline
         last_eval = resume_plan.last_eval
+        pending_stage_baseline = resume_plan.pending_stage_baseline
         if resume_plan.restore_rng and "rng" in ckpt:
             _set_rng_state(ckpt["rng"])
         if resume_plan.reset_windows:
             trainer.stats.reset_rolling_windows()
+        if resume_plan.reset_optimizer:
+            trainer.reset_optimizer(args.lr)
+            print(
+                f"[train] --force-stage: fresh Adam at lr={args.lr:g} "
+                f"(fresh={optimizer_is_fresh(trainer.opt)})"
+            )
+        elif resume_plan.keep_optimizer:
+            apply_optimizer_lr(trainer.opt, args.lr)
+            trainer.cfg.lr = float(args.lr)
+            print(
+                f"[train] --keep-optimizer: inherited Adam moments; "
+                f"param-group lr set to {args.lr:g}"
+            )
         for warn in resume_plan.warnings:
             print(warn)
         if args.force_stage:
@@ -555,9 +659,22 @@ def main(argv: list[str] | None = None) -> None:
             resume_plan.curriculum = curriculum
         print(
             format_resume_plan(
-                resume_plan, env_steps=env_steps, total_steps=args.total_steps
+                resume_plan,
+                env_steps=env_steps,
+                total_steps=args.total_steps,
+                eval_every=args.eval_every,
             )
         )
+        if resume_plan.force_stage:
+            print(
+                f"[dry-run] transfer recommendation: --lr {TRANSFER_LR:g} "
+                f"--eval-every {TRANSFER_EVAL_EVERY} "
+                "(do not change global defaults for unrelated fresh runs)"
+            )
+            print(
+                "[dry-run] CLI lr after optimizer reset = "
+                f"{args.lr:g}; eval_every={args.eval_every}"
+            )
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +743,12 @@ def main(argv: list[str] | None = None) -> None:
         return obs_
 
     def save_ckpt(path: Path, **extra) -> None:
+        source = resume_plan.source_checkpoint if resume_plan is not None else ""
+        if write_touches_foreign_source(path, run_dir, source):
+            raise RuntimeError(
+                f"refusing to write {path} into source checkpoint directory "
+                f"{Path(source).resolve().parent}"
+            )
         trainer.save(
             str(path),
             extra={
@@ -643,6 +766,8 @@ def main(argv: list[str] | None = None) -> None:
                 "rng": _rng_state(),
                 "seed_stream": seed_stream.state_dict(),
                 "curriculum_suite": curriculum.suite_meta(),
+                "pending_stage_baseline": pending_stage_baseline,
+                "halt_reason": halt_reason,
                 **extra,
             },
         )
@@ -655,6 +780,136 @@ def main(argv: list[str] | None = None) -> None:
     steps_per_iter = cfg.rollout_len * total_envs
     device = torch.device(cfg.device)
 
+    def persist_stage_entry(ev: dict | None = None, **extra) -> None:
+        save_ckpt(
+            run_dir / STAGE_ENTRY_FILENAME,
+            eval=ev or {},
+            stage_entry=True,
+            **extra,
+        )
+
+    def apply_map_unlock(ev: dict, *, it: int) -> dict:
+        judgment = curriculum.apply_unlock(ev)
+        if judgment["action"] != "hold":
+            rec = map_unlock_event_record(
+                it=it, stage=curriculum.stage.name, judgment=judgment
+            )
+            log_f.write(json.dumps(rec) + "\n")
+            pbar.write(
+                f"[curriculum] maps {judgment['action']} "
+                f"stage={curriculum.stage.name} "
+                f"samp_win={judgment['sampled_win_rate']} "
+                f"wilson_lb={judgment['sampled_wilson_lower']} "
+                f"maps_unlocked={judgment['maps_unlocked']}"
+            )
+        return judgment
+
+    def restore_on_regression(judgment: dict) -> str:
+        entry = run_dir / STAGE_ENTRY_FILENAME
+        best_path = run_dir / stage_best_filename(curriculum.stage.name)
+        which = choose_restore_snapshot(
+            stage_entry_exists=entry.is_file(),
+            stage_best_exists=best_path.is_file(),
+            stage_best_score=stage_best_score,
+            baseline_wr=float((stage_baseline or {}).get("win_rate") or 0.0),
+        )
+        src = best_path if which == "stage-best" else entry
+        if which == "none" or not src.is_file():
+            raise RuntimeError(
+                "stage regression halt requested but no stage-entry/stage-best "
+                "snapshot exists"
+            )
+        snap = trainer.load_weights_and_optimizer(str(src))
+        restore_runtime_from_snapshot(
+            snap,
+            curriculum=curriculum,
+            seed_stream=seed_stream,
+            set_rng=_set_rng_state,
+        )
+        return str(src)
+
+    def run_force_stage_baseline() -> None:
+        nonlocal stage_baseline, last_eval, pending_stage_baseline, obs
+        nonlocal stage_best_score
+        holdout_n = resolve_holdout_episodes(
+            args.eval_episodes, curriculum.stage.min_eval_episodes
+        )
+        it0 = trainer.stats.iterations
+        steps0 = trainer.stats.env_steps
+        pbar.write(
+            f"[eval] pre-update baseline holdout at it={it0} "
+            f"env_steps={steps0} stage={curriculum.stage.name} "
+            f"n_samp={holdout_n} n_det={args.eval_det_episodes} "
+            f"map={curriculum.stage.holdout_map} seeds=frozen "
+            "(no collect/update, no stage advance, no global-best write)"
+        )
+        env.set_episode_hooks(None)
+        try:
+            baseline, ev, ood_ev, unlock = run_pre_update_baseline(
+                policy=policy,
+                env=env,
+                curriculum=curriculum,
+                trainer=trainer,
+                device=device,
+                n_sampled=holdout_n,
+                n_det=args.eval_det_episodes,
+                n_ood=args.eval_ood_episodes,
+            )
+        finally:
+            obs = reinit_envs()
+        if trainer.stats.iterations != it0 or trainer.stats.env_steps != steps0:
+            raise RuntimeError("baseline eval advanced trainer counters")
+        stage_baseline = baseline
+        last_eval = ev
+        pending_stage_baseline = False
+        score = _eval_score(ev)
+        if should_write_stage_best(score, stage_best_score, ev):
+            stage_best_score = score
+            save_ckpt(
+                run_dir / stage_best_filename(curriculum.stage.name),
+                eval=ev,
+                mastery={"baseline": True, "passed": False},
+                ood=ood_ev,
+                unlock=unlock,
+                best_kind="stage",
+            )
+        persist_stage_entry(
+            ev,
+            mastery={"baseline": True, "passed": False},
+            ood=ood_ev,
+            unlock=unlock,
+            best_kind="stage_entry",
+        )
+        if unlock.get("action") not in (None, "hold") and log_f is not None:
+            log_f.write(
+                json.dumps(
+                    map_unlock_event_record(
+                        it=it0, stage=curriculum.stage.name, judgment=unlock
+                    )
+                )
+                + "\n"
+            )
+        if log_f is not None:
+            log_f.write(
+                json.dumps(
+                    baseline_event_record(
+                        it=it0,
+                        env_steps=steps0,
+                        stage=curriculum.stage.name,
+                        baseline=baseline,
+                        unlock=unlock,
+                    )
+                )
+                + "\n"
+            )
+        pbar.write(
+            f"[eval] stage-entry baseline samp_win={baseline['win_rate']:.3f} "
+            f"n={baseline['episodes']} "
+            f"unlock={unlock.get('action')} "
+            f"maps_unlocked={curriculum.maps_unlocked} "
+            f"it={trainer.stats.iterations} env_steps={trainer.stats.env_steps}"
+        )
+
     pbar = tqdm(
         total=args.total_steps,
         initial=trainer.stats.env_steps,
@@ -666,6 +921,11 @@ def main(argv: list[str] | None = None) -> None:
     finalize_reason = "done"
 
     try:
+        if pending_stage_baseline or (
+            resume_plan is not None and resume_plan.need_baseline_eval
+        ):
+            run_force_stage_baseline()
+
         while trainer.stats.env_steps < args.total_steps:
             t0 = time.time()
             try:
@@ -721,11 +981,10 @@ def main(argv: list[str] | None = None) -> None:
             prev_idx = curriculum.idx
             if curriculum.maybe_advance():
                 pre_reset = st.rolling_snapshot(prev_stage)
-                stage_baseline = {
-                    "win_rate": st.win_rate,
-                    "mean_return": st.mean_return,
-                    "env_steps": st.env_steps,
-                }
+                # New stage: holdout baseline is taken before the next
+                # collect. Rolling train windows are not a transfer bar.
+                stage_baseline = {}
+                pending_stage_baseline = True
                 global_best_score, stage_best_score = on_stage_advance_scores(
                     global_best_score
                 )
@@ -763,6 +1022,8 @@ def main(argv: list[str] | None = None) -> None:
                 pbar.set_description(curriculum.stage.name)
                 save_ckpt(run_dir / "latest.pt")
                 obs = reinit_envs()
+                persist_stage_entry()
+                run_force_stage_baseline()
 
             if args.eval_every and st.iterations > 0 and st.iterations % args.eval_every == 0:
                 suite_meta = curriculum.suite_meta()
@@ -812,6 +1073,82 @@ def main(argv: list[str] | None = None) -> None:
                             suite="ood",
                         )
                     last_eval = ev
+                    apply_map_unlock(ev, it=st.iterations)
+                    if int((stage_baseline or {}).get("episodes") or 0) < (
+                        curriculum.stage.min_eval_episodes
+                    ):
+                        stage_baseline = build_stage_baseline(
+                            ev,
+                            iterations=st.iterations,
+                            env_steps=st.env_steps,
+                            stage=curriculum.stage.name,
+                            kind="first_holdout",
+                        )
+                        persist_stage_entry(ev, mastery=judgment, ood=ood_ev)
+                    else:
+                        guard = judge_holdout_regression(ev, stage_baseline)
+                        if (
+                            not is_sentinel_score(stage_best_score)
+                            and float(stage_best_score[0])
+                            > float(stage_baseline.get("win_rate") or 0.0)
+                        ):
+                            guard_best = judge_holdout_regression(
+                                ev,
+                                {
+                                    "win_rate": float(stage_best_score[0]),
+                                    "episodes": int(
+                                        stage_baseline.get("episodes")
+                                        or (ev.get("sampled") or {}).get("episodes")
+                                        or 32
+                                    ),
+                                    "kind": "stage_best",
+                                },
+                            )
+                            if guard_best["severe"]:
+                                guard = guard_best
+                        if guard["severe"]:
+                            restored = restore_on_regression(guard)
+                            halt_reason = guard["reason"]
+                            log_f.write(
+                                json.dumps(
+                                    regression_event_record(
+                                        it=st.iterations,
+                                        env_steps=st.env_steps,
+                                        stage=curriculum.stage.name,
+                                        judgment=guard,
+                                        restored_from=restored,
+                                    )
+                                )
+                                + "\n"
+                            )
+                            pbar.write(
+                                f"[eval] STAGE REGRESSION {guard['reason']}: "
+                                f"holdout {guard['current_win_rate']} vs "
+                                f"baseline {guard['baseline_win_rate']}; "
+                                f"restored {restored} and halting "
+                                "(no rollback loop; source/global best untouched)"
+                            )
+                            save_ckpt(
+                                run_dir / "latest.pt",
+                                eval=ev,
+                                mastery=judgment,
+                                ood=ood_ev,
+                                regression=guard,
+                                save_reason="stage_regression",
+                            )
+                            # latest.pt now holds the restored snapshot.
+                            # Do not let the outer finally re-serialize
+                            # whatever is still in memory after this point.
+                            halt_checkpoint_committed = True
+                            save_ckpt(
+                                run_dir / "final.pt",
+                                eval=ev,
+                                mastery=judgment,
+                                ood=ood_ev,
+                                regression=guard,
+                                save_reason="stage_regression",
+                            )
+                            raise StageRegressionHalt(guard["reason"])
                     score = _eval_score(ev)
                     if should_write_stage_best(score, stage_best_score, ev):
                         stage_best_score = score
@@ -899,6 +1236,7 @@ def main(argv: list[str] | None = None) -> None:
                 "stage_success_rate": round(curriculum.stage_success_rate, 4),
                 "stage_win_rate": round(curriculum.stage_success_rate, 4),
                 "train_maps": curriculum.stage.train_map_set,
+                "maps_unlocked": curriculum.maps_unlocked,
                 "holdout_map": curriculum.stage.holdout_map,
                 "ood_maps": list(curriculum.stage.ood_maps),
                 "seed_stream": seed_stream.summary(),
@@ -938,6 +1276,15 @@ def main(argv: list[str] | None = None) -> None:
                 save_ckpt(run_dir / "latest.pt")
             if st.iterations % 100 == 0:
                 save_ckpt(run_dir / f"it{st.iterations}.pt")
+    except StageRegressionHalt as exc:
+        finalize_reason = "stage_regression"
+        if halt_checkpoint_committed:
+            pbar.write(
+                f"stage regression halt: {exc}; restored latest.pt already "
+                "committed (finally will not rewrite)"
+            )
+        else:
+            pbar.write(f"stage regression halt: {exc}; saving restored latest.pt")
     except KeyboardInterrupt:
         finalize_reason = "keyboard_interrupt"
         pbar.write("interrupted; saving latest.pt and final.pt")
@@ -949,8 +1296,12 @@ def main(argv: list[str] | None = None) -> None:
         pbar.close()
         # Newest recoverable (committed) trainer state — not a partial
         # collect. latest.pt must not rewind to the last %5 snapshot.
-        save_ckpt(run_dir / "latest.pt", save_reason=finalize_reason)
-        save_ckpt(run_dir / "final.pt", save_reason=finalize_reason)
+        # After a regression restore the snapshot is already on disk;
+        # rewriting here would replace it with whatever is still in
+        # memory (including a failed/partial restore).
+        if should_rewrite_halt_checkpoint(halt_checkpoint_committed):
+            save_ckpt(run_dir / "latest.pt", save_reason=finalize_reason)
+            save_ckpt(run_dir / "final.pt", save_reason=finalize_reason)
         if log_f is not None:
             log_f.write(
                 json.dumps(

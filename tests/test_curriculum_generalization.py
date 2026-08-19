@@ -113,21 +113,25 @@ def test_holdout_seeds_frozen_and_independent_of_iteration():
     assert all(c["shaping"] == 0.0 for c in cfgs)
 
 
-def test_train_map_set_is_canonical_until_burn_in():
+def test_train_map_set_is_canonical_until_holdout_unlock():
     cur = Curriculum(start=2)
     assert cur.stage.name == "island-ffa"
     assert cur.stage.map == "FourIslands"
     assert "Hawaii" in cur.stage.train_map_set
     cfg = cur.make_env_config("any-seed", suite="train")
     assert cfg["map"] == "FourIslands"
-    cur.stage_episodes = cur.stage.map_burn_in
+    # Episode-count burn-in no longer unlocks extra maps.
+    cur.stage_episodes = max(cur.stage.map_burn_in, 10_000)
     maps = {cur.make_env_config(mix_seed("m", i), suite="train")["map"] for i in range(40)}
-    assert "FourIslands" in maps
-    assert maps & set(cur.stage.train_maps)
+    assert maps == {"FourIslands"}
     hold = cur.make_env_config(mix_seed("h", 0), suite="holdout")
     assert hold["map"] == "FourIslands"
     ood = cur.make_env_config(mix_seed("o", 0), suite="ood")
     assert ood["map"] in cur.stage.ood_maps
+    cur.maps_unlocked = True
+    unlocked = {cur.make_env_config(mix_seed("m", i), suite="train")["map"] for i in range(40)}
+    assert "FourIslands" in unlocked
+    assert unlocked & set(cur.stage.train_maps)
 
 
 def test_seed_stream_persists_and_does_not_replay():
@@ -233,18 +237,17 @@ def test_ood_maps_do_not_overlap_train_set():
         )
 
 
-def test_burn_in_next_episode_uses_completed_plus_one():
+def test_completed_episodes_does_not_unlock_maps():
     cur = Curriculum(start=2)
     burn = cur.stage.map_burn_in
     assert burn > 1
     cur.stage_episodes = burn - 1
     assert cur.make_env_config("still-canonical")["map"] == "FourIslands"
-    unlocked = {
+    still_locked = {
         cur.make_env_config(mix_seed("m", i), completed_episodes=burn)["map"]
         for i in range(48)
     }
-    assert "FourIslands" in unlocked
-    assert unlocked & set(cur.stage.train_maps)
+    assert still_locked == {"FourIslands"}
 
 
 def test_resolve_holdout_episodes_raises_legacy_eight():

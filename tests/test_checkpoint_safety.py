@@ -250,6 +250,9 @@ def test_force_stage_resets_windows_ordinary_resume_does_not():
         force_stage=True,
     )
     assert forced.reset_windows
+    assert forced.reset_optimizer
+    assert forced.need_baseline_eval
+    assert not forced.curriculum.maps_unlocked
     assert not forced.restore_seed_stream
     assert not forced.restore_rng
     assert forced.curriculum.stage.name == "nations-easy-peninsula"
@@ -269,6 +272,8 @@ def test_force_stage_resets_windows_ordinary_resume_does_not():
         force_stage=False,
     )
     assert not ordinary.reset_windows
+    assert not ordinary.reset_optimizer
+    assert not ordinary.need_baseline_eval
     assert ordinary.restore_seed_stream
     assert ordinary.curriculum.stage.name == "nations-easy-small"
     assert ordinary.curriculum.stage_episodes == 9170
@@ -530,6 +535,12 @@ def test_dry_run_cli_writes_nothing(tmp_path, monkeypatch, capsys):
     assert "nations-easy-peninsula" in out
     assert "force_stage=True" in out
     assert "reset_windows=True" in out
+    assert "reset_optimizer=True" in out
+    assert "need_baseline_eval=True" in out
+    assert "pre_update_baseline=frozen sampled holdout" in out
+    assert "maps_unlocked=False" in out
+    assert "eval_every=0" in out
+    assert "eval-every 0" in out
     assert not (tmp_path / dest_name).exists()
     assert not (tmp_path / "logs" / f"{dest_name}.jsonl").exists()
     assert src.is_file()
@@ -552,6 +563,7 @@ def test_parse_args_new_flags():
         ]
     )
     assert args.force_stage
+    assert not args.keep_optimizer
     assert args.allow_collapsed_resume
     assert args.dry_run
     assert args.additional_steps == 1_000_000

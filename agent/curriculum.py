@@ -45,10 +45,10 @@ class CurriculumRestoreError(ValueError):
     """Checkpoint stage identity cannot be mapped onto the current list."""
 
 
-def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
-    """Wilson score interval lower bound for a binomial win rate."""
+def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval (lower, upper) for a binomial win rate."""
     if n <= 0:
-        return 0.0
+        return 0.0, 1.0
     wins = max(0, min(int(wins), int(n)))
     n = int(n)
     p = wins / n
@@ -56,7 +56,29 @@ def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
     den = 1.0 + z2 / n
     center = (p + z2 / (2.0 * n)) / den
     half = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)) ** 0.5) / den
-    return max(0.0, center - half)
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
+    """Wilson score interval lower bound for a binomial win rate."""
+    return wilson_interval(wins, n, z)[0]
+
+
+def wilson_upper_bound(wins: int, n: int, z: float = 1.96) -> float:
+    """Wilson score interval upper bound for a binomial win rate."""
+    return wilson_interval(wins, n, z)[1]
+
+
+def sampled_binomial(mode: dict | None) -> tuple[int, int, float]:
+    """Return (wins, n, win_rate) from a sampled eval block."""
+    samp = dict(mode or {})
+    n = int(samp.get("episodes") or 0)
+    wr = float(samp.get("win_rate") or 0.0)
+    if n <= 0:
+        return 0, 0, 0.0
+    wins = int(round(wr * n))
+    wins = max(0, min(wins, n))
+    return wins, n, wr
 
 
 @dataclass
@@ -87,15 +109,25 @@ class Stage:
     # Training competency flag (core FFA win remains 80%). 0 disables.
     # Crossing this sets stageSuccess; it does not end the episode.
     win_tiles_frac: float = 0.0
-    # Canonical map is `map`. Extra train maps unlock after map_burn_in
-    # stage episodes. Holdout always uses holdout_map (defaults to canonical).
+    # Canonical map is `map`. Extra train maps unlock only after a sampled
+    # frozen holdout clears the unlock bar (not episode-count burn-in).
+    # Holdout always uses holdout_map (defaults to canonical).
     train_maps: list[str] = field(default_factory=list)
     holdout_map: str = ""
     holdout_map_size: str = ""
     ood_maps: list[str] = field(default_factory=list)
     ood_map_size: str = ""
-    # -1 → min_episodes // 4 canonical-only burn-in.
+    # Retained in suite metadata; unlock is holdout-gated, not episode-count.
     map_burn_in: int = -1
+    # Unlock is easier than 26/32 mastery so maps can enter before stage
+    # advance, but n=32 + Wilson 0.30 rejects the 5/32 and 19% collapse
+    # that episode-count unlock allowed. 16/32 is the first integer that
+    # clears both bars; 15/32 does not.
+    unlock_win_threshold: float = 0.50
+    unlock_wilson_floor: float = 0.30
+    # Hysteresis: stay unlocked through 0.35–0.50 noise; relock only when
+    # the holdout is clearly no longer competent (11/32 ≈ 0.344).
+    relock_win_threshold: float = 0.35
 
     def __post_init__(self) -> None:
         if self.map_burn_in < 0:
@@ -350,6 +382,8 @@ class Curriculum:
         self.consecutive_eval_passes = 0
         self.last_eval_passed = False
         self.stage_episodes = 0
+        # Extra train maps stay locked until a holdout unlock judgment.
+        self.maps_unlocked = False
         # Stage-isolated competency window (logged; not an advance gate)
         self._stage_successes: list[float] = []
 
@@ -402,12 +436,7 @@ class Curriculum:
         if suite == "ood":
             keys = s.ood_maps or [s.map]
             return pick_from_set(keys, seed), s.ood_map_size
-        seen = (
-            self.stage_episodes
-            if completed_episodes is None
-            else int(completed_episodes)
-        )
-        if seen < s.map_burn_in or len(s.train_map_set) <= 1:
+        if (not self.maps_unlocked) or len(s.train_map_set) <= 1:
             return s.map, s.map_size
         return pick_from_set(s.train_map_set, seed), s.map_size
 
@@ -424,10 +453,9 @@ class Curriculum:
         from peak tiles.
 
         `suite` is train (staged map set), holdout (frozen canonical), or ood.
-        Map choice is a pure function of (stage, suite, seed,
-        completed_episodes or stage_episodes). Pass completed_episodes
-        when building the *next* auto-reset config so burn-in unlocks
-        on the episode after the threshold, not one later.
+        Extra train maps are used only while `maps_unlocked` is true.
+        `completed_episodes` is kept for call-site compat and does not
+        unlock maps.
         """
         s = self.stage
         mmap, msize = self._choose_map(
@@ -490,6 +518,10 @@ class Curriculum:
             "min_eval_episodes": s.min_eval_episodes,
             "sampled_win_threshold": s.sampled_win_threshold,
             "sampled_wilson_floor": s.sampled_wilson_floor,
+            "unlock_win_threshold": s.unlock_win_threshold,
+            "unlock_wilson_floor": s.unlock_wilson_floor,
+            "relock_win_threshold": s.relock_win_threshold,
+            "maps_unlocked": self.maps_unlocked,
             "gate": "sampled_true_win_wilson",
         }
 
@@ -533,7 +565,8 @@ class Curriculum:
         det_ss = float(det.get("stage_success_rate") or 0.0)
         samp_wr = float(samp.get("win_rate") or 0.0)
         samp_ss = float(samp.get("stage_success_rate") or 0.0)
-        samp_wins = int(round(samp_wr * max(samp_n, 0)))
+        samp_wins, samp_n_stat, samp_wr = sampled_binomial(samp)
+        samp_n = samp_n_stat if samp_n_stat else samp_n
         samp_lb = wilson_lower_bound(samp_wins, samp_n, s.sampled_wilson_z)
 
         samp_enough = samp_n >= s.min_eval_episodes
@@ -569,6 +602,67 @@ class Curriculum:
             "holdout_map_size": s.holdout_map_size,
         }
 
+    def judge_unlock(self, ev: dict) -> dict:
+        """Decide whether extra train maps may unlock or must relock.
+
+        Separate from stage-advance mastery: 16/32 + Wilson >= 0.30 is
+        enough to mix maps, but 5/32 / 19% never unlocks. Unlock never
+        uses training-window rates or episode counts.
+        """
+        s = self.stage
+        samp = ev.get("sampled") or {}
+        samp_wins, samp_n, samp_wr = sampled_binomial(samp)
+        samp_lb, samp_ub = wilson_interval(samp_wins, samp_n, s.sampled_wilson_z)
+        samp_enough = samp_n >= s.min_eval_episodes
+        unlock = (
+            samp_enough
+            and samp_wr >= s.unlock_win_threshold
+            and samp_lb >= s.unlock_wilson_floor
+        )
+        relock = samp_enough and samp_wr < s.relock_win_threshold
+        if unlock:
+            reason = "unlock_holdout"
+        elif relock:
+            reason = "relock_holdout"
+        else:
+            reason = "hold"
+        return {
+            "unlock": bool(unlock),
+            "relock": bool(relock),
+            "reason": reason,
+            "maps_unlocked": self.maps_unlocked,
+            "sampled_episodes": samp_n,
+            "sampled_win_rate": round(samp_wr, 4),
+            "sampled_wilson_lower": round(samp_lb, 4),
+            "sampled_wilson_upper": round(samp_ub, 4),
+            "unlock_win_threshold": s.unlock_win_threshold,
+            "unlock_wilson_floor": s.unlock_wilson_floor,
+            "relock_win_threshold": s.relock_win_threshold,
+            "min_eval_episodes": s.min_eval_episodes,
+            "stage": s.name,
+            "canonical_map": s.map,
+            "train_maps": s.train_map_set,
+        }
+
+    def apply_unlock(self, ev: dict) -> dict:
+        """Update persisted unlock state from a frozen sampled holdout."""
+        judgment = self.judge_unlock(ev)
+        prev = self.maps_unlocked
+        if judgment["unlock"]:
+            self.maps_unlocked = True
+        elif judgment["relock"]:
+            self.maps_unlocked = False
+        if self.maps_unlocked and not prev:
+            action = "unlock"
+        elif prev and not self.maps_unlocked:
+            action = "relock"
+        else:
+            action = "hold"
+        judgment["action"] = action
+        judgment["maps_unlocked"] = self.maps_unlocked
+        judgment["prev_maps_unlocked"] = prev
+        return judgment
+
     def maybe_advance(self) -> bool:
         """Advance on min_episodes + one frozen holdout mastery pass.
 
@@ -590,6 +684,7 @@ class Curriculum:
         self._stage_successes = []
         self.consecutive_eval_passes = 0
         self.last_eval_passed = False
+        self.maps_unlocked = False
 
     def state_dict(self) -> dict:
         successes = list(self._stage_successes)
@@ -602,6 +697,7 @@ class Curriculum:
             "stage_successes": successes,
             # Older checkpoints/tests used this name for the same window.
             "stage_wins": successes,
+            "maps_unlocked": self.maps_unlocked,
             "mastery_version": MASTERY_VERSION,
         }
 
@@ -615,6 +711,9 @@ class Curriculum:
             self._stage_successes = self._stage_successes[-w:]
         version = int(d.get("mastery_version", 1))
         # Pre-v3 consecutive / det-only passes must not count.
+        # Missing maps_unlocked → locked. Episode-count burn-in is not
+        # inferred, so a collapsed transfer cannot re-open extra maps.
+        self.maps_unlocked = bool(d.get("maps_unlocked", False))
         if version < MASTERY_VERSION:
             self.last_eval_passed = False
             self.consecutive_eval_passes = 0

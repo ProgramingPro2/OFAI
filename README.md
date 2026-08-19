@@ -122,7 +122,8 @@ video output.
 
 Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
 `--resume`, `--stage` / `--force-stage` (name or current-table index),
-`--allow-collapsed-resume`, `--dry-run`,
+`--keep-optimizer` (advanced; default `--force-stage` is a fresh Adam
+at `--lr`), `--allow-collapsed-resume`, `--dry-run`,
 `--eval-every`, `--eval-episodes`
 (default 32 frozen holdout; values below the stage minimum are raised),
 `--eval-det-episodes` (diagnostic),
@@ -131,8 +132,34 @@ Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
 action-type entropy in [0, 1]). There is no `--compile` path; rollout
 always uses the eager policy.
 
+`--force-stage` loads policy/value weights, resets Adam unless
+`--keep-optimizer`, then runs a frozen sampled holdout **before** the
+first collect/update. That baseline cannot advance the stage or write
+`best.pt`. Extra train maps stay on the canonical map until a later
+holdout clears the unlock bar (16/32 + Wilson 0.30), not because 55
+or 75 episodes elapsed. A confirmed holdout collapse versus the
+stage-entry/stage-best bar restores those weights, optimizer, RNG,
+curriculum, and seed stream, writes `latest.pt`, and stops without
+the shutdown `finally` rewriting the restored file. `--eval-every 0`
+is warned on `--force-stage` (no later unlock/regression).
+
+Distribution-transfer recovery (do not use these as new global
+defaults): `--lr 1e-4 --eval-every 5` with a **new** `--run-name`,
+`--additional-steps` past the checkpoint `env_steps`, and the source
+**16×8** farm. Example (read-only dry-run first):
+
+```bash
+python -m agent.train --dry-run --resume checkpoints/v2run1/it800.pt \
+    --stage nations-easy-peninsula --force-stage --run-name v3run2 \
+    --lr 1e-4 --eval-every 5 --eval-episodes 32 \
+    --additional-steps 10000000 --servers 16 --envs 8 --port 8765
+```
+
 Curriculum resume is keyed by stage name. A schema-v2 checkpoint that
 only stored `idx` is migrated through the frozen v2 name table so
 inserted stages cannot silently remap. Unknown names fail clearly.
-Train maps, holdout suite, OOD suite, and seed-stream counters are
-written to checkpoint extras and JSONL logs.
+Train maps, holdout suite, OOD suite, unlock state, stage-entry
+baseline, and seed-stream counters are written to checkpoint extras
+and JSONL logs. Old schema-v2 checkpoints load without
+`maps_unlocked` (stay locked) or holdout `stage_baseline` (first
+later holdout becomes the guard).

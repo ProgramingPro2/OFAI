@@ -435,13 +435,27 @@ def _reward_terms(info: dict, step_reward: float) -> dict:
     }
 
 
+def make_adam(policy: nn.Module, lr: float) -> torch.optim.Adam:
+    """Fresh Adam with the trainer's transfer-safe defaults."""
+    return torch.optim.Adam(policy.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-5)
+
+
+def optimizer_is_fresh(opt: torch.optim.Optimizer) -> bool:
+    """True when Adam has no inherited moments or step counters."""
+    state = opt.state_dict().get("state") or {}
+    return len(state) == 0
+
+
+def apply_optimizer_lr(opt: torch.optim.Optimizer, lr: float) -> None:
+    for group in opt.param_groups:
+        group["lr"] = float(lr)
+
+
 class PPOTrainer:
     def __init__(self, policy: Policy, cfg: PPOConfig):
         self.policy = policy.to(cfg.device)
         self.cfg = cfg
-        self.opt = torch.optim.Adam(
-            policy.parameters(), lr=cfg.lr, betas=(0.9, 0.95), eps=1e-5
-        )
+        self.opt = make_adam(self.policy, cfg.lr)
         self.stats = TrainStats()
         self.ent_coef = cfg.ent_coef
         self._trackers: list[_EnvTracker] = []
@@ -746,6 +760,22 @@ class PPOTrainer:
             "mean_return_target": float(b_returns.mean()),
         }
 
+    def reset_optimizer(self, lr: float | None = None) -> None:
+        """Replace Adam with an empty optimizer at `lr` (or cfg.lr)."""
+        use_lr = self.cfg.lr if lr is None else float(lr)
+        self.cfg.lr = use_lr
+        self.opt = make_adam(self.policy, use_lr)
+
+    def load_weights_and_optimizer(self, path: str) -> dict:
+        """Restore model, optimizer, and ent_coef. Stats/counters stay put."""
+        ckpt = torch.load(path, map_location=self.cfg.device, weights_only=False)
+        self.policy.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            self.opt.load_state_dict(ckpt["optimizer"])
+        if "ent_coef" in ckpt:
+            self.ent_coef = float(ckpt["ent_coef"])
+        return ckpt
+
     def save(self, path: str, extra: dict | None = None):
         payload = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -771,7 +801,7 @@ class PPOTrainer:
             payload.update(extra)
         atomic_torch_save(payload, path)
 
-    def load(self, path: str) -> dict:
+    def load(self, path: str, *, restore_optimizer: bool = True) -> dict:
         ckpt = torch.load(path, map_location=self.cfg.device, weights_only=False)
         ver = int(ckpt.get("schema_version", 1))
         if ver < CHECKPOINT_SCHEMA_VERSION:
@@ -787,7 +817,7 @@ class PPOTrainer:
                 f"checkpoint {path!r} does not match the current policy "
                 f"architecture (pointer target + active-head). {exc}"
             ) from exc
-        if "optimizer" in ckpt:
+        if restore_optimizer and "optimizer" in ckpt:
             self.opt.load_state_dict(ckpt["optimizer"])
         if "stats" in ckpt:
             stats = ckpt["stats"]
