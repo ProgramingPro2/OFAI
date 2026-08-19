@@ -39,17 +39,25 @@ python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 20 \
     --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
 
 # Watch (sampled policy; recommended fast preview).
-# --frame-skip N still steps the policy every decision but only pulls the
-# full-resolution map / pygame compose every Nth frame (plus first and last).
-# --fps is the display/video rate of those rendered frames, not sim speed.
-# Videos stream to ffmpeg so long 1500x1500 games stay memory-bounded.
+# Interactive: one fullscreen pygame window for configuration, playback,
+# and post-match replay. --frame-skip N still steps the policy every
+# decision but only pulls the full-resolution map every Nth frame (plus
+# first and last). --fps is the display/video rate of those rendered
+# frames; in-window [ ] changes playback speed only. Videos stream to
+# ffmpeg so long 1500x1500 games stay memory-bounded.
 # --greedy is a deterministic diagnostic, not the deployed policy.
 python -m agent.watch --ckpt checkpoints/run1/latest.pt \
-    --scale 1 --fps 60 --frame-skip 5
+    --preset tribes20 --scale 1 --fps 60 --frame-skip 5
 
-# Headless video (same sampling)
+# Headless video: nations only at the map's default nation count.
 python -m agent.watch --ckpt checkpoints/run1/latest.pt \
+    --opponents nations --difficulty Hard --map World \
     --save match.mp4 --scale 1 --fps 60 --frame-skip 5
+
+# Mixed custom match: exactly 8 nations plus 20 tribe filler bots.
+python -m agent.watch --ckpt checkpoints/run1/latest.pt \
+    --opponents mixed --map FourIslands --map-size Normal \
+    --nations 8 --bots 20 --difficulty Easy
 
 # Unit tests (mocked; no EnvServer required)
 python -m pytest tests/test_rl_pipeline.py -q
@@ -57,6 +65,51 @@ python -m pytest tests/test_rl_pipeline.py -q
 # Live env smoke (requires OpenFrontIO env server)
 python tests/test_env_client.py
 ```
+
+`agent.watch` supports every curriculum stage via `--preset`: `duel`,
+`small-ffa`, `island-ffa`, `tribes20`, `nations-easy-small`,
+`nations-easy-mid`, `nations-medium-mid`, `nations-hard-mid`, and
+`nations-impossible-world`. Explicit match flags override preset values.
+`--game-type` (also `--opponents`) selects `tribes`, `nations`, or `mixed`;
+`--nations` accepts an exact count, `default`, or `disabled`, while `--bots`
+is the tribe filler count from 0 to 400. Difficulties are `Easy`, `Medium`, `Hard`, and
+`Impossible`; map sizes are `Compact` and `Normal`. Maps use OpenFront
+`GameMapType` keys such as `Halkidiki`, `FourIslands`, and `World`.
+
+Watch runs are reproducible by default: episode game IDs are `watch-0`,
+`watch-1`, and so on, and sampled policy actions use PyTorch seed 0. Use
+`--seed` and `--policy-seed` to choose another deterministic sequence. The
+OpenFront agent environment supports single-player FFA only; team and network
+lobby types are not watch options.
+
+The interactive viewer is a single pygame window. It starts in true
+fullscreen on `--display N` (default 0) and stays fullscreen during play.
+CLI flags prepopulate the in-window form (checkpoint, preset, game type,
+difficulty, map, nations/bots, seeds, max ticks, episodes, scale, fps,
+frame skip, speed). Start and Quit are on that form. `--save` remains
+headless and does not open the UI. `--episodes` is the headless video
+count; the window plays one match, stays open, and uses New for the next
+seed.
+
+Playback and camera (HUD stays fixed in screen pixels; only the map zooms):
+- Space pause/resume; `.` or `n` step one decision while paused
+- `[` / `]` slower and faster (0.25x to 8x, current speed always shown)
+- Mouse wheel or `+`/`-` zoom (aspect ratio preserved); arrows/WASD or
+  drag to pan; `0` / Home / middle-click recenter
+- Esc opens a menu (Resume / Configure / Quit; arrows + Enter select);
+  F11 or Alt+Enter leave or re-enter fullscreen; Q confirms quit; the
+  window close button exits. The mouse is never grabbed.
+
+After a match the window stays open. Replay uses recorded frames when they
+fit a 96MB / 360-frame cap, otherwise it reapplies the recorded action tape
+without running the policy. Restart uses the same game seed and the policy
+RNG from match start; New increments the episode suffix (`watch-1`, …);
+Configure returns to the form.
+
+Use `--windowed` or `--window-size WIDTHxHEIGHT` to start windowed
+(oversized requests are clamped to the usable display). `--scale` controls
+the native map and saved-video resolution; display fitting does not alter
+video output.
 
 Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
 `--resume`, `--stage` / `--force-stage`, `--eval-every`, `--target-kl`
