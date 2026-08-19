@@ -22,13 +22,29 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from .checkpoint import (
+    BEST_SCORE_SENTINEL,
+    CollapsedCheckpointError,
+    _eval_score,
+    _mode_collapsed,
+    finalize_event_record,
+    eval_is_passive_collapse,
+    eval_is_zero_win,
+    format_resume_plan,
+    on_stage_advance_scores,
+    plan_resume,
+    should_write_global_best,
+    should_write_stage_best,
+    stage_advance_event_record,
+    stage_best_filename,
+    training_budget_warning,
+)
 from .curriculum import (
     DEFAULT_DET_EVAL_EPISODES,
     DEFAULT_HOLDOUT_EPISODES,
     DEFAULT_OOD_EVAL_EPISODES,
     STAGES,
     Curriculum,
-    CurriculumRestoreError,
 )
 from .env_client import RolloutInterrupted, ShardedVecEnv
 from .model import Policy, obs_to_tensors
@@ -74,7 +90,7 @@ def resolve_holdout_episodes(requested: int, minimum: int) -> int:
     return max(req, mn)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--envs", type=int, default=8, help="parallel games per server")
     p.add_argument("--servers", type=int, default=4, help="env-server processes")
@@ -105,6 +121,17 @@ def parse_args() -> argparse.Namespace:
         "current table; v2 checkpoints migrate idx through V2_STAGE_NAMES.",
     )
     p.add_argument("--force-stage", action="store_true", help="apply --stage even when resuming")
+    p.add_argument(
+        "--allow-collapsed-resume",
+        action="store_true",
+        help="override the refuse-to-resume guard when eval metadata "
+        "shows a zero-win/passive collapse (still warns)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="load resume/config, print the plan, exit without envs or writes",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument(
@@ -149,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         help="optional OOD episodes logged only (0=skip; default 8)",
     )
     p.add_argument("--device", type=str, default="cuda")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _rng_state() -> dict:
@@ -420,50 +447,8 @@ def _fixed_seed_eval_attempt(
     return results
 
 
-def _mode_collapsed(mode: dict) -> bool:
-    """True when a mode is never-spawn / spawn-then-NOOP / no territory."""
-    peak = float(mode.get("mean_peak_tiles", 0.0))
-    causes = mode.get("terminal_causes") or {}
-    n = max(1, int(mode.get("episodes", 1)))
-    no_spawn = float(causes.get("no_spawn", 0)) / n
-    hist = mode.get("action_hist") or {}
-    total_a = float(sum(hist.values()) or 1.0)
-    noop_frac = float(hist.get("noop", 0)) / total_a
-    return (
-        peak < 0.01
-        or no_spawn >= 0.5
-        or (noop_frac >= 0.85 and peak < 0.02)
-    )
-
-
-def _eval_score(ev: dict) -> tuple:
-    """best.pt ranking for the deployed (sampled) policy.
-
-    Order: sampled true win, det true win, sampled peak, det peak.
-    Stage-success / milestone rates never enter this score. Collapse
-    zeros that mode's contribution.
-    """
-    if "sampled" in ev or "deterministic" in ev:
-        samp = ev.get("sampled") or {}
-        det = ev.get("deterministic") or {}
-    else:
-        samp = ev
-        det = ev
-    samp_wr = float(samp.get("win_rate", 0.0))
-    det_wr = float(det.get("win_rate", 0.0))
-    samp_peak = float(samp.get("mean_peak_tiles", 0.0))
-    det_peak = float(det.get("mean_peak_tiles", 0.0))
-    if _mode_collapsed(samp):
-        samp_wr = 0.0
-        samp_peak = 0.0
-    if _mode_collapsed(det):
-        det_wr = 0.0
-        det_peak = 0.0
-    return (samp_wr, det_wr, samp_peak, det_peak)
-
-
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -471,16 +456,11 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     run_dir = CKPT_DIR / args.run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{args.run_name}.jsonl"
     ep_log_path = LOG_DIR / f"{args.run_name}.episodes.jsonl"
-
-    # Fresh run must not silently append to a prior run's logs.
     resume_path = args.resume
-    log_mode = "a" if resume_path else "w"
-    log_f = open(log_path, log_mode, buffering=1)
-    ep_log_f = open(ep_log_path, log_mode, buffering=1)
+    log_f = None
+    ep_log_f = None
 
     start_stage = args.stage if args.stage is not None else 0
     curriculum = Curriculum(start=start_stage)
@@ -496,43 +476,54 @@ def main() -> None:
         device=args.device if torch.cuda.is_available() else "cpu",
     )
     trainer = PPOTrainer(policy, cfg)
-    best_score: tuple = (-1.0, -1.0, -1.0, -1.0)
+    global_best_score: tuple = BEST_SCORE_SENTINEL
+    stage_best_score: tuple = BEST_SCORE_SENTINEL
+    source_best_score: tuple = BEST_SCORE_SENTINEL
     stage_baseline: dict = {}
+    last_eval: dict = {}
     last_mastery: dict = {}
+    resume_plan = None
+    ckpt: dict = {}
 
     if resume_path:
         ckpt = trainer.load(resume_path)
         print(f"resumed from {resume_path} (schema={ckpt.get('schema_version', 1)})")
-        if "curriculum" in ckpt and not args.force_stage:
-            try:
-                curriculum.load_state_dict(ckpt["curriculum"])
-            except CurriculumRestoreError as exc:
-                raise SystemExit(f"[train] cannot restore curriculum: {exc}") from exc
+        try:
+            resume_plan = plan_resume(
+                ckpt=ckpt,
+                resume_path=resume_path,
+                run_name=args.run_name,
+                run_dir=run_dir,
+                stage_idx=args.stage,
+                force_stage=args.force_stage,
+                allow_collapsed=args.allow_collapsed_resume,
+                default_start=start_stage,
+            )
+        except CollapsedCheckpointError:
+            raise
+        curriculum = resume_plan.curriculum
+        global_best_score = resume_plan.global_best_score
+        stage_best_score = resume_plan.stage_best_score
+        source_best_score = resume_plan.source_best_score
+        stage_baseline = resume_plan.stage_baseline
+        last_eval = resume_plan.last_eval
+        if resume_plan.restore_rng and "rng" in ckpt:
+            _set_rng_state(ckpt["rng"])
+        if resume_plan.reset_windows:
+            trainer.stats.reset_rolling_windows()
+        for warn in resume_plan.warnings:
+            print(warn)
+        if args.force_stage:
+            print(
+                f"[train] --force-stage {curriculum.stage.name}: "
+                "stage-local curriculum/mastery/windows/seed-stream reset; "
+                "global-best metadata retained; "
+                f"writing to {run_dir}"
+            )
+        else:
             print(
                 f"[train] restored stage={curriculum.stage.name} "
                 f"idx={curriculum.idx} episodes={curriculum.stage_episodes}"
-            )
-        elif args.stage is not None and args.force_stage:
-            curriculum = Curriculum(start=args.stage)
-        if "rng" in ckpt:
-            _set_rng_state(ckpt["rng"])
-        stage_baseline = dict(ckpt.get("stage_baseline", {}))
-        raw_best = tuple(ckpt.get("best_score", best_score))
-        if len(raw_best) < 4:
-            raw_best = tuple(list(raw_best) + [0.0] * (4 - len(raw_best)))
-        best_score = raw_best[:4]  # type: ignore[assignment]
-        # Pre-v2 scores ranked deterministic ticks/peaks; do not mix.
-        mastery_ver = int((ckpt.get("curriculum") or {}).get("mastery_version", 1))
-        if mastery_ver < 2:
-            best_score = (-1.0, -1.0, -1.0, -1.0)
-            print(
-                "[train] mastery_version < 2: reset best.pt ranking "
-                "(sampled true-win first)"
-            )
-        if mastery_ver < 3:
-            print(
-                "[train] mastery_version < 3: holdout gate is one sampled "
-                "Wilson decision; previous consecutive/det passes discarded"
             )
         if args.additional_steps > 0:
             args.total_steps = trainer.stats.env_steps + args.additional_steps
@@ -540,8 +531,43 @@ def main() -> None:
                 f"[train] --additional-steps={args.additional_steps} -> "
                 f"total_steps={args.total_steps}"
             )
+        budget = training_budget_warning(
+            trainer.stats.env_steps, args.total_steps
+        )
+        if budget:
+            print(budget)
     elif args.stage is not None:
         curriculum = Curriculum(start=args.stage)
+
+    if args.dry_run:
+        env_steps = trainer.stats.env_steps
+        if resume_plan is None:
+            resume_plan = plan_resume(
+                ckpt={"stats": trainer.stats.state_dict()},
+                resume_path=resume_path or "(fresh)",
+                run_name=args.run_name,
+                run_dir=run_dir,
+                stage_idx=args.stage,
+                force_stage=False,
+                allow_collapsed=True,
+                default_start=start_stage,
+            )
+            resume_plan.curriculum = curriculum
+        print(
+            format_resume_plan(
+                resume_plan, env_steps=env_steps, total_steps=args.total_steps
+            )
+        )
+        return
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Fresh run must not silently append to a prior run's logs.
+    log_mode = "a" if resume_path else "w"
+    log_f = open(log_path, log_mode, buffering=1)
+    ep_log_f = open(ep_log_path, log_mode, buffering=1)
+    if resume_plan is not None:
+        log_f.write(json.dumps(resume_plan.event) + "\n")
 
     env = ShardedVecEnv(
         num_servers=args.servers,
@@ -551,10 +577,16 @@ def main() -> None:
     )
     total_envs = env.k
     seed_stream = SeedStream(args.run_name, args.seed, total_envs)
-    if resume_path:
+    if resume_path and resume_plan is not None and resume_plan.restore_seed_stream:
         raw_stream = ckpt.get("seed_stream")
         if isinstance(raw_stream, dict):
             seed_stream.load_state_dict(raw_stream)
+    elif resume_path and (resume_plan is None or not resume_plan.restore_seed_stream):
+        if resume_plan is not None and resume_plan.force_stage:
+            print(
+                "[train] --force-stage: new seed stream for "
+                f"{args.run_name} (source stream not restored)"
+            )
         else:
             print(
                 "[train] no seed_stream in checkpoint; starting mixed counters "
@@ -599,7 +631,15 @@ def main() -> None:
             extra={
                 "curriculum": curriculum.state_dict(),
                 "stage_baseline": stage_baseline,
-                "best_score": list(best_score),
+                "best_score": list(global_best_score),
+                "global_best_score": list(global_best_score),
+                "stage_best_score": list(stage_best_score),
+                "stage_best_stage": curriculum.stage.name,
+                "source_best_score": list(source_best_score),
+                "source_checkpoint": (
+                    resume_plan.source_checkpoint if resume_plan is not None else ""
+                ),
+                "last_eval": last_eval,
                 "rng": _rng_state(),
                 "seed_stream": seed_stream.state_dict(),
                 "curriculum_suite": curriculum.suite_meta(),
@@ -623,6 +663,7 @@ def main() -> None:
         desc=curriculum.stage.name,
     )
     eval_s = 0.0
+    finalize_reason = "done"
 
     try:
         while trainer.stats.env_steps < args.total_steps:
@@ -679,12 +720,29 @@ def main() -> None:
             prev_stage = curriculum.stage.name
             prev_idx = curriculum.idx
             if curriculum.maybe_advance():
+                pre_reset = st.rolling_snapshot(prev_stage)
                 stage_baseline = {
                     "win_rate": st.win_rate,
                     "mean_return": st.mean_return,
                     "env_steps": st.env_steps,
                 }
-                best_score = (-1.0, -1.0, -1.0, -1.0)
+                global_best_score, stage_best_score = on_stage_advance_scores(
+                    global_best_score
+                )
+                st.reset_rolling_windows()
+                last_eval = {}
+                log_f.write(
+                    json.dumps(
+                        stage_advance_event_record(
+                            it=st.iterations,
+                            prev_stage=prev_stage,
+                            new_stage=curriculum.stage.name,
+                            snapshot=pre_reset,
+                            reason=str(last_mastery.get("reason", "unknown")),
+                        )
+                    )
+                    + "\n"
+                )
                 pbar.write(
                     f"[curriculum] advanced {prev_stage} -> {curriculum.stage.name} "
                     f"idx={prev_idx}->{curriculum.idx} "
@@ -699,7 +757,8 @@ def main() -> None:
                     f"det_win={last_mastery.get('det_win_rate')} "
                     f"det_thresh={last_mastery.get('det_threshold')} "
                     f"gate={last_mastery.get('gate')} "
-                    f"holdout={last_mastery.get('holdout_map')}"
+                    f"holdout={last_mastery.get('holdout_map')} "
+                    f"global_best={list(global_best_score)}"
                 )
                 pbar.set_description(curriculum.stage.name)
                 save_ckpt(run_dir / "latest.pt")
@@ -752,20 +811,43 @@ def main() -> None:
                             n_sampled=args.eval_ood_episodes,
                             suite="ood",
                         )
+                    last_eval = ev
                     score = _eval_score(ev)
-                    if score > best_score:
-                        best_score = score
+                    if should_write_stage_best(score, stage_best_score, ev):
+                        stage_best_score = score
+                        save_ckpt(
+                            run_dir / stage_best_filename(curriculum.stage.name),
+                            eval=ev,
+                            mastery=judgment,
+                            ood=ood_ev,
+                            best_kind="stage",
+                        )
+                        pbar.write(
+                            f"[eval] new {stage_best_filename(curriculum.stage.name)} "
+                            f"samp_win={samp['win_rate']:.3f} "
+                            f"samp_peak={samp['mean_peak_tiles']:.3f}"
+                        )
+                    if should_write_global_best(score, global_best_score, ev):
+                        global_best_score = score
                         save_ckpt(
                             run_dir / "best.pt",
                             eval=ev,
                             mastery=judgment,
                             ood=ood_ev,
+                            best_kind="global",
                         )
                         pbar.write(
                             f"[eval] new best.pt samp_win={samp['win_rate']:.3f} "
                             f"det_win={det['win_rate']:.3f} "
                             f"samp_peak={samp['mean_peak_tiles']:.3f} "
                             f"det_peak={det['mean_peak_tiles']:.3f}"
+                        )
+                    elif eval_is_zero_win(ev) or eval_is_passive_collapse(ev):
+                        pbar.write(
+                            "[eval] keeping best.pt "
+                            f"(global={list(global_best_score)}; "
+                            f"new samp_win={samp['win_rate']:.3f} "
+                            "is zero-win or collapsed)"
                         )
                     ood_wr = (
                         (ood_ev or {}).get("sampled", {}).get("win_rate")
@@ -825,7 +907,7 @@ def main() -> None:
                 "collect_s": round(collect_s, 3),
                 "update_s": round(update_s, 3),
                 "eval_s": round(eval_s, 3),
-                **st.rolling_snapshot(),
+                **st.rolling_snapshot(curriculum.stage.name),
                 **{
                     k: round(v, 5) if isinstance(v, float) else v
                     for k, v in metrics.items()
@@ -857,16 +939,34 @@ def main() -> None:
             if st.iterations % 100 == 0:
                 save_ckpt(run_dir / f"it{st.iterations}.pt")
     except KeyboardInterrupt:
-        pbar.write("interrupted; saving checkpoint")
+        finalize_reason = "keyboard_interrupt"
+        pbar.write("interrupted; saving latest.pt and final.pt")
     except Exception as exc:
-        pbar.write(f"training crashed: {exc!r}; saving checkpoint")
+        finalize_reason = "crash"
+        pbar.write(f"training crashed: {exc!r}; saving latest.pt and final.pt")
         raise
     finally:
         pbar.close()
-        save_ckpt(run_dir / "final.pt")
+        # Newest recoverable (committed) trainer state — not a partial
+        # collect. latest.pt must not rewind to the last %5 snapshot.
+        save_ckpt(run_dir / "latest.pt", save_reason=finalize_reason)
+        save_ckpt(run_dir / "final.pt", save_reason=finalize_reason)
+        if log_f is not None:
+            log_f.write(
+                json.dumps(
+                    finalize_event_record(
+                        it=trainer.stats.iterations,
+                        stage=curriculum.stage.name,
+                        env_steps=trainer.stats.env_steps,
+                        reason=finalize_reason,
+                    )
+                )
+                + "\n"
+            )
+            log_f.close()
+        if ep_log_f is not None:
+            ep_log_f.close()
         env.close()
-        log_f.close()
-        ep_log_f.close()
 
     print(f"done. checkpoints in {run_dir}, log {log_path}, episodes {ep_log_path}")
 

@@ -122,6 +122,7 @@ video output.
 
 Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
 `--resume`, `--stage` / `--force-stage` (name or current-table index),
+`--allow-collapsed-resume`, `--dry-run`,
 `--eval-every`, `--eval-episodes`
 (default 32 frozen holdout; values below the stage minimum are raised),
 `--eval-det-episodes` (diagnostic),

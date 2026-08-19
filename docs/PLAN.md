@@ -224,8 +224,12 @@ mastery of the intended policy, not a reason to repeat the stage.
 `best.pt` ranks sampled true `win_rate`, then deterministic true
 `win_rate`, then sampled / det peak tiles. Collapse (never-spawn,
 spawn-then-NOOP, near-zero territory) zeros that mode. Milestone rates
-do not enter the score. Stage advance resets `best_score` so a new
-stage can replace the previous best.
+do not enter the score. `best.pt` is the run-global ranking and is
+never reset to a sentinel on stage advance or `--force-stage`; a
+zero-win or passively collapsed eval cannot replace it. Stage-best
+files (`best-<stage>.pt`) reset per stage. Rolling train
+`win_20/100/500` windows reset on stage transition / `--force-stage`.
+Clean shutdown writes `latest.pt` and `final.pt`.
 
 **16-slot observability.** Slot 0 is the agent. Priority fill keeps
 bordering / attacking / allied opponents individually targetable. When

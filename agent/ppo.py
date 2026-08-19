@@ -5,8 +5,11 @@ episode metrics that persist across collect() calls.
 from __future__ import annotations
 
 import copy
+import os
+import tempfile
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -16,6 +19,43 @@ from . import spaces
 from .model import Policy, obs_to_tensors
 
 CHECKPOINT_SCHEMA_VERSION = 2
+
+# Bounded rolling histories. Stage transitions reset these; lifetime
+# counters (episodes, wins, env_steps, …) are never cleared here.
+WINDOW_MAXLEN: dict[str, int] = {
+    "ret_20": 20,
+    "ret_100": 100,
+    "ret_500": 500,
+    "wins_20": 20,
+    "wins_100": 100,
+    "wins_500": 500,
+    "stage_20": 20,
+    "stage_100": 100,
+    "stage_500": 500,
+    "kills_20": 20,
+    "kills_100": 100,
+    "kills_500": 500,
+    "len_20": 20,
+    "len_100": 100,
+    "death_20": 20,
+    "timeout_20": 20,
+    "accept_20": 20,
+}
+
+
+def atomic_torch_save(payload: dict, path: str | Path) -> None:
+    """Write a checkpoint via same-dir tempfile + os.replace."""
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=dest.name + ".", suffix=".tmp", dir=dest.parent)
+    os.close(fd)
+    tmp_path = Path(tmp)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, dest)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -258,8 +298,8 @@ class TrainStats:
         total_a = ep.accepted + ep.fizzled
         self.accept_20.append(ep.accepted / total_a if total_a else 1.0)
 
-    def rolling_snapshot(self) -> dict:
-        return {
+    def rolling_snapshot(self, stage: str | None = None) -> dict:
+        snap = {
             "return_20": round(self.mean_return_20, 4),
             "return_100": round(self.mean_return, 4),
             "return_500": round(self._mean(self.ret_500), 4),
@@ -276,6 +316,14 @@ class TrainStats:
             "ep_len_20": round(self.mean_ep_len_20, 1),
             "accept_20": round(self.accept_rate_20, 4),
         }
+        if stage is not None:
+            snap["window_stage"] = stage
+        return snap
+
+    def reset_rolling_windows(self) -> None:
+        """Clear 20/100/500 windows. Lifetime counters stay intact."""
+        for name, ml in WINDOW_MAXLEN.items():
+            setattr(self, name, deque(maxlen=ml))
 
     def state_dict(self) -> dict:
         d = {
@@ -292,25 +340,7 @@ class TrainStats:
             "actions_total": self.actions_total,
             "sps": self.sps,
         }
-        for name in (
-            "ret_20",
-            "ret_100",
-            "ret_500",
-            "wins_20",
-            "wins_100",
-            "wins_500",
-            "stage_20",
-            "stage_100",
-            "stage_500",
-            "kills_20",
-            "kills_100",
-            "kills_500",
-            "len_20",
-            "len_100",
-            "death_20",
-            "timeout_20",
-            "accept_20",
-        ):
+        for name in WINDOW_MAXLEN:
             d[name] = list(getattr(self, name))
         return d
 
@@ -331,26 +361,7 @@ class TrainStats:
         ):
             if key in d:
                 setattr(self, key, d[key])
-        maxlen = {
-            "ret_20": 20,
-            "ret_100": 100,
-            "ret_500": 500,
-            "wins_20": 20,
-            "wins_100": 100,
-            "wins_500": 500,
-            "stage_20": 20,
-            "stage_100": 100,
-            "stage_500": 500,
-            "kills_20": 20,
-            "kills_100": 100,
-            "kills_500": 500,
-            "len_20": 20,
-            "len_100": 100,
-            "death_20": 20,
-            "timeout_20": 20,
-            "accept_20": 20,
-        }
-        for name, ml in maxlen.items():
+        for name, ml in WINDOW_MAXLEN.items():
             if name in d:
                 setattr(self, name, deque(d[name], maxlen=ml))
 
@@ -758,7 +769,7 @@ class PPOTrainer:
         }
         if extra:
             payload.update(extra)
-        torch.save(payload, path)
+        atomic_torch_save(payload, path)
 
     def load(self, path: str) -> dict:
         ckpt = torch.load(path, map_location=self.cfg.device, weights_only=False)
