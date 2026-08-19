@@ -1,9 +1,9 @@
 """PPO training entry point.
 
 Spawns (or connects to) env servers, then alternates rollout collection and
-PPO updates. Curriculum stages advance on min_episodes plus consecutive
-fixed-seed mastery passes: deterministic competency or sampled true-win
-(Wilson-guarded). Deterministic argmax is a robustness diagnostic.
+PPO updates. Curriculum stages advance on min_episodes plus one frozen
+holdout sampled-true-win mastery decision (Wilson-guarded). Deterministic
+argmax is a robustness diagnostic and never gates.
 
 Example:
   .venv/bin/python -m agent.train --servers 4 --envs 8 --rollout-len 128 \
@@ -22,15 +22,56 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from .curriculum import Curriculum
+from .curriculum import (
+    DEFAULT_DET_EVAL_EPISODES,
+    DEFAULT_HOLDOUT_EPISODES,
+    DEFAULT_OOD_EVAL_EPISODES,
+    STAGES,
+    Curriculum,
+    CurriculumRestoreError,
+)
 from .env_client import RolloutInterrupted, ShardedVecEnv
 from .model import Policy, obs_to_tensors
 from . import spaces
 from .ppo import PPOConfig, PPOTrainer, RolloutBuffer, classify_outcome
+from .seeds import SeedStream, holdout_seed, ood_seed
 
 ROOT = Path(__file__).resolve().parent.parent
 CKPT_DIR = ROOT / "checkpoints"
 LOG_DIR = ROOT / "logs"
+
+
+def parse_stage_arg(value: str) -> int:
+    """Accept a current-table index or a stage name."""
+    names = [stage.name for stage in STAGES]
+    if value in names:
+        return names.index(value)
+    try:
+        idx = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"unknown stage {value!r}; expected an index or one of {names}"
+        ) from exc
+    if idx < 0 or idx >= len(STAGES):
+        raise argparse.ArgumentTypeError(
+            f"stage index {idx} is outside 0..{len(STAGES) - 1}"
+        )
+    return idx
+
+
+def resolve_holdout_episodes(requested: int, minimum: int) -> int:
+    """Raise a too-small `--eval-episodes` to the stage holdout minimum.
+
+    Older commands still pass `--eval-episodes 8`. The mastery gate is
+    26/32, so those runs must actually play 32 frozen holdout games.
+    """
+    req = int(requested)
+    mn = int(minimum)
+    if req < 1:
+        raise ValueError("eval episodes must be positive")
+    if mn < 1:
+        raise ValueError("holdout minimum must be positive")
+    return max(req, mn)
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,10 +98,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=str, default="", help="checkpoint path to resume")
     p.add_argument(
         "--stage",
-        type=int,
+        type=parse_stage_arg,
         default=None,
-        help="explicit curriculum stage index for a fresh run (ignored on resume "
-        "unless also passed to force override)",
+        help="fresh-run stage name or current-table index (ignored on resume "
+        "unless also passed with --force-stage). Numeric indices follow the "
+        "current table; v2 checkpoints migrate idx through V2_STAGE_NAMES.",
     )
     p.add_argument("--force-stage", action="store_true", help="apply --stage even when resuming")
     p.add_argument("--lr", type=float, default=3e-4)
@@ -85,9 +127,27 @@ def parse_args() -> argparse.Namespace:
         "--eval-every",
         type=int,
         default=0,
-        help="iterations between fixed-seed inline evals (0=off)",
+        help="iterations between frozen holdout evals (0=off)",
     )
-    p.add_argument("--eval-episodes", type=int, default=8)
+    p.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=DEFAULT_HOLDOUT_EPISODES,
+        help="sampled holdout episodes (frozen per-stage seeds; default 32; "
+        "values below the stage minimum are raised to that minimum)",
+    )
+    p.add_argument(
+        "--eval-det-episodes",
+        type=int,
+        default=DEFAULT_DET_EVAL_EPISODES,
+        help="deterministic diagnostic episodes (does not gate; default 8)",
+    )
+    p.add_argument(
+        "--eval-ood-episodes",
+        type=int,
+        default=DEFAULT_OOD_EVAL_EPISODES,
+        help="optional OOD episodes logged only (0=skip; default 8)",
+    )
     p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
 
@@ -126,28 +186,75 @@ def _set_rng_state(state: dict) -> None:
 FIXED_SEED_EVAL_RETRIES = 3
 
 
+def _eval_configs(
+    curriculum: Curriculum,
+    n_episodes: int,
+    offset: int,
+    *,
+    suite: str,
+    seed_prefix: str | None,
+    mode: str = "sampled",
+) -> list[dict]:
+    """Frozen holdout/OOD configs, or an explicit prefix for tests.
+
+    Frozen identities are shared across det/sampled. A test prefix keeps
+    the historical `{prefix}-{mode}-{i}` form so retries stay comparable.
+    """
+    cfgs: list[dict] = []
+    for i in range(n_episodes):
+        idx = offset + i
+        if seed_prefix:
+            seed = f"{seed_prefix}-{mode}-{idx}"
+        elif suite == "ood":
+            seed = ood_seed(curriculum.stage.name, idx)
+        else:
+            seed = holdout_seed(curriculum.stage.name, idx)
+        cfg = curriculum.make_env_config(seed, objective=True, suite=suite)
+        cfg["shaping"] = 0.0
+        cfgs.append(cfg)
+    return cfgs
+
+
 def run_fixed_seed_eval(
     policy: Policy,
     env: ShardedVecEnv,
     curriculum: Curriculum,
     device: torch.device,
     n_episodes: int,
-    seed_prefix: str,
+    seed_prefix: str | None = None,
+    *,
+    n_det: int | None = None,
+    n_sampled: int | None = None,
+    suite: str = "holdout",
 ) -> dict:
     """Inline eval matching the active stage. Runs deterministic then sampled.
 
-    Milestone termination is omitted (`objective=True`) so `win_rate` is the
-    core 80% FFA outcome. Stage success is inferred from peak tiles.
+    Default seeds are frozen per (stage, index) and do not rotate with
+    iteration. `seed_prefix` overrides that for tests. Milestone
+    termination is omitted so `win_rate` is the core 80% FFA outcome.
 
     `RolloutInterrupted` is recoverable: discard the entire attempt (do not
     mix finished episodes or mid-step healthy shards), re-init every eval
     env with the same fixed seeds, and retry from the beginning.
+
+    Episodes are spread across shards via ``init_active`` / ``step_active``
+    so a 32-game holdout uses idle servers instead of packing into the
+    first few processes. Idle lanes are not created or stepped.
     """
+    sampled_n = n_sampled if n_sampled is not None else n_episodes
+    det_n = n_det if n_det is not None else n_episodes
     last_exc: RolloutInterrupted | None = None
     for attempt in range(1, FIXED_SEED_EVAL_RETRIES + 1):
         try:
             return _fixed_seed_eval_attempt(
-                policy, env, curriculum, device, n_episodes, seed_prefix
+                policy,
+                env,
+                curriculum,
+                device,
+                sampled_n=sampled_n,
+                det_n=det_n,
+                seed_prefix=seed_prefix,
+                suite=suite,
             )
         except RolloutInterrupted as exc:
             last_exc = exc
@@ -167,16 +274,30 @@ def _fixed_seed_eval_attempt(
     env: ShardedVecEnv,
     curriculum: Curriculum,
     device: torch.device,
-    n_episodes: int,
-    seed_prefix: str,
+    *,
+    sampled_n: int,
+    det_n: int,
+    seed_prefix: str | None,
+    suite: str,
 ) -> dict:
     """One clean eval pass. Accumulators are local; callers retry wholesale."""
     stage = curriculum.stage
-    k = min(env.k, n_episodes)
-    results = {"deterministic": {}, "sampled": {}}
+    k = env.k
+    results: dict = {"deterministic": {}, "sampled": {}}
     stage_frac = float(stage.win_tiles_frac)
 
-    for mode in ("deterministic", "sampled"):
+    for mode, n_episodes in (("deterministic", det_n), ("sampled", sampled_n)):
+        if n_episodes <= 0:
+            results[mode] = {
+                "episodes": 0,
+                "win_rate": 0.0,
+                "stage_success_rate": 0.0,
+                "stage": stage.name,
+                "suite": suite,
+                "seeds": [],
+                "maps": [],
+            }
+            continue
         wins = 0
         stage_hits = 0
         deaths = 0
@@ -189,32 +310,40 @@ def _fixed_seed_eval_attempt(
         accepted = 0
         total_a = 0
         hist: dict[str, int] = {}
+        used_seeds: list[str] = []
+        used_maps: list[str] = []
         remaining = n_episodes
         while remaining > 0:
             batch_n = min(k, remaining)
-            cfgs = [
+            offset = n_episodes - remaining
+            cfgs = _eval_configs(
+                curriculum,
+                batch_n,
+                offset,
+                suite=suite,
+                seed_prefix=seed_prefix,
+                mode=mode,
+            )
+            used_seeds.extend(str(c["seed"]) for c in cfgs)
+            used_maps.extend(str(c["map"]) for c in cfgs)
+            pad = [
                 {
                     **curriculum.make_env_config(
-                        f"{seed_prefix}-{mode}-{n_episodes - remaining + i}",
-                        objective=True,
+                        f"eval-pad-{suite}-{i}", objective=True, suite=suite
                     ),
-                    "shaping": 0.0,  # eval without shaping
+                    "shaping": 0.0,
                 }
-                for i in range(batch_n)
-            ]
-            # Temporarily re-init only first batch_n via full init of size env.k
-            # is awkward; use shard 0's VecEnv through a dedicated init of env.k
-            # with padding configs when batch_n < env.k.
-            pad = [
-                curriculum.make_env_config(f"{seed_prefix}-pad-{i}", objective=True)
                 for i in range(env.k - batch_n)
             ]
-            for c in pad:
-                c["shaping"] = 0.0
+            use_active = hasattr(env, "init_active") and hasattr(
+                env, "step_active"
+            )
             use_leading = hasattr(env, "init_leading") and hasattr(
                 env, "step_leading"
             )
-            if use_leading:
+            if use_active:
+                obs = env.init_active(cfgs)
+            elif use_leading:
                 obs = env.init_leading(cfgs)
             else:
                 obs = env.init(cfgs + pad)
@@ -228,7 +357,12 @@ def _fixed_seed_eval_attempt(
                     obs_t = obs_to_tensors(obs, device)
                     acts, _, _ = policy.act(obs_t, deterministic=(mode == "deterministic"))
                 actions = acts.cpu().numpy().astype(np.int32)
-                step = env.step_leading(actions) if use_leading else env.step(actions)
+                if use_active:
+                    step = env.step_active(actions)
+                elif use_leading:
+                    step = env.step_leading(actions)
+                else:
+                    step = env.step(actions)
                 ep_ret += step.rewards
                 for i in range(batch_n):
                     if not active[i]:
@@ -276,7 +410,13 @@ def _fixed_seed_eval_attempt(
             "action_hist": hist,
             "accept_rate": accepted / max(1, total_a),
             "stage": stage.name,
+            "suite": suite,
+            "seeds": used_seeds,
+            "maps": used_maps,
         }
+    results["suite"] = suite
+    results["holdout_map"] = stage.holdout_map
+    results["holdout_map_size"] = stage.holdout_map_size
     return results
 
 
@@ -364,7 +504,14 @@ def main() -> None:
         ckpt = trainer.load(resume_path)
         print(f"resumed from {resume_path} (schema={ckpt.get('schema_version', 1)})")
         if "curriculum" in ckpt and not args.force_stage:
-            curriculum.load_state_dict(ckpt["curriculum"])
+            try:
+                curriculum.load_state_dict(ckpt["curriculum"])
+            except CurriculumRestoreError as exc:
+                raise SystemExit(f"[train] cannot restore curriculum: {exc}") from exc
+            print(
+                f"[train] restored stage={curriculum.stage.name} "
+                f"idx={curriculum.idx} episodes={curriculum.stage_episodes}"
+            )
         elif args.stage is not None and args.force_stage:
             curriculum = Curriculum(start=args.stage)
         if "rng" in ckpt:
@@ -375,11 +522,17 @@ def main() -> None:
             raw_best = tuple(list(raw_best) + [0.0] * (4 - len(raw_best)))
         best_score = raw_best[:4]  # type: ignore[assignment]
         # Pre-v2 scores ranked deterministic ticks/peaks; do not mix.
-        if int((ckpt.get("curriculum") or {}).get("mastery_version", 1)) < 2:
+        mastery_ver = int((ckpt.get("curriculum") or {}).get("mastery_version", 1))
+        if mastery_ver < 2:
             best_score = (-1.0, -1.0, -1.0, -1.0)
             print(
                 "[train] mastery_version < 2: reset best.pt ranking "
                 "(sampled true-win first)"
+            )
+        if mastery_ver < 3:
+            print(
+                "[train] mastery_version < 3: holdout gate is one sampled "
+                "Wilson decision; previous consecutive/det passes discarded"
             )
         if args.additional_steps > 0:
             args.total_steps = trainer.stats.env_steps + args.additional_steps
@@ -397,17 +550,42 @@ def main() -> None:
         connect=args.connect,
     )
     total_envs = env.k
+    seed_stream = SeedStream(args.run_name, args.seed, total_envs)
+    if resume_path:
+        raw_stream = ckpt.get("seed_stream")
+        if isinstance(raw_stream, dict):
+            seed_stream.load_state_dict(raw_stream)
+        else:
+            print(
+                "[train] no seed_stream in checkpoint; starting mixed counters "
+                "at 0 (v2 it{N} replay strings are not reused)"
+            )
     print(
         f"[train] batch={cfg.rollout_len * total_envs} "
         f"num_minibatches={cfg.num_minibatches} epochs={cfg.update_epochs} "
-        f"target_kl={cfg.target_kl} stage={curriculum.stage.name}"
+        f"target_kl={cfg.target_kl} stage={curriculum.stage.name} "
+        f"holdout={curriculum.stage.holdout_map} "
+        f"train_maps={curriculum.stage.train_map_set}"
     )
 
-    def reinit_envs() -> dict:
-        cfgs = [
-            curriculum.make_env_config(
-                f"{args.run_name}-s{args.seed}-e{i}-it{trainer.stats.iterations}"
+    def attach_train_hooks() -> None:
+        def next_cfg(env_i: int) -> dict:
+            # +1: this env is about to complete, so the next episode should
+            # see the post-completion burn-in count.
+            return curriculum.make_env_config(
+                seed_stream.next_env_seed(env_i),
+                completed_episodes=curriculum.stage_episodes + 1,
             )
+
+        def on_reset(env_i: int, _cfg: dict) -> None:
+            seed_stream.note_done(env_i)
+
+        env.set_episode_hooks(next_cfg, on_reset)
+
+    def reinit_envs() -> dict:
+        attach_train_hooks()
+        cfgs = [
+            curriculum.make_env_config(seed_stream.env_seed(i))
             for i in range(total_envs)
         ]
         obs_ = env.init(cfgs)
@@ -423,6 +601,8 @@ def main() -> None:
                 "stage_baseline": stage_baseline,
                 "best_score": list(best_score),
                 "rng": _rng_state(),
+                "seed_stream": seed_stream.state_dict(),
+                "curriculum_suite": curriculum.suite_meta(),
                 **extra,
             },
         )
@@ -481,6 +661,8 @@ def main() -> None:
                             "accepted": ep.accepted,
                             "fizzled": ep.fizzled,
                             "intent_count": ep.intent_count,
+                            "map": ep.map,
+                            "seed": ep.seed,
                         }
                     )
                     + "\n"
@@ -516,48 +698,84 @@ def main() -> None:
                     f"wilson_floor={last_mastery.get('sampled_wilson_floor')} "
                     f"det_win={last_mastery.get('det_win_rate')} "
                     f"det_thresh={last_mastery.get('det_threshold')} "
-                    f"passes={last_mastery.get('eval_passes_required')}"
+                    f"gate={last_mastery.get('gate')} "
+                    f"holdout={last_mastery.get('holdout_map')}"
                 )
                 pbar.set_description(curriculum.stage.name)
                 save_ckpt(run_dir / "latest.pt")
                 obs = reinit_envs()
 
             if args.eval_every and st.iterations > 0 and st.iterations % args.eval_every == 0:
+                suite_meta = curriculum.suite_meta()
+                holdout_n = resolve_holdout_episodes(
+                    args.eval_episodes, curriculum.stage.min_eval_episodes
+                )
+                if holdout_n != args.eval_episodes:
+                    pbar.write(
+                        f"[eval] --eval-episodes={args.eval_episodes} raised to "
+                        f"{holdout_n} (stage {curriculum.stage.name} holdout minimum)"
+                    )
                 pbar.write(
-                    f"[eval] fixed-seed eval at it={st.iterations} "
-                    f"stage={curriculum.stage.name} n={args.eval_episodes} "
-                    f"modes=deterministic,sampled"
+                    f"[eval] holdout eval at it={st.iterations} "
+                    f"stage={curriculum.stage.name} "
+                    f"n_samp={holdout_n} n_det={args.eval_det_episodes} "
+                    f"map={suite_meta['holdout_map']} "
+                    f"seeds=frozen"
                 )
                 t_eval = time.time()
+                ood_ev = None
                 try:
+                    env.set_episode_hooks(None)
                     ev = run_fixed_seed_eval(
                         policy,
                         env,
                         curriculum,
                         device,
-                        args.eval_episodes,
-                        seed_prefix=f"{args.run_name}-eval-it{st.iterations}",
+                        holdout_n,
+                        n_det=args.eval_det_episodes,
+                        n_sampled=holdout_n,
+                        suite="holdout",
                     )
                     det = ev["deterministic"]
                     samp = ev["sampled"]
                     judgment = curriculum.judge_eval(ev)
                     curriculum.note_eval(judgment["passed"])
-                    judgment["consecutive_eval_passes"] = (
-                        curriculum.consecutive_eval_passes
-                    )
                     last_mastery = judgment
+                    if args.eval_ood_episodes > 0 and curriculum.stage.ood_maps:
+                        ood_ev = run_fixed_seed_eval(
+                            policy,
+                            env,
+                            curriculum,
+                            device,
+                            args.eval_ood_episodes,
+                            n_det=0,
+                            n_sampled=args.eval_ood_episodes,
+                            suite="ood",
+                        )
                     score = _eval_score(ev)
                     if score > best_score:
                         best_score = score
-                        save_ckpt(run_dir / "best.pt", eval=ev, mastery=judgment)
+                        save_ckpt(
+                            run_dir / "best.pt",
+                            eval=ev,
+                            mastery=judgment,
+                            ood=ood_ev,
+                        )
                         pbar.write(
                             f"[eval] new best.pt samp_win={samp['win_rate']:.3f} "
                             f"det_win={det['win_rate']:.3f} "
                             f"samp_peak={samp['mean_peak_tiles']:.3f} "
                             f"det_peak={det['mean_peak_tiles']:.3f}"
                         )
+                    ood_wr = (
+                        (ood_ev or {}).get("sampled", {}).get("win_rate")
+                        if ood_ev
+                        else None
+                    )
                     pbar.write(
-                        f"[eval] modes=deterministic,sampled n={args.eval_episodes} "
+                        f"[eval] suite=holdout n_samp={holdout_n} "
+                        f"n_det={args.eval_det_episodes} "
+                        f"map={suite_meta['holdout_map']} "
                         f"samp_win={samp['win_rate']:.3f} "
                         f"det_win={det['win_rate']:.3f} "
                         f"samp_stage={samp.get('stage_success_rate', 0.0):.3f} "
@@ -565,14 +783,19 @@ def main() -> None:
                         f"wilson_lb={judgment['sampled_wilson_lower']:.3f} "
                         f"samp_thresh={judgment['sampled_win_threshold']} "
                         f"wilson_floor={judgment['sampled_wilson_floor']} "
-                        f"det_thresh={judgment['det_threshold']} "
                         f"passed={judgment['passed']} reason={judgment['reason']} "
-                        f"passes={judgment['consecutive_eval_passes']}"
-                        f"/{judgment['eval_passes_required']}"
+                        f"ood_win={ood_wr}"
                     )
                     log_f.write(
                         json.dumps(
-                            {"it": st.iterations, "eval": ev, "mastery": judgment}
+                            {
+                                "it": st.iterations,
+                                "eval": ev,
+                                "ood": ood_ev,
+                                "mastery": judgment,
+                                "curriculum_suite": suite_meta,
+                                "seed_stream": seed_stream.summary(),
+                            }
                         )
                         + "\n"
                     )
@@ -593,6 +816,10 @@ def main() -> None:
                 "stage_episodes": curriculum.stage_episodes,
                 "stage_success_rate": round(curriculum.stage_success_rate, 4),
                 "stage_win_rate": round(curriculum.stage_success_rate, 4),
+                "train_maps": curriculum.stage.train_map_set,
+                "holdout_map": curriculum.stage.holdout_map,
+                "ood_maps": list(curriculum.stage.ood_maps),
+                "seed_stream": seed_stream.summary(),
                 "sps": round(sps, 1),
                 "stage_sps": round(sps, 1),
                 "collect_s": round(collect_s, 3),

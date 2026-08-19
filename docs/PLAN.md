@@ -126,25 +126,45 @@ until the agent has land); a never-spawn at `maxTicks` is `no_spawn`.
 ```
 model, optimizer, ent_coef, stats (bounded windows + cumulatives),
 hyperparameters, metrics snapshot,
-curriculum {idx, stage_episodes, stage_successes, consecutive_eval_passes,
-mastery_version},
+curriculum {idx, stage (name), stage_episodes, stage_successes,
+last_eval_passed, consecutive_eval_passes, mastery_version},
+seed_stream {run_name, master_seed, n_envs, episode_index[]},
+curriculum_suite {canonical_map, train_maps, holdout_map, ood_maps, gate},
 stage_baseline, best_score (sampled true win, det true win, sampled peak,
 det peak), rng {python, numpy, torch, cuda}
 ```
 
-Resume restores the above. Fresh `--stage` is explicit; on resume use
-`--force-stage` to override. `--additional-steps` extends past checkpoint
-`env_steps`; otherwise `--total-steps` is an absolute ceiling.
+Resume restores the above. Curriculum identity is the stage **name**.
+v2 checkpoints that only stored `idx` migrate through `V2_STAGE_NAMES`
+(duel … nations-impossible-world), so a live `nations-easy-small`
+checkpoint (`idx=4`) lands on that name rather than the inserted
+`nations-easy-intro`. Inserted stages cannot silently load the wrong
+stage; an unknown name or idx raises `CurriculumRestoreError`. Fresh
+`--stage` accepts a name or a **current-table** index.
+A missing `seed_stream` starts mixed counters at 0 (new hash namespace;
+old `it{N}` strings are not reused). Fresh `--stage` is explicit; on
+resume use `--force-stage` to override. `--additional-steps` extends past
+checkpoint `env_steps`; otherwise `--total-steps` is an absolute ceiling.
+
+`schema_version` stays **2** (model/observation tensors unchanged).
+`mastery_version` is 3 (one frozen sampled-Wilson decision).
 
 ### Curriculum (`agent/curriculum.py`)
 
-| Stage | Map | Bots | maxTicks | shaping | Actions |
-|-------|-----|------|----------|---------|---------|
-| duel | Halkidiki Compact | 1 | 8000 | 1.0 | land+boat, stage milestone 30% tiles |
-| small-ffa | Halkidiki Compact | 5 | 10000 | 0.6 | land+boat |
-| island-ffa | FourIslands Normal | 10 | 12000 | 0.4 | +build+boat |
-| tribes20 | FourIslands Normal | 20 | 16000 | 0.25 | full |
-| nations-* | … | … | … | →0 | full |
+| Stage | Canonical map | Nations / bots | Notes |
+|-------|---------------|----------------|-------|
+| duel | Halkidiki Compact | 0 / 1 | land+boat, milestone 30% tiles |
+| small-ffa | Halkidiki Compact | 0 / 5 | land+boat |
+| island-ffa | FourIslands Normal | 0 / 10 | +build; island set after burn-in |
+| tribes20 | FourIslands Normal | 0 / 20 | full actions |
+| nations-easy-intro | FourIslands Normal | 3 / 8 | Easy nations, fewer bots |
+| nations-easy-small | FourIslands Normal | 8 / 20 | previous first-nation stage |
+| nations-easy-peninsula | Halkidiki Compact | 8 / 16 | topology/size soften |
+| nations-easy-mid | Halkidiki Normal | 12 / 40 | peninsula Normal set |
+| nations-medium-mid | Halkidiki Normal | 12 / 40 | Medium |
+| nations-hard-mid | Halkidiki Normal | 12 / 40 | Hard |
+| nations-world-easy | World Normal | 12 / 20 | Easy continent before Impossible |
+| nations-impossible-world | World Normal | default / 100 | Impossible |
 
 Halkidiki is peninsulas: land-only cannot reach an opponent on another
 finger, and player ATTACK is legal only with a shared border (intents
@@ -159,19 +179,42 @@ in later stages. `REWARD_CURRICULUM_SUCCESS=1.0` is reserved below
 `REWARD_WIN=3.0` if a discrete milestone bonus is ever reintroduced;
 it must not create a positive non-win return.
 
-`--eval-every` plays the true objective (no milestone termination) on
-fixed seeds, both deterministic and sampled. `win` / `win_rate` are
-core 80% FFA only. `stageSuccess` / `stage_success_rate` are peak tiles
-reaching the stage milestone (or a true win) and never substitute for
-`win`.
+**Map sets.** Early stages stay on one canonical map. After
+`map_burn_in` (`min_episodes/4`) island and later stages sample a small
+validated set (FourIslands/Hawaii/Caribbean/FaroeIslands, then
+Halkidiki/Balkans/Britannia, then World/Europe/NorthAmerica). Selection
+is deterministic from the episode seed. Arcade, tournament, The Box, and
+Giant World are never used. Tensor/action schema does not change.
 
-Advancement uses `min_episodes` plus **two consecutive** mastery passes.
-A pass is either (A) deterministic competency (`stage_success_rate` on
-milestone stages, else true `win_rate`, at `win_threshold`) or (B)
-sampled **true-win** mastery (`win_rate >= 0.8` and Wilson lower bound
-above `sampled_wilson_floor`, default 0.50). Untrained random on the
-duel is ~20–32% and cannot pass (B). Sampled milestone / stageSuccess
-alone never passes. Training-time sampled rates are logged only.
+**Holdout gate.** `--eval-every` plays the true objective on a **frozen
+per-stage holdout** (canonical map; blake2 mix of
+`("holdout", stage_name, index)`, default 32 sampled episodes). Seeds do
+not rotate with iteration; retries replay the same identities. Values of
+`--eval-episodes` below the stage minimum (including leftover `--eval-episodes 8`
+commands) are raised to 32 so the 26/32 bar is actually played.
+Advancement is **one** sampled true-win decision: `win_rate >= 0.8` and
+Wilson lower bound `>= 0.50` (26/32). Deterministic argmax (default 8
+episodes, same holdout maps/seeds) is logged only and cannot pass.
+Sampled milestone / stageSuccess never passes. Training-time rates are
+logged only. Optional OOD episodes (ArchipelagoSea / Balkans / Britannia
+/ SouthAmerica, never overlapping that stage's train set) are logged and
+never gate.
+
+Eval uses `init_active` / `step_active`: episodes are round-robin
+spread across as many shards as possible (a 32-game holdout on a 16×8
+farm uses all 16 servers, two games each). Idle shards and unused
+lanes are not stepped. Results stay in seed/episode order. After eval,
+training `init()` restores the full shard layout.
+
+**Seed stream.** Python owns train episode identity. Each env has a
+persisted `episode_index`. Seeds are blake2 mixes of
+`(train, run, master_seed, env_i, episode_index)` — not sequential
+`e{i}` + djb2. On `done`, the step frame may include `nextConfigs`
+(seed + map). TypeScript falls back to `{seed}-r{n}` only for watch /
+clients that omit the field. Shard restart re-inits from the **current**
+per-env configs (updated on each done), so a dead shard does not replay
+the original `init()` batch. Interrupt / resume restores counters and
+continues; it does not jump back to `it{N}`.
 
 Deterministic argmax is a robustness / greedy diagnostic, not the
 definition of policy quality. Training and deployment use the sampled
@@ -183,6 +226,24 @@ mastery of the intended policy, not a reason to repeat the stage.
 spawn-then-NOOP, near-zero territory) zeros that mode. Milestone rates
 do not enter the score. Stage advance resets `best_score` so a new
 stage can replace the previous best.
+
+**16-slot observability.** Slot 0 is the agent. Priority fill keeps
+bordering / attacking / allied opponents individually targetable. When
+more than 15 opponents exist, slots 1–14 stay individuals and slot 15
+is an untargetable overflow aggregate (both Nation+Bot feature flags).
+Opponent `sharesBorderWith` / attackability / incoming troops are
+computed once per extract and reused for player features and target
+masks; ties break by `smallID` then id. v2 checkpoints remain loadable
+(schema_version 2, same tensor shapes). Residual: more than 14
+simultaneous border/attackers still cannot all be targeted; World-scale
+games remain mostly anonymous mass. A v3 schema would be required for
+full correction.
+
+**Headless GameRunner.** AgentEnv constructs `GameRunner` with
+`skipNamePlacement: true` so HUD `placeName` / `placeSpawnName` is
+skipped. Packed tile/player/attack updates, hashes, rewards, masks,
+and `renderFrame` still emit. `createGameRunner()` (OpenFront client)
+keeps the default name-placement path.
 
 ## Historical notes (bugs that shaped the design)
 

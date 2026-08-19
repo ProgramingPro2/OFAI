@@ -9,6 +9,8 @@ from __future__ import annotations
 SPATIAL_CHANNELS = 10
 SPATIAL_SIZE = 64
 NUM_PLAYER_SLOTS = 16  # slot 0 is always the agent
+# Overflow (>15 opponents): slots 1-14 stay targetable individuals;
+# slot 15 is an untargetable aggregate (Nation+Bot flags). Same shape.
 PLAYER_FEATURES = 14
 GLOBAL_FEATURES = 10
 

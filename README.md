@@ -27,7 +27,7 @@ source .venv/bin/activate
 # Train (N env-server processes x K games each). Fresh runs truncate their
 # JSONL logs; resume appends. Episode-level metrics go to logs/<run>.episodes.jsonl.
 python -m agent.train --servers 4 --envs 8 --rollout-len 128 --run-name run1 \
-    --eval-every 25 --total-steps 2000000
+    --eval-every 25 --eval-episodes 32 --total-steps 2000000
 
 # Resume with an absolute step ceiling, or add more steps beyond the checkpoint:
 python -m agent.train --resume checkpoints/run1/latest.pt --run-name run1 \
@@ -68,8 +68,9 @@ python tests/test_env_client.py
 ```
 
 `agent.watch` supports every curriculum stage via `--preset`: `duel`,
-`small-ffa`, `island-ffa`, `tribes20`, `nations-easy-small`,
-`nations-easy-mid`, `nations-medium-mid`, `nations-hard-mid`, and
+`small-ffa`, `island-ffa`, `tribes20`, `nations-easy-intro`,
+`nations-easy-small`, `nations-easy-peninsula`, `nations-easy-mid`,
+`nations-medium-mid`, `nations-hard-mid`, `nations-world-easy`, and
 `nations-impossible-world`. Explicit match flags override preset values.
 `--game-type` (also `--opponents`) selects `tribes`, `nations`, or `mixed`;
 `--nations` accepts an exact count, `default`, or `disabled`, while `--bots`
@@ -120,7 +121,17 @@ the native map and saved-video resolution; display fitting does not alter
 video output.
 
 Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
-`--resume`, `--stage` / `--force-stage`, `--eval-every`, `--target-kl`
+`--resume`, `--stage` / `--force-stage` (name or current-table index),
+`--eval-every`, `--eval-episodes`
+(default 32 frozen holdout; values below the stage minimum are raised),
+`--eval-det-episodes` (diagnostic),
+`--eval-ood-episodes` (logged only), `--target-kl`
 (default 0.03 active-joint), `--ent-target` (default 0.6 mask-normalized
 action-type entropy in [0, 1]). There is no `--compile` path; rollout
 always uses the eager policy.
+
+Curriculum resume is keyed by stage name. A schema-v2 checkpoint that
+only stored `idx` is migrated through the frozen v2 name table so
+inserted stages cannot silently remap. Unknown names fail clearly.
+Train maps, holdout suite, OOD suite, and seed-stream counters are
+written to checkpoint extras and JSONL logs.

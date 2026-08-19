@@ -36,6 +36,8 @@ from agent.env_client import (
     _encode_frame,
     _obs_dict,
     _read_frame,
+    _scatter_obs,
+    distribute_active_lanes,
 )
 from agent.eval import scripted_expander_action
 from agent.model import Policy, make_dummy_obs, normalized_action_entropy, obs_to_tensors
@@ -354,7 +356,7 @@ def test_shard_recovery_no_double_step():
         def __init__(self, idx):
             self.idx = idx
 
-        def step(self, actions):
+        def step(self, actions, next_configs=None):
             step_counts[self.idx] += 1
             if self.idx == 1:
                 raise ConnectionError("shard down")
@@ -446,11 +448,11 @@ def test_curriculum_window_and_state():
     assert len(cur._stage_successes) == 5
     assert not cur.maybe_advance()
     cur.note_eval(True)
-    cur.note_eval(True)
     assert cur.maybe_advance()
     assert cur.idx == 1
     assert cur.stage_episodes == 0
     assert cur.consecutive_eval_passes == 0
+    assert not cur.last_eval_passed
     sd = cur.state_dict()
     cur2 = Curriculum(stages=stages, start=0)
     cur2.load_state_dict(sd)
@@ -1062,8 +1064,6 @@ def test_curriculum_advance_ignores_sampled_stage_rate():
     assert cur.stage_success_rate == 1.0
     assert not cur.maybe_advance()
     cur.note_eval(True)
-    assert not cur.maybe_advance()
-    cur.note_eval(True)
     assert cur.maybe_advance()
     assert cur.idx == 1
 
@@ -1071,7 +1071,7 @@ def test_curriculum_advance_ignores_sampled_stage_rate():
 def test_wilson_random_sampled_does_not_pass():
     """Untrained-like 20-32% sampled true win must not pass mastery."""
     cur = Curriculum()
-    for n, rate in ((8, 0.20), (8, 0.32), (50, 0.20), (50, 0.32)):
+    for n, rate in ((8, 0.20), (8, 0.32), (32, 0.20), (32, 0.32), (50, 0.32)):
         ev = {
             "deterministic": _mode_stats(0.0, episodes=n),
             "sampled": _mode_stats(rate, episodes=n),
@@ -1079,25 +1079,32 @@ def test_wilson_random_sampled_does_not_pass():
         judgment = cur.judge_eval(ev)
         assert not judgment["passed"], (n, rate, judgment)
         assert judgment["reason"] == "none"
-        assert judgment["sampled_wilson_lower"] < cur.stage.sampled_wilson_floor
+        if n >= cur.stage.min_eval_episodes:
+            assert judgment["sampled_wilson_lower"] < cur.stage.sampled_wilson_floor
     tiny = {
         "deterministic": _mode_stats(0.0, episodes=4),
         "sampled": _mode_stats(1.0, episodes=4, cause="win"),
     }
     assert not cur.judge_eval(tiny)["passed"]
+    full = {
+        "deterministic": _mode_stats(0.0, episodes=8),
+        "sampled": _mode_stats(1.0, episodes=8, cause="win"),
+    }
+    # Default holdout is 32; 8/8 is a lottery and must not pass.
+    assert not cur.judge_eval(full)["passed"]
     assert wilson_lower_bound(10, 50) < 0.50
     assert wilson_lower_bound(16, 50) < 0.50
 
 
-def test_sampled_mastery_requires_two_evals():
-    """100% sampled true wins pass only after two consecutive evaluations."""
+def test_sampled_mastery_is_one_holdout_decision():
+    """100% sampled true wins on a large enough holdout advance once."""
     stages = [
         Stage(
             name="a",
             map="Halkidiki",
             bots=1,
             min_episodes=2,
-            eval_passes_required=2,
+            min_eval_episodes=8,
             win_tiles_frac=0.30,
         ),
         Stage(name="b", map="Halkidiki", bots=5, min_episodes=1),
@@ -1113,17 +1120,14 @@ def test_sampled_mastery_requires_two_evals():
     assert first["passed"]
     assert first["reason"] == "sampled_true_win"
     assert first["sampled_wilson_lower"] >= cur.stage.sampled_wilson_floor
+    assert first["det_diagnostic_only"] is True
     assert not cur.maybe_advance()
     cur.note_eval(True)
-    assert cur.consecutive_eval_passes == 1
-    assert not cur.maybe_advance()
-    second = cur.judge_eval(ev)
-    assert second["passed"]
-    cur.note_eval(True)
-    assert cur.consecutive_eval_passes == 2
+    assert cur.last_eval_passed
     assert cur.maybe_advance()
     assert cur.idx == 1
     assert cur.consecutive_eval_passes == 0
+    assert not cur.last_eval_passed
     assert cur.stage_episodes == 0
 
 
@@ -1150,27 +1154,28 @@ def test_stage_success_only_never_passes_objective_mastery():
     assert later_j["reason"] == "none"
 
 
-def test_deterministic_competency_can_pass():
-    """Robust det competency still advances even if sampled win is random-like."""
+def test_deterministic_competency_does_not_gate():
+    """Det argmax is diagnostic only; it cannot pass the holdout gate."""
     cur = Curriculum()
     ev = {
         "deterministic": _mode_stats(
-            0.0, episodes=8, stage_success_rate=0.75, peak=0.35
+            0.0, episodes=32, stage_success_rate=1.0, peak=0.35
         ),
-        "sampled": _mode_stats(0.20, episodes=8, stage_success_rate=0.20),
+        "sampled": _mode_stats(0.20, episodes=32, stage_success_rate=0.20),
     }
     judgment = cur.judge_eval(ev)
-    assert judgment["passed"]
-    assert judgment["reason"] == "deterministic_competency"
+    assert not judgment["passed"]
+    assert judgment["reason"] == "none"
+    assert judgment["det_diagnostic_only"] is True
     later = Curriculum(start=1)
     assert later.stage.win_tiles_frac == 0.0
     win_ev = {
-        "deterministic": _mode_stats(0.75, episodes=8, cause="win"),
-        "sampled": _mode_stats(0.20, episodes=8),
+        "deterministic": _mode_stats(1.0, episodes=32, cause="win"),
+        "sampled": _mode_stats(0.20, episodes=32),
     }
     win_j = later.judge_eval(win_ev)
-    assert win_j["passed"]
-    assert win_j["reason"] == "deterministic_true_win"
+    assert not win_j["passed"]
+    assert win_j["reason"] == "none"
 
 
 def test_old_mastery_version_resets_eval_passes():
@@ -1184,14 +1189,29 @@ def test_old_mastery_version_resets_eval_passes():
         }
     )
     assert cur.consecutive_eval_passes == 0
-    assert MASTERY_VERSION == 2
+    assert not cur.last_eval_passed
+    assert MASTERY_VERSION == 3
     cur2 = Curriculum()
     cur2.note_eval(True)
     sd = cur2.state_dict()
     assert sd["mastery_version"] == MASTERY_VERSION
+    assert sd["stage"] == "duel"
     cur3 = Curriculum()
     cur3.load_state_dict(sd)
+    assert cur3.last_eval_passed
     assert cur3.consecutive_eval_passes == 1
+    v2 = Curriculum()
+    v2.load_state_dict(
+        {
+            "idx": 4,
+            "consecutive_eval_passes": 2,
+            "stage_episodes": 100,
+            "mastery_version": 2,
+        }
+    )
+    assert v2.stage.name == "nations-easy-small"
+    assert v2.idx == next(i for i, s in enumerate(STAGES) if s.name == "nations-easy-small")
+    assert not v2.last_eval_passed
 
 
 class _EvalInterruptEnv:
@@ -1456,26 +1476,28 @@ def test_concat_obs_reuse_matches_allocate():
         assert np.array_equal(fresh[key], again[key]), key
 
 
-def test_eval_leading_shards_skips_idle_envs():
+def test_eval_active_lanes_skips_idle_envs():
     """Eval with 8 episodes on a 16-env mock must not pad-init all shards."""
 
-    class LeadingEnv:
+    class ActiveEnv:
         def __init__(self):
             self.k = 16
             self.envs_per_server = 8
             self.init_n = []
             self.step_n = []
             self.full_init = 0
+            self.seeds: list[str] = []
 
         def init(self, cfgs):
             self.full_init += 1
             return _numpy_obs(self.k)
 
-        def init_leading(self, cfgs):
+        def init_active(self, cfgs):
             self.init_n.append(len(cfgs))
+            self.seeds = [c["seed"] for c in cfgs]
             return _numpy_obs(len(cfgs))
 
-        def step_leading(self, actions):
+        def step_active(self, actions):
             self.step_n.append(actions.shape[0])
             n = actions.shape[0]
             info = _fake_info(
@@ -1489,9 +1511,9 @@ def test_eval_leading_shards_skips_idle_envs():
             )
 
         def step(self, actions):
-            raise AssertionError("full step should not run when leading exists")
+            raise AssertionError("full step should not run when active exists")
 
-    env = LeadingEnv()
+    env = ActiveEnv()
     ev = run_fixed_seed_eval(
         Policy(),
         env,
@@ -1505,6 +1527,55 @@ def test_eval_leading_shards_skips_idle_envs():
     assert env.step_n == [8, 8]
     assert ev["deterministic"]["episodes"] == 8
     assert ev["sampled"]["episodes"] == 8
+    assert ev["deterministic"]["seeds"] == [f"lead-eval-deterministic-{i}" for i in range(8)]
+    assert ev["sampled"]["seeds"] == [f"lead-eval-sampled-{i}" for i in range(8)]
+
+
+def test_eval_sampled_32_keeps_holdout_seed_order():
+    class ActiveEnv:
+        def __init__(self):
+            self.k = 128
+            self.full_init = 0
+
+        def init(self, cfgs):
+            self.full_init += 1
+            return _numpy_obs(self.k)
+
+        def init_active(self, cfgs):
+            self.last = [c["seed"] for c in cfgs]
+            return _numpy_obs(len(cfgs))
+
+        def step_active(self, actions):
+            n = actions.shape[0]
+            info = _fake_info(
+                terminalCause="win", win=True, tick=4, peakTilesFrac=0.4, tilesFrac=0.4
+            )
+            return StepBatch(
+                obs=_numpy_obs(n),
+                rewards=np.ones(n, np.float32),
+                dones=np.ones(n, dtype=bool),
+                infos=[info] * n,
+            )
+
+        def step(self, actions):
+            raise AssertionError("idle full-width step")
+
+    env = ActiveEnv()
+    cur = Curriculum(start=0)
+    ev = run_fixed_seed_eval(
+        Policy(),
+        env,
+        cur,
+        torch.device("cpu"),
+        n_episodes=32,
+        n_det=0,
+        n_sampled=32,
+    )
+    expected = cur.holdout_seeds(32)
+    assert env.full_init == 0
+    assert env.last == expected
+    assert ev["sampled"]["seeds"] == expected
+    assert ev["sampled"]["episodes"] == 32
 
 
 def test_progress_timing_fields_round():
@@ -1521,3 +1592,155 @@ def test_progress_timing_fields_round():
     assert rec["update_s"] == 1.96
     assert rec["eval_s"] == 0.0
     assert rec["sps"] == rec["stage_sps"]
+
+
+def test_distribute_active_lanes_spreads_instead_of_packing():
+    eight = distribute_active_lanes(8, 16, 8)
+    assert sum(len(s) for s in eight) == 8
+    assert sum(1 for s in eight if s) == 8
+    assert all(len(s) <= 1 for s in eight)
+    assert eight[0] == [0]
+    assert eight[7] == [7]
+    assert eight[8] == []
+
+    holdout = distribute_active_lanes(32, 16, 8)
+    assert [len(s) for s in holdout] == [2] * 16
+    assert holdout[0] == [0, 16]
+    assert holdout[1] == [1, 17]
+    assert sorted(i for lanes in holdout for i in lanes) == list(range(32))
+
+    packed_cap = distribute_active_lanes(32, 4, 8)
+    assert [len(s) for s in packed_cap] == [8] * 4
+    assert packed_cap[0] == list(range(0, 32, 4))
+
+    with pytest.raises(ValueError, match="cannot place"):
+        distribute_active_lanes(33, 4, 8)
+
+
+def test_scatter_obs_restores_episode_order():
+    assignment = [[0, 2], [1]]
+    shard0 = _numpy_obs(2)
+    shard1 = _numpy_obs(1)
+    shard0["global"][0, 0] = 10
+    shard0["global"][1, 0] = 12
+    shard1["global"][0, 0] = 11
+    out = _scatter_obs({0: shard0, 1: shard1}, assignment, 3)
+    assert list(out["global"][:, 0]) == [10, 11, 12]
+
+
+def test_init_active_skips_idle_shards_and_keeps_result_order():
+    from concurrent.futures import ThreadPoolExecutor
+
+    env = object.__new__(ShardedVecEnv)
+    env.envs_per_server = 8
+    env.k = 32
+    env.ports = [1, 2, 3, 4]
+    env.connect = True
+    env.servers = []
+    env._configs = [{"seed": f"train-{i}"} for i in range(32)]
+    env.pool = ThreadPoolExecutor(max_workers=4)
+    env._obs_buf = None
+    env._next_config_fn = None
+    env._on_episode_reset = None
+    env._active_assignment = []
+    env._active_shards = []
+    env._active_n = 0
+    inited: list[int] = []
+    stepped: list[int] = []
+
+    class FakeClient:
+        def __init__(self, idx: int):
+            self.idx = idx
+
+        def init(self, cfgs):
+            inited.append(self.idx)
+            obs = _numpy_obs(len(cfgs))
+            for local, cfg in enumerate(cfgs):
+                obs["global"][local, 0] = float(str(cfg["seed"]).split("-")[1])
+            return obs
+
+        def step(self, actions, next_configs=None):
+            stepped.append(self.idx)
+            n = actions.shape[0]
+            return StepBatch(
+                obs=_numpy_obs(n),
+                rewards=np.full(n, float(self.idx), np.float32),
+                dones=np.ones(n, dtype=bool),
+                infos=[{"shard": self.idx, "local": j} for j in range(n)],
+            )
+
+    env.clients = [FakeClient(i) for i in range(4)]
+    cfgs = [{"seed": f"eval-{i}"} for i in range(3)]
+    obs = env.init_active(cfgs)
+    assert sorted(inited) == [0, 1, 2]
+    assert 3 not in inited
+    assert list(obs["global"][:3, 0]) == [0.0, 1.0, 2.0]
+    assert env._configs[0]["seed"] == "train-0"
+
+    batch = env.step_active(np.zeros((3, 5), np.int32))
+    assert sorted(stepped) == [0, 1, 2]
+    assert 3 not in stepped
+    assert list(batch.rewards) == [0.0, 1.0, 2.0]
+    assert [info["shard"] for info in batch.infos] == [0, 1, 2]
+    env.pool.shutdown(wait=False)
+
+
+def test_init_active_full_width_does_not_clear_active_or_train_configs():
+    """32-on-32 (README 4x8 + 32 holdout) must keep step_active usable."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    env = object.__new__(ShardedVecEnv)
+    env.envs_per_server = 2
+    env.k = 8
+    env.ports = [1, 2, 3, 4]
+    env.connect = True
+    env.servers = []
+    env._configs = [{"seed": f"train-{i}"} for i in range(8)]
+    env.pool = ThreadPoolExecutor(max_workers=4)
+    env._obs_buf = None
+    env._next_config_fn = None
+    env._on_episode_reset = None
+    env._active_assignment = []
+    env._active_shards = []
+    env._active_n = 0
+    inited: list[int] = []
+
+    class FakeClient:
+        def __init__(self, idx: int):
+            self.idx = idx
+
+        def init(self, cfgs):
+            inited.append(len(cfgs))
+            obs = _numpy_obs(len(cfgs))
+            for local, cfg in enumerate(cfgs):
+                obs["global"][local, 0] = float(str(cfg["seed"]).split("-")[1])
+            return obs
+
+        def step(self, actions, next_configs=None):
+            n = actions.shape[0]
+            return StepBatch(
+                obs=_numpy_obs(n),
+                rewards=np.full(n, float(self.idx), np.float32),
+                dones=np.ones(n, dtype=bool),
+                infos=[{"shard": self.idx, "local": j} for j in range(n)],
+            )
+
+    env.clients = [FakeClient(i) for i in range(4)]
+    cfgs = [{"seed": f"eval-{i}"} for i in range(8)]
+    obs = env.init_active(cfgs)
+    assert inited.count(2) == 4
+    assert len(inited) == 4
+    assert env._configs[0]["seed"] == "train-0"
+    assert env._active_n == 8
+    assert list(obs["global"][:, 0]) == list(range(8))
+    batch = env.step_active(np.zeros((8, 5), np.int32))
+    # Round-robin: shard i owns episodes i, i+4
+    assert [info["shard"] for info in batch.infos] == [0, 1, 2, 3, 0, 1, 2, 3]
+    env.pool.shutdown(wait=False)
+
+
+def test_init_active_32_on_16_shards_uses_all_servers():
+    assignment = distribute_active_lanes(32, 16, 8)
+    assert len(assignment) == 16
+    assert all(len(lanes) == 2 for lanes in assignment)
+    assert [lanes[0] for lanes in assignment] == list(range(16))

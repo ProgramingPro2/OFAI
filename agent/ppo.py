@@ -100,6 +100,8 @@ class EpisodeRecord:
     accepted: int
     fizzled: int
     intent_count: int
+    map: str = ""
+    seed: str = ""
 
 
 @dataclass
@@ -538,6 +540,8 @@ class PPOTrainer:
                         accepted=tr.accepted,
                         fizzled=tr.fizzled,
                         intent_count=tr.intent_count,
+                        map=str(info.get("map", "")),
+                        seed=str(info.get("seed", "")),
                     )
                     self.stats.record_episode(ep)
                     completed.append(ep)

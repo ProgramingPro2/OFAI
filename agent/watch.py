@@ -41,7 +41,7 @@ import numpy as np
 import torch
 
 from . import spaces
-from .curriculum import STAGES
+from .curriculum import STAGES, all_curriculum_maps
 from .env_client import EnvServerProcess, VecEnv
 from .model import Policy, obs_to_tensors
 
@@ -622,7 +622,7 @@ def parse_game_map_keys(source: str) -> list[str]:
 
 def discover_maps(openfront_root: Path | None = None) -> list[str]:
     """Curriculum maps plus locally installed OpenFront GameMapType keys."""
-    maps = {stage.map for stage in STAGES}
+    maps = all_curriculum_maps()
     root = Path(openfront_root) if openfront_root is not None else REPO_ROOT / "OpenFrontIO"
     for rel in ("src/core/game/Maps.gen.ts", "src/core/game/Game.ts"):
         path = root / rel

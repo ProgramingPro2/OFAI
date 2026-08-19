@@ -23,6 +23,7 @@ import struct
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,11 +248,22 @@ class VecEnv:
         self.k = int(header["k"])
         return _obs_dict(tensors, self.k)
 
-    def step(self, actions: np.ndarray) -> StepBatch:
-        """actions: int32 [K, 5] in (action_type, target, region, quantity, unit)."""
+    def step(
+        self,
+        actions: np.ndarray,
+        next_configs: list[dict | None] | None = None,
+    ) -> StepBatch:
+        """actions: int32 [K, 5] in (action_type, target, region, quantity, unit).
+
+        When provided, `next_configs[i]` is applied by the server if env i
+        ends this step (Python-owned seed / map stream).
+        """
         assert actions.shape == (self.k, 5)
         acts = np.ascontiguousarray(actions, dtype=np.int32)
-        self.sock.sendall(_encode_frame({"cmd": "step"}, {"actions": acts}))
+        header: dict = {"cmd": "step"}
+        if next_configs is not None:
+            header["nextConfigs"] = next_configs
+        self.sock.sendall(_encode_frame(header, {"actions": acts}))
         header, tensors = _read_frame(self.sock)
         if header.get("type") == "error":
             raise RuntimeError(f"env server error: {header.get('error')}")
@@ -295,6 +307,63 @@ class VecEnv:
             self.sock.close()
 
 
+def distribute_active_lanes(
+    n: int, num_shards: int, envs_per_server: int
+) -> list[list[int]]:
+    """Assign episode indices ``0..n-1`` across shards.
+
+    Uses as many shards as possible (up to ``min(n, num_shards)``) without
+    placing more than ``envs_per_server`` lanes on one shard. Assignment is
+    round-robin so gathering by shard and scattering by index restores
+    episode order. Raises if ``n`` exceeds total capacity.
+    """
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    if num_shards < 1:
+        raise ValueError("num_shards must be positive")
+    if envs_per_server < 1:
+        raise ValueError("envs_per_server must be positive")
+    assignment: list[list[int]] = [[] for _ in range(num_shards)]
+    if n == 0:
+        return assignment
+    capacity = num_shards * envs_per_server
+    if n > capacity:
+        raise ValueError(
+            f"cannot place {n} active lanes on {num_shards}x{envs_per_server}"
+        )
+    used = min(num_shards, n)
+    while math.ceil(n / used) > envs_per_server:
+        used += 1
+    for i in range(n):
+        assignment[i % used].append(i)
+    return assignment
+
+
+def _scatter_obs(
+    shard_obs: dict[int, dict[str, np.ndarray]],
+    assignment: list[list[int]],
+    n: int,
+    out: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
+    """Place per-shard obs back into episode-index order."""
+    first = next(iter(shard_obs.values()))
+    if out is None or any(
+        key not in out
+        or out[key].shape[0] != n
+        or out[key].shape[1:] != first[key].shape[1:]
+        for key in first
+    ):
+        out = {
+            key: np.empty((n,) + first[key].shape[1:], dtype=first[key].dtype)
+            for key in first
+        }
+    for shard_i, obs in shard_obs.items():
+        lanes = assignment[shard_i]
+        for key in out:
+            out[key][lanes] = obs[key]
+    return out
+
+
 def _concat_obs(
     obses: list[dict[str, np.ndarray]],
     out: dict[str, np.ndarray] | None = None,
@@ -321,7 +390,11 @@ def _concat_obs(
 
 class ShardedVecEnv:
     """Several EnvServer processes stepped in parallel behind one VecEnv-like
-    interface. Env index i lives on server i // envs_per_server.
+    interface. Training env index i lives on server i // envs_per_server.
+
+    Eval uses ``init_active`` / ``step_active`` to spread a subset of
+    episodes across shards (round-robin) and skip idle lanes. Training
+    ``init()`` / ``step()`` always cover the full width.
 
     On shard failure: restart the dead shard(s) and raise RolloutInterrupted.
     Healthy shards are never re-stepped (retry-all would double-step them).
@@ -347,6 +420,22 @@ class ShardedVecEnv:
         self._obs_buf: dict[str, np.ndarray] | None = None
         self._leading_shards = 0
         self._leading_n = 0
+        self._active_assignment: list[list[int]] = []
+        self._active_shards: list[int] = []
+        self._active_n = 0
+        self._next_config_fn: Callable[[int], dict] | None = None
+        self._on_episode_reset: Callable[[int, dict], None] | None = None
+
+    def set_episode_hooks(
+        self,
+        next_config_fn: Callable[[int], dict] | None,
+        on_episode_reset: Callable[[int, dict], None] | None = None,
+    ) -> None:
+        """Python-owned auto-reset: next train config per env, and a callback
+        after a done env is re-seeded. Eval should clear hooks.
+        """
+        self._next_config_fn = next_config_fn
+        self._on_episode_reset = on_episode_reset
 
     def init(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
         assert len(env_configs) == self.k
@@ -362,39 +451,55 @@ class ShardedVecEnv:
         self._obs_buf = _concat_obs(obses, self._obs_buf)
         self._leading_shards = len(self.clients)
         self._leading_n = self.k
+        self._clear_active()
         return self._obs_buf
 
-    def init_leading(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
-        """Init the minimum leading shards covering these configs.
+    def _clear_active(self) -> None:
+        self._active_assignment = []
+        self._active_shards = []
+        self._active_n = 0
 
-        Other shards are left untouched so eval cannot double-step them.
-        Returns obs for ``len(env_configs)`` envs (trailing shard slots are
-        padded internally and sliced off).
+    def _set_active(self, assignment: list[list[int]], n: int) -> None:
+        self._active_assignment = assignment
+        self._active_shards = [i for i, lanes in enumerate(assignment) if lanes]
+        self._active_n = n
+        self._leading_shards = len(self._active_shards)
+        self._leading_n = n
+
+    def init_active(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
+        """Init only the shards that receive these configs.
+
+        Episodes are spread across as many shards as possible (round-robin)
+        so a 32-game holdout uses idle training shards instead of packing
+        into the first few processes. Each participating shard is inited
+        with only its assigned configs — idle lanes are not created or
+        stepped. Training ``_configs`` are left unchanged so a later
+        ``init()`` restores the train layout.
+
+        Returns obs in the original config / episode order.
         """
         n = len(env_configs)
-        if n == self.k:
-            return self.init(env_configs)
         if n <= 0:
-            raise ValueError("init_leading requires at least one env config")
-        eps = self.envs_per_server
-        n_shards = min(len(self.clients), max(1, math.ceil(n / eps)))
-        width = n_shards * eps
-        padded = list(env_configs)
-        while len(padded) < width:
-            base = dict(env_configs[-1])
-            base["seed"] = f"{env_configs[-1].get('seed', 'p')}-leadpad-{len(padded)}"
-            padded.append(base)
-        chunks = [padded[i * eps : (i + 1) * eps] for i in range(n_shards)]
-        obses = list(
-            self.pool.map(
-                lambda t: t[0].init(t[1]),
-                zip(self.clients[:n_shards], chunks),
-            )
+            raise ValueError("init_active requires at least one env config")
+        # Never call init() here: that would overwrite training `_configs`
+        # and clear the active assignment. A 32-game holdout on a 4x8 farm
+        # is n==k and must still scatter + step_active.
+        assignment = distribute_active_lanes(
+            n, len(self.clients), self.envs_per_server
         )
-        stacked = _concat_obs(obses)
-        self._leading_shards = n_shards
-        self._leading_n = n
-        return {key: stacked[key][:n] for key in stacked}
+        self._set_active(assignment, n)
+
+        def _init_one(shard_i: int) -> tuple[int, dict[str, np.ndarray]]:
+            cfgs = [env_configs[j] for j in assignment[shard_i]]
+            return shard_i, self.clients[shard_i].init(cfgs)
+
+        pairs = list(self.pool.map(_init_one, self._active_shards))
+        shard_obs = {i: obs for i, obs in pairs}
+        return _scatter_obs(shard_obs, assignment, n)
+
+    def init_leading(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
+        """Alias for ``init_active`` (distributed, not packed leading shards)."""
+        return self.init_active(env_configs)
 
     def _restart_shard(self, i: int) -> None:
         port = self.ports[i]
@@ -408,15 +513,45 @@ class ShardedVecEnv:
             self.servers[i] = EnvServerProcess(port)
         self.clients[i] = VecEnv("127.0.0.1", port)
         eps = self.envs_per_server
+        # Current per-env configs (updated on each done), not the original init.
         self.clients[i].init(self._configs[i * eps : (i + 1) * eps])
+
+    def _next_configs_for(self, n: int) -> list[dict | None] | None:
+        fn = getattr(self, "_next_config_fn", None)
+        if fn is None:
+            return None
+        return [fn(i) for i in range(n)]
+
+    def _note_resets(self, dones: np.ndarray, next_configs: list[dict | None] | None) -> None:
+        if next_configs is None:
+            return
+        for i, done in enumerate(dones):
+            if not done:
+                continue
+            cfg = next_configs[i]
+            if cfg is None:
+                continue
+            if i < len(self._configs):
+                self._configs[i] = dict(cfg)
+            on_reset = getattr(self, "_on_episode_reset", None)
+            if on_reset is not None:
+                on_reset(i, cfg)
 
     def step(self, actions: np.ndarray) -> StepBatch:
         assert actions.shape == (self.k, 5)
         eps = self.envs_per_server
+        next_configs = self._next_configs_for(self.k)
         chunks = [actions[i * eps : (i + 1) * eps] for i in range(len(self.clients))]
+        cfg_chunks: list[list[dict | None] | None]
+        if next_configs is None:
+            cfg_chunks = [None] * len(self.clients)
+        else:
+            cfg_chunks = [
+                next_configs[i * eps : (i + 1) * eps] for i in range(len(self.clients))
+            ]
         futures = [
-            self.pool.submit(client.step, chunk)
-            for client, chunk in zip(self.clients, chunks)
+            self.pool.submit(client.step, chunk, cfgs)
+            for client, chunk, cfgs in zip(self.clients, chunks, cfg_chunks)
         ]
         batches: list[StepBatch | None] = [None] * len(self.clients)
         errors: list[tuple[int, BaseException]] = []
@@ -441,37 +576,40 @@ class ShardedVecEnv:
         assert all(b is not None for b in batches)
         ready: list[StepBatch] = batches  # type: ignore[assignment]
         self._obs_buf = _concat_obs([b.obs for b in ready], self._obs_buf)
+        dones = np.concatenate([b.dones for b in ready])
+        self._note_resets(dones, next_configs)
         return StepBatch(
             obs=self._obs_buf,
             rewards=np.concatenate([b.rewards for b in ready]),
-            dones=np.concatenate([b.dones for b in ready]),
+            dones=dones,
             infos=[info for b in ready for info in b.infos],
         )
 
-    def step_leading(self, actions: np.ndarray) -> StepBatch:
-        """Step only shards covering ``init_leading`` envs."""
-        n = self._leading_n
-        if n <= 0 or self._leading_shards <= 0:
-            raise RuntimeError("step_leading requires a prior init_leading")
+    def step_active(self, actions: np.ndarray) -> StepBatch:
+        """Step only shards that have active lanes from ``init_active``.
+
+        ``actions`` are in episode-index order (same as ``init_active``
+        configs). Idle shards are not submitted. Results are scattered
+        back into that order.
+        """
+        n = self._active_n
+        assignment = self._active_assignment
+        if n <= 0 or not self._active_shards:
+            raise RuntimeError("step_active requires a prior init_active")
         if actions.shape != (n, 5):
-            raise ValueError(f"step_leading expected actions ({n}, 5), got {actions.shape}")
-        eps = self.envs_per_server
-        width = self._leading_shards * eps
-        if n < width:
-            full = np.zeros((width, 5), dtype=np.int32)
-            full[:n] = np.ascontiguousarray(actions, dtype=np.int32)
-        else:
-            full = np.ascontiguousarray(actions, dtype=np.int32)
-        chunks = [full[i * eps : (i + 1) * eps] for i in range(self._leading_shards)]
-        futures = [
-            self.pool.submit(client.step, chunk)
-            for client, chunk in zip(self.clients[: self._leading_shards], chunks)
-        ]
-        batches: list[StepBatch | None] = [None] * self._leading_shards
+            raise ValueError(
+                f"step_active expected actions ({n}, 5), got {actions.shape}"
+            )
+        acts = np.ascontiguousarray(actions, dtype=np.int32)
+        futures: dict[int, object] = {}
+        for i in self._active_shards:
+            chunk = acts[assignment[i]]
+            futures[i] = self.pool.submit(self.clients[i].step, chunk)
+        batches: dict[int, StepBatch] = {}
         errors: list[tuple[int, BaseException]] = []
-        for i, fut in enumerate(futures):
+        for i, fut in futures.items():
             try:
-                batches[i] = fut.result()
+                batches[i] = fut.result()  # type: ignore[union-attr]
             except (TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
                 errors.append((i, exc))
         if errors:
@@ -484,18 +622,27 @@ class ShardedVecEnv:
             for i in failed:
                 self._restart_shard(i)
             raise RolloutInterrupted(failed)
-        assert all(b is not None for b in batches)
-        ready: list[StepBatch] = batches  # type: ignore[assignment]
-        obs = _concat_obs([b.obs for b in ready])
-        rewards = np.concatenate([b.rewards for b in ready])
-        dones = np.concatenate([b.dones for b in ready])
-        infos = [info for b in ready for info in b.infos]
+        rewards = np.empty(n, dtype=np.float32)
+        dones = np.empty(n, dtype=bool)
+        infos: list[dict | None] = [None] * n
+        shard_obs: dict[int, dict[str, np.ndarray]] = {}
+        for i, batch in batches.items():
+            lanes = assignment[i]
+            shard_obs[i] = batch.obs
+            rewards[lanes] = batch.rewards
+            dones[lanes] = batch.dones
+            for local, g in enumerate(lanes):
+                infos[g] = batch.infos[local]
         return StepBatch(
-            obs={key: obs[key][:n] for key in obs},
-            rewards=rewards[:n],
-            dones=dones[:n],
-            infos=infos[:n],
+            obs=_scatter_obs(shard_obs, assignment, n),
+            rewards=rewards,
+            dones=dones,
+            infos=infos,  # type: ignore[arg-type]
         )
+
+    def step_leading(self, actions: np.ndarray) -> StepBatch:
+        """Alias for ``step_active``."""
+        return self.step_active(actions)
 
     def reset(self, index: int, seed: str | None = None) -> dict[str, np.ndarray]:
         shard = index // self.envs_per_server
