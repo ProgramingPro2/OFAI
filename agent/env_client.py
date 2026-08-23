@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import socket
 import struct
 import subprocess
@@ -31,21 +32,51 @@ from pathlib import Path
 import numpy as np
 
 from . import spaces
+from .backend import BACKEND_OFFICIAL, BACKEND_RUST, rust_sim_cmd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent / "OpenFrontIO"
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 
+# Match OpenFrontIO resolveWorkerCount. Auto targets the measured K=8 / 4
+# worker farm; resource checks may fall back to the sequential oracle.
+MAX_ENV_WORKERS = 32
+AUTO_ENV_WORKERS = 4
+LOW_MEM_GB = 1.5
+MIN_MEM_GB_HEADROOM = 2.0
+MIN_MEM_GB_PER_SLOT = 0.5
+OFAI_ENV_WORKERS = "OFAI_ENV_WORKERS"
+
 _DTYPES = {"f32": np.float32, "u8": np.uint8, "i32": np.int32}
+
+# Dead/truncated shards can raise JSONDecodeError on a zero-length header
+# instead of ConnectionError. Treat those as the same recoverable interrupt.
+_SHARD_IO_ERRORS = (
+    TimeoutError,
+    ConnectionError,
+    OSError,
+    RuntimeError,
+    json.JSONDecodeError,
+)
 
 
 class RolloutInterrupted(Exception):
     """Raised after a shard failure/restart. The partial rollout must be
     discarded and per-env episode trackers reset; healthy shards were NOT
     re-stepped (retry-all would double-step them).
+
+    ``failed_lanes`` are the episode / env indices that lived on the dead
+    shards. Eval keeps completed seeds and retries only these plus any
+    still-pending seeds.
     """
 
-    def __init__(self, failed_shards: list[int], message: str = ""):
+    def __init__(
+        self,
+        failed_shards: list[int],
+        message: str = "",
+        failed_lanes: list[int] | None = None,
+    ):
         self.failed_shards = list(failed_shards)
+        self.failed_lanes = list(failed_lanes or [])
         super().__init__(
             message
             or f"rollout interrupted after restarting shards {self.failed_shards}"
@@ -60,6 +91,198 @@ class StepBatch:
     rewards: np.ndarray  # [K] f32
     dones: np.ndarray  # [K] bool
     infos: list[dict]
+    profile: dict | None = None
+
+
+@dataclass(frozen=True)
+class WorkerResolution:
+    """Resolved actor-thread count passed to each EnvServer process."""
+
+    requested: int | str
+    workers: int
+    reason: str
+    fallback: bool
+    source: str
+    cpu_count: int | None = None
+    mem_available_gb: float | None = None
+
+    def log_line(self) -> str:
+        return (
+            f"[env] workers={self.workers} requested={self.requested} "
+            f"source={self.source} fallback={str(self.fallback).lower()} "
+            f"{self.reason}"
+        )
+
+
+def detect_cpu_count() -> int:
+    try:
+        n = len(os.sched_getaffinity(0))
+        if n > 0:
+            return n
+    except (AttributeError, OSError):
+        pass
+    return int(os.cpu_count() or 1)
+
+
+def detect_mem_available_gb() -> float | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def env_server_cmd(
+    port: int,
+    workers: int = 0,
+    backend: str = BACKEND_OFFICIAL,
+) -> list[str]:
+    """EnvServer argv. Official always passes --workers. Rust is the
+    schema-v2 mirror and is only spawned after fail-closed selection."""
+    if str(backend).strip().lower() == BACKEND_RUST:
+        return rust_sim_cmd(port)
+    return [
+        "npx",
+        "tsx",
+        "ofai/env/EnvServer.ts",
+        "--port",
+        str(int(port)),
+        "--workers",
+        str(max(0, int(workers))),
+    ]
+
+
+def _parse_env_workers(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        n = int(text)
+    except ValueError:
+        return None
+    if n < 0:
+        return None
+    return n
+
+
+def resolve_env_workers(
+    requested: int | str,
+    *,
+    envs_per_server: int,
+    num_servers: int,
+    cpu_count: int | None = None,
+    mem_available_gb: float | None = None,
+    env_var: str | None | object = ...,
+) -> WorkerResolution:
+    """Pick a per-server worker count that is safe for this farm.
+
+    ``auto`` uses OFAI_ENV_WORKERS when that env var is a valid integer,
+    otherwise targets the measured 4-worker farm (capped by K). Explicit
+    N is honored after hard caps (K, 32) and a critically-low-memory
+    sequential fallback. Auto also shrinks to the CPU/memory budget.
+    """
+    if envs_per_server < 1:
+        raise ValueError("envs_per_server must be positive")
+    if num_servers < 1:
+        raise ValueError("num_servers must be positive")
+    if cpu_count is None:
+        cpu_count = detect_cpu_count()
+    if mem_available_gb is None:
+        mem_available_gb = detect_mem_available_gb()
+    if env_var is ...:
+        env_var = os.environ.get(OFAI_ENV_WORKERS)
+
+    source = "cli"
+    notes: list[str] = []
+    if isinstance(requested, str) and requested.strip().lower() in ("auto", "safe"):
+        env_n = _parse_env_workers(env_var if isinstance(env_var, str) else None)
+        if env_n is not None:
+            target = env_n
+            source = "env"
+            notes.append(f"{OFAI_ENV_WORKERS}={env_n}")
+        else:
+            target = min(envs_per_server, AUTO_ENV_WORKERS) if envs_per_server > 1 else 1
+            source = "auto"
+            notes.append(f"auto-safe target={target}")
+    else:
+        try:
+            target = int(requested)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid workers {requested!r}") from exc
+        if target < 0:
+            raise ValueError("workers must be >= 0")
+        notes.append(f"explicit={target}")
+
+    workers = target
+    fallback = False
+    if workers <= 1:
+        workers = 1
+        notes.append("sequential oracle")
+    if workers > envs_per_server:
+        workers = envs_per_server
+        fallback = True
+        notes.append(f"capped at envs_per_server={envs_per_server}")
+    if workers > MAX_ENV_WORKERS:
+        workers = MAX_ENV_WORKERS
+        fallback = True
+        notes.append(f"capped at {MAX_ENV_WORKERS}")
+
+    if mem_available_gb is not None and mem_available_gb < LOW_MEM_GB:
+        if workers > 1:
+            fallback = True
+        workers = 1
+        notes.append(f"low memory {mem_available_gb:.2f}GiB -> sequential")
+    elif source == "auto" and mem_available_gb is not None:
+        while (
+            workers > 1
+            and num_servers * workers * MIN_MEM_GB_PER_SLOT + MIN_MEM_GB_HEADROOM
+            > mem_available_gb
+        ):
+            workers -= 1
+            fallback = True
+        if fallback and "memory budget" not in "".join(notes):
+            notes.append(f"memory budget {mem_available_gb:.1f}GiB")
+
+    if source == "auto" and cpu_count is not None and cpu_count > 0:
+        budget = max(1, int(cpu_count) - 1)
+        cap = max(1, budget // num_servers)
+        if workers > cap:
+            workers = cap
+            fallback = True
+            notes.append(f"cpu budget {cpu_count} -> {cap}/server")
+    elif (
+        source != "auto"
+        and cpu_count is not None
+        and workers > 1
+        and num_servers * workers > int(cpu_count) * 2
+    ):
+        notes.append(
+            f"warning: {num_servers}x{workers} oversubscribed vs cpu={cpu_count}"
+        )
+
+    if workers <= 1:
+        workers = 1
+
+    reason = (
+        f"servers={num_servers} envs={envs_per_server} "
+        f"cpu={cpu_count} mem="
+        f"{'?' if mem_available_gb is None else f'{mem_available_gb:.1f}GiB'}; "
+        + "; ".join(notes)
+    )
+    return WorkerResolution(
+        requested=requested,
+        workers=workers,
+        reason=reason,
+        fallback=fallback,
+        source=source,
+        cpu_count=cpu_count,
+        mem_available_gb=mem_available_gb,
+    )
 
 
 def _recv_exactly(sock: socket.socket, n: int) -> bytes:
@@ -89,7 +312,10 @@ def _read_frame(sock: socket.socket) -> tuple[dict, dict[str, np.ndarray]]:
     payload = bytearray(total_len)
     _recv_into(sock, payload, total_len)
     (header_len,) = struct.unpack_from("<I", payload, 0)
-    header = json.loads(bytes(payload[4 : 4 + header_len]))
+    try:
+        header = json.loads(bytes(payload[4 : 4 + header_len]))
+    except json.JSONDecodeError as exc:
+        raise ConnectionError(f"corrupt env frame header: {exc}") from exc
     blob_off = 4 + header_len
     tensors: dict[str, np.ndarray] = {}
     for name, spec in header.pop("tensors", {}).items():
@@ -177,12 +403,27 @@ class EnvServerProcess:
     times out.
     """
 
-    def __init__(self, port: int, cwd: Path = REPO_ROOT, timeout_s: float = 120.0):
+    def __init__(
+        self,
+        port: int,
+        cwd: Path | None = None,
+        timeout_s: float = 120.0,
+        workers: int = 0,
+        backend: str = BACKEND_OFFICIAL,
+    ):
         self.port = port
+        self.workers = max(0, int(workers))
+        self.backend_kind = str(backend).strip().lower() or BACKEND_OFFICIAL
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self.log_path = LOG_DIR / f"env-server-{port}.log"
         self._log = open(self.log_path, "ab", buffering=0)
-        cmd = ["npx", "tsx", "ofai/env/EnvServer.ts", "--port", str(port)]
+        cmd = env_server_cmd(port, self.workers, self.backend_kind)
+        if cwd is None:
+            cwd = (
+                Path(__file__).resolve().parent.parent
+                if self.backend_kind == BACKEND_RUST
+                else REPO_ROOT
+            )
         self.proc = subprocess.Popen(
             cmd,
             cwd=cwd,
@@ -204,11 +445,21 @@ class EnvServerProcess:
 
     def _drain_stdout(self) -> None:
         assert self.proc.stdout is not None
-        for raw in iter(self.proc.stdout.readline, b""):
-            self._log.write(raw)
-            if b"ENV_SERVER_READY" in raw:
-                self._ready.set()
-        self._ready.set()
+        try:
+            for raw in iter(self.proc.stdout.readline, b""):
+                try:
+                    if self._log.closed:
+                        break
+                    self._log.write(raw)
+                except ValueError:
+                    # stop() may close the log while this thread is draining
+                    break
+                if b"ENV_SERVER_READY" in raw:
+                    self._ready.set()
+        except ValueError:
+            pass
+        finally:
+            self._ready.set()
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -220,8 +471,16 @@ class EnvServerProcess:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        if self.proc.stdout is not None:
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass
+        if self._drain.is_alive():
+            self._drain.join(timeout=2)
         try:
-            self._log.close()
+            if not self._log.closed:
+                self._log.close()
         except Exception:
             pass
 
@@ -237,6 +496,8 @@ class VecEnv:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.k = 0
         self._configs: list[dict] = []
+        self.backend: str | None = None
+        self.workers: int | None = None
 
     def init(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
         self._configs = list(env_configs)
@@ -246,6 +507,13 @@ class VecEnv:
             raise RuntimeError(f"env server error: {header.get('error')}")
         assert header["type"] == "inited", header
         self.k = int(header["k"])
+        backend = header.get("backend")
+        self.backend = str(backend) if backend is not None else None
+        raw_workers = header.get("workers")
+        try:
+            self.workers = int(raw_workers) if raw_workers is not None else None
+        except (TypeError, ValueError):
+            self.workers = None
         return _obs_dict(tensors, self.k)
 
     def step(
@@ -273,6 +541,7 @@ class VecEnv:
             rewards=np.asarray(header["rewards"], dtype=np.float32),
             dones=np.asarray(header["dones"], dtype=bool),
             infos=header["infos"],
+            profile=header.get("profile") if isinstance(header.get("profile"), dict) else None,
         )
 
     def reset(self, index: int, seed: str | None = None) -> dict[str, np.ndarray]:
@@ -364,6 +633,20 @@ def _scatter_obs(
     return out
 
 
+def _merge_step_profiles(profiles: list[dict | None]) -> dict | None:
+    """Sum per-shard server timing counters from step headers."""
+    keys = ("simMs", "maskObsMs", "serializeMs", "resetMs", "resets")
+    merged = {key: 0.0 for key in keys}
+    any_profile = False
+    for profile in profiles:
+        if not profile:
+            continue
+        any_profile = True
+        for key in keys:
+            merged[key] += float(profile.get(key) or 0)
+    return merged if any_profile else None
+
+
 def _concat_obs(
     obses: list[dict[str, np.ndarray]],
     out: dict[str, np.ndarray] | None = None,
@@ -394,10 +677,12 @@ class ShardedVecEnv:
 
     Eval uses ``init_active`` / ``step_active`` to spread a subset of
     episodes across shards (round-robin) and skip idle lanes. Training
-    ``init()`` / ``step()`` always cover the full width.
+    ``init()`` / ``step()`` always cover the full width. ``step_active``
+    can also skip shards whose assigned lanes are already done.
 
-    On shard failure: restart the dead shard(s) and raise RolloutInterrupted.
-    Healthy shards are never re-stepped (retry-all would double-step them).
+    On shard failure: restart the dead shard(s) and raise RolloutInterrupted
+    with ``failed_lanes`` so eval retries only those seeds. Healthy shards
+    are never re-stepped (retry-all would double-step them).
     """
 
     def __init__(
@@ -406,14 +691,23 @@ class ShardedVecEnv:
         base_port: int,
         envs_per_server: int,
         connect: bool = False,
+        workers: int = 0,
+        backend: str = BACKEND_OFFICIAL,
     ):
         self.envs_per_server = envs_per_server
         self.k = num_servers * envs_per_server
         self.ports = [base_port + i for i in range(num_servers)]
         self.connect = connect
+        self.workers = max(0, int(workers))
+        self.sim_backend = str(backend).strip().lower() or BACKEND_OFFICIAL
+        self.backend: str | None = None
+        self.reported_workers: int | None = None
         self.servers: list[EnvServerProcess] = []
         if not connect:
-            self.servers = [EnvServerProcess(p) for p in self.ports]
+            self.servers = [
+                EnvServerProcess(p, workers=self.workers, backend=self.sim_backend)
+                for p in self.ports
+            ]
         self.clients = [VecEnv("127.0.0.1", p) for p in self.ports]
         self.pool = ThreadPoolExecutor(max_workers=num_servers)
         self._configs: list[dict] = []
@@ -425,6 +719,45 @@ class ShardedVecEnv:
         self._active_n = 0
         self._next_config_fn: Callable[[int], dict] | None = None
         self._on_episode_reset: Callable[[int, dict], None] | None = None
+
+    def backend_summary(self) -> str:
+        return (
+            f"backend={self.backend or 'unknown'} "
+            f"sim_backend={getattr(self, 'sim_backend', BACKEND_OFFICIAL)} "
+            f"workers={self.reported_workers}"
+        )
+
+    def _note_backends(self, shards: list[int] | None = None) -> None:
+        """Record optional init-header backend/workers from participating shards."""
+        if shards is None:
+            clients = list(self.clients)
+        else:
+            clients = [
+                self.clients[i] for i in shards if 0 <= i < len(self.clients)
+            ]
+        names = [getattr(c, "backend", None) for c in clients]
+        counts = [getattr(c, "workers", None) for c in clients]
+        known = [str(n) for n in names if n]
+        if not known:
+            self.backend = None
+        elif all(n == known[0] for n in known):
+            self.backend = known[0]
+        else:
+            self.backend = "mixed"
+        known_w = []
+        for w in counts:
+            if w is None:
+                continue
+            try:
+                known_w.append(int(w))
+            except (TypeError, ValueError):
+                continue
+        if known_w and all(w == known_w[0] for w in known_w):
+            self.reported_workers = known_w[0]
+        elif known_w:
+            self.reported_workers = max(known_w)
+        else:
+            self.reported_workers = None
 
     def set_episode_hooks(
         self,
@@ -447,11 +780,25 @@ class ShardedVecEnv:
         chunks = [
             self._configs[i * eps : (i + 1) * eps] for i in range(len(self.clients))
         ]
-        obses = list(self.pool.map(lambda t: t[0].init(t[1]), zip(self.clients, chunks)))
-        self._obs_buf = _concat_obs(obses, self._obs_buf)
+        futures = [
+            self.pool.submit(client.init, chunk)
+            for client, chunk in zip(self.clients, chunks)
+        ]
+        obses: list[dict[str, np.ndarray] | None] = [None] * len(self.clients)
+        errors: list[tuple[int, BaseException]] = []
+        for i, fut in enumerate(futures):
+            try:
+                obses[i] = fut.result()
+            except _SHARD_IO_ERRORS as exc:
+                errors.append((i, exc))
+        if errors:
+            self._restart_failed_shards(errors)
+        assert all(o is not None for o in obses)
+        self._obs_buf = _concat_obs(obses, self._obs_buf)  # type: ignore[arg-type]
         self._leading_shards = len(self.clients)
         self._leading_n = self.k
         self._clear_active()
+        self._note_backends()
         return self._obs_buf
 
     def _clear_active(self) -> None:
@@ -465,6 +812,23 @@ class ShardedVecEnv:
         self._active_n = n
         self._leading_shards = len(self._active_shards)
         self._leading_n = n
+
+    def _lanes_for_shards(self, shards: list[int]) -> list[int]:
+        """Episode / env indices owned by ``shards`` under the current layout."""
+        assignment = getattr(self, "_active_assignment", None) or []
+        active_n = int(getattr(self, "_active_n", 0) or 0)
+        if assignment and active_n > 0:
+            lanes: list[int] = []
+            for i in shards:
+                if 0 <= i < len(assignment):
+                    lanes.extend(assignment[i])
+            return lanes
+        eps = self.envs_per_server
+        lanes = []
+        for i in shards:
+            start = i * eps
+            lanes.extend(range(start, min(self.k, start + eps)))
+        return lanes
 
     def init_active(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
         """Init only the shards that receive these configs.
@@ -493,13 +857,42 @@ class ShardedVecEnv:
             cfgs = [env_configs[j] for j in assignment[shard_i]]
             return shard_i, self.clients[shard_i].init(cfgs)
 
-        pairs = list(self.pool.map(_init_one, self._active_shards))
+        futures = {i: self.pool.submit(_init_one, i) for i in self._active_shards}
+        pairs: list[tuple[int, dict[str, np.ndarray]]] = []
+        errors: list[tuple[int, BaseException]] = []
+        for i, fut in futures.items():
+            try:
+                pairs.append(fut.result())
+            except _SHARD_IO_ERRORS as exc:
+                errors.append((i, exc))
+        if errors:
+            self._restart_failed_shards(errors)
         shard_obs = {i: obs for i, obs in pairs}
+        self._note_backends(self._active_shards)
         return _scatter_obs(shard_obs, assignment, n)
 
     def init_leading(self, env_configs: list[dict]) -> dict[str, np.ndarray]:
         """Alias for ``init_active`` (distributed, not packed leading shards)."""
         return self.init_active(env_configs)
+
+    def _restart_failed_shards(
+        self, errors: list[tuple[int, BaseException]]
+    ) -> None:
+        """Restart dead shards and raise RolloutInterrupted.
+
+        Used by init/step so a truncated JSON frame is the same recovery
+        path as a closed socket. ``connect`` mode (tests / attach) re-raises
+        the first raw error instead.
+        """
+        if self.connect:
+            raise errors[0][1]
+        failed = [i for i, _ in errors]
+        for i, s in enumerate(self.servers):
+            if not s.alive() and i not in failed:
+                failed.append(i)
+        for i in failed:
+            self._restart_shard(i)
+        raise RolloutInterrupted(failed, failed_lanes=self._lanes_for_shards(failed))
 
     def _restart_shard(self, i: int) -> None:
         port = self.ports[i]
@@ -510,7 +903,11 @@ class ShardedVecEnv:
             pass
         if not self.connect:
             self.servers[i].stop()
-            self.servers[i] = EnvServerProcess(port)
+            self.servers[i] = EnvServerProcess(
+                port,
+                workers=int(getattr(self, "workers", 0) or 0),
+                backend=str(getattr(self, "sim_backend", BACKEND_OFFICIAL)),
+            )
         self.clients[i] = VecEnv("127.0.0.1", port)
         eps = self.envs_per_server
         # Current per-env configs (updated on each done), not the original init.
@@ -558,20 +955,10 @@ class ShardedVecEnv:
         for i, fut in enumerate(futures):
             try:
                 batches[i] = fut.result()
-            except (TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
+            except _SHARD_IO_ERRORS as exc:
                 errors.append((i, exc))
         if errors:
-            if self.connect:
-                raise errors[0][1]
-            failed = [i for i, _ in errors]
-            # Also restart any process that is already dead but whose future
-            # may have raised a different client.
-            for i, s in enumerate(self.servers):
-                if not s.alive() and i not in failed:
-                    failed.append(i)
-            for i in failed:
-                self._restart_shard(i)
-            raise RolloutInterrupted(failed)
+            self._restart_failed_shards(errors)
 
         assert all(b is not None for b in batches)
         ready: list[StepBatch] = batches  # type: ignore[assignment]
@@ -583,14 +970,19 @@ class ShardedVecEnv:
             rewards=np.concatenate([b.rewards for b in ready]),
             dones=dones,
             infos=[info for b in ready for info in b.infos],
+            profile=_merge_step_profiles([b.profile for b in ready]),
         )
 
-    def step_active(self, actions: np.ndarray) -> StepBatch:
-        """Step only shards that have active lanes from ``init_active``.
+    def step_active(
+        self, actions: np.ndarray, live: np.ndarray | None = None
+    ) -> StepBatch:
+        """Step only shards that have live lanes from ``init_active``.
 
         ``actions`` are in episode-index order (same as ``init_active``
-        configs). Idle shards are not submitted. Results are scattered
-        back into that order.
+        configs). Idle shards, and shards whose assigned lanes are all
+        done, are not submitted. Results are scattered back into that
+        order. Done lanes on a skipped shard are filled with a zero
+        reward, ``done=True``, and a dummy observation.
         """
         n = self._active_n
         assignment = self._active_assignment
@@ -600,30 +992,35 @@ class ShardedVecEnv:
             raise ValueError(
                 f"step_active expected actions ({n}, 5), got {actions.shape}"
             )
+        if live is None:
+            live_mask = np.ones(n, dtype=bool)
+        else:
+            live_mask = np.asarray(live, dtype=bool)
+            if live_mask.shape != (n,):
+                raise ValueError(
+                    f"step_active live mask expected ({n},), got {live_mask.shape}"
+                )
         acts = np.ascontiguousarray(actions, dtype=np.int32)
         futures: dict[int, object] = {}
+        skipped: list[int] = []
         for i in self._active_shards:
-            chunk = acts[assignment[i]]
+            lanes = assignment[i]
+            if not any(live_mask[j] for j in lanes):
+                skipped.append(i)
+                continue
+            chunk = acts[lanes]
             futures[i] = self.pool.submit(self.clients[i].step, chunk)
         batches: dict[int, StepBatch] = {}
         errors: list[tuple[int, BaseException]] = []
         for i, fut in futures.items():
             try:
                 batches[i] = fut.result()  # type: ignore[union-attr]
-            except (TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
+            except _SHARD_IO_ERRORS as exc:
                 errors.append((i, exc))
         if errors:
-            if self.connect:
-                raise errors[0][1]
-            failed = [i for i, _ in errors]
-            for i, s in enumerate(self.servers):
-                if not s.alive() and i not in failed:
-                    failed.append(i)
-            for i in failed:
-                self._restart_shard(i)
-            raise RolloutInterrupted(failed)
-        rewards = np.empty(n, dtype=np.float32)
-        dones = np.empty(n, dtype=bool)
+            self._restart_failed_shards(errors)
+        rewards = np.zeros(n, dtype=np.float32)
+        dones = np.zeros(n, dtype=bool)
         infos: list[dict | None] = [None] * n
         shard_obs: dict[int, dict[str, np.ndarray]] = {}
         for i, batch in batches.items():
@@ -633,11 +1030,33 @@ class ShardedVecEnv:
             dones[lanes] = batch.dones
             for local, g in enumerate(lanes):
                 infos[g] = batch.infos[local]
+        if skipped:
+            template = next(iter(batches.values())).obs if batches else None
+            for i in skipped:
+                lanes = assignment[i]
+                dones[lanes] = True
+                for g in lanes:
+                    infos[g] = {}
+                if template is not None:
+                    shard_obs[i] = {
+                        key: np.zeros(
+                            (len(lanes),) + template[key].shape[1:],
+                            dtype=template[key].dtype,
+                        )
+                        for key in template
+                    }
+        for g in range(n):
+            if infos[g] is None:
+                infos[g] = {}
+                dones[g] = True
+        if not shard_obs:
+            raise RuntimeError("step_active has no live shards to step")
         return StepBatch(
             obs=_scatter_obs(shard_obs, assignment, n),
             rewards=rewards,
             dones=dones,
             infos=infos,  # type: ignore[arg-type]
+            profile=_merge_step_profiles([b.profile for b in batches.values()]),
         )
 
     def step_leading(self, actions: np.ndarray) -> StepBatch:

@@ -103,6 +103,21 @@ HEAD_INDEX = {
     "unit": 4,
 }
 
+# Exploration weights for effectiveness-aware action-type entropy.
+# 0 excludes the type from the bonus (always-legal / low-value utilities).
+# Attack and spawn keep full weight so transfer still explores conquest.
+ACTION_ENTROPY_WEIGHTS = (
+    0.0,  # noop — always legal after spawn
+    1.0,  # spawn
+    1.0,  # attack
+    0.5,  # retreat_all
+    0.0,  # build — often always-legal once gold exists
+    0.0,  # boat — legal_frac≈1.0 on peninsula after spawn
+    0.0,  # ally
+    0.0,  # break_ally
+    0.0,  # embargo
+)
+
 
 def active_conditional_heads(action_type: int) -> frozenset[str]:
     return _ACTIVE_COND.get(int(action_type), frozenset())

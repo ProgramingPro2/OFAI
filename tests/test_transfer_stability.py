@@ -237,7 +237,9 @@ def test_pre_update_baseline_does_not_advance_counters_or_stage():
     assert not cur.last_eval_passed
     assert cur.idx == _peninsula_idx()
     assert not cur.maybe_advance()
-    assert unlock["reason"] in ("hold", "unlock_holdout", "relock_holdout")
+    assert unlock["reason"] == "pre_update_baseline"
+    assert unlock["action"] == "hold"
+    assert not cur.maps_unlocked
 
 
 def test_baseline_does_not_write_global_best_from_other_distribution():
@@ -280,12 +282,17 @@ def test_unlock_relock_resume_thresholds():
     cur.apply_unlock(_holdout_ev(5 / 32))
     assert not cur.maps_unlocked
 
-    mid = cur.judge_unlock(_holdout_ev(14 / 32))
+    mid = cur.judge_unlock(_holdout_ev(16 / 32))
     assert not mid["unlock"]
-    # 14/32 = 0.4375 is above relock 0.35, so a locked run stays locked.
+    # 16/32 is the old unlock bar; v4 requires 26/32 mastery.
     assert not mid["relock"]
 
-    ok = cur.apply_unlock(_holdout_ev(16 / 32))
+    still = cur.apply_unlock(_holdout_ev(21 / 32))
+    assert not still["unlock"]
+    assert still["action"] == "hold"
+    assert not cur.maps_unlocked
+
+    ok = cur.apply_unlock(_holdout_ev(26 / 32))
     assert ok["unlock"]
     assert ok["action"] == "unlock"
     assert cur.maps_unlocked
@@ -318,17 +325,21 @@ def test_unlock_relock_resume_thresholds():
     assert {legacy.make_env_config(f"l-{i}")["map"] for i in range(16)} == {"Halkidiki"}
 
 
-def test_unlock_is_not_mastery_lottery():
+def test_unlock_requires_mastery_bar():
     cur = Curriculum(start=_peninsula_idx())
-    # 16/32 unlocks maps but does not pass 26/32 mastery.
-    ev = _holdout_ev(16 / 32)
-    assert cur.judge_unlock(ev)["unlock"]
-    assert not cur.judge_eval(ev)["passed"]
+    # 16/32 and 21/32 (the v3 zero-shot) must not unlock extra maps.
+    ev16 = _holdout_ev(16 / 32)
+    ev21 = _holdout_ev(21 / 32)
+    assert not cur.judge_unlock(ev16)["unlock"]
+    assert not cur.judge_unlock(ev21)["unlock"]
+    assert not cur.judge_eval(ev16)["passed"]
+    assert not cur.judge_eval(ev21)["passed"]
     mastery = cur.judge_eval(_holdout_ev(26 / 32))
     assert mastery["passed"]
-    assert wilson_lower_bound(16, 32) >= cur.stage.unlock_wilson_floor
-    assert wilson_lower_bound(15, 32) < cur.stage.unlock_win_threshold or (
-        15 / 32 < cur.stage.unlock_win_threshold
+    assert cur.judge_unlock(_holdout_ev(26 / 32))["unlock"]
+    assert wilson_lower_bound(26, 32) >= cur.stage.unlock_wilson_floor
+    assert wilson_lower_bound(25, 32) < cur.stage.unlock_win_threshold or (
+        25 / 32 < cur.stage.unlock_win_threshold
     )
 
 
@@ -526,15 +537,15 @@ def test_baseline_eval_frozen_seeds_match_holdout_helper():
     assert all(m == "Halkidiki" for m in ev["sampled"]["maps"])
 
 
-def test_unlock_16_32_and_hysteresis_cannot_oscillate():
-    lb16, ub16 = wilson_interval(16, 32)
-    lb15, ub15 = wilson_interval(15, 32)
-    assert 16 / 32 >= 0.50
-    assert lb16 >= 0.30
-    assert 15 / 32 < 0.50 or lb15 < 0.30
+def test_unlock_26_32_and_hysteresis_cannot_oscillate():
+    lb26, _ub26 = wilson_interval(26, 32)
+    lb21, _ub21 = wilson_interval(21, 32)
+    assert 26 / 32 >= 0.80
+    assert lb26 >= 0.50
+    assert 21 / 32 < 0.80 or lb21 < 0.50
     cur = Curriculum(start=_peninsula_idx())
     states = []
-    for wr_n in (16, 12, 11, 16, 12, 11, 16):
+    for wr_n in (26, 12, 11, 26, 12, 11, 26):
         cur.apply_unlock(_holdout_ev(wr_n / 32))
         states.append(cur.maps_unlocked)
         assert not cur.maybe_advance()
@@ -553,7 +564,7 @@ def test_reinit_and_in_flight_next_cfg_obey_lock():
         stream.next_env_seed(0), completed_episodes=cur.stage_episodes + 1
     )
     assert nxt["map"] == "Halkidiki"
-    cur.apply_unlock(_holdout_ev(16 / 32))
+    cur.apply_unlock(_holdout_ev(26 / 32))
     unlocked = {cur.make_env_config(mix_seed("reinit", i))["map"] for i in range(64)}
     assert "Halkidiki" in unlocked
     assert "Balkans" in unlocked

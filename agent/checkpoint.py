@@ -272,8 +272,23 @@ def metrics_look_collapsed(ckpt: dict) -> str | None:
     return None
 
 
+def halted_resume_reason(ckpt: dict) -> str | None:
+    """Ordinary resume must not continue a regression-halted run."""
+    halt = str(ckpt.get("halt_reason") or "").strip()
+    if halt:
+        return f"halt_reason={halt}"
+    if ckpt.get("save_reason") == "stage_regression":
+        return "save_reason=stage_regression"
+    if ckpt.get("regression"):
+        return "stage_regression metadata"
+    return None
+
+
 def collapse_resume_reason(ckpt: dict) -> str | None:
     """Hard refuse reason from eval metadata, or None if usable."""
+    halted = halted_resume_reason(ckpt)
+    if halted:
+        return halted
     ev = checkpoint_eval_payload(ckpt)
     if ev is None:
         return None
@@ -288,6 +303,24 @@ def collapse_resume_reason(ckpt: dict) -> str | None:
             f"(sampled win_rate={wr}, peak={peak})"
         )
     return None
+
+
+def floor_global_best_at_entry(
+    global_best: tuple,
+    entry_ev: dict | None,
+) -> tuple[float, float, float, float]:
+    """Force-stage write bar starts at the stage-entry holdout score.
+
+    A later 12/32 eval cannot become `best.pt` when entry was 21/32.
+    Does not write best.pt itself.
+    """
+    if not entry_ev:
+        return normalize_best_score(global_best)
+    entry_score = _eval_score(entry_ev)
+    current = normalize_best_score(global_best)
+    if is_sentinel_score(current) or tuple(entry_score) > tuple(current):
+        return entry_score
+    return current
 
 
 def zero_win_resume_warning(ckpt: dict) -> str | None:
@@ -518,6 +551,19 @@ def plan_resume(
         stage_baseline: dict = {}
         last_eval: dict = {}
         forced_name = curriculum.stage.name
+        reused = reusable_stage_baseline(ckpt, stage=forced_name)
+        if reused is not None:
+            pending_stage_baseline = False
+            need_baseline_eval = False
+            stage_baseline = reused
+            last_eval = dict(
+                reused.get("eval") or checkpoint_eval_payload(ckpt) or {}
+            )
+            warnings.append(
+                "[train] --force-stage: reusing frozen stage_baseline "
+                f"from checkpoint (stage={forced_name} it={int(reused.get('iterations') or 0)} "
+                f"n={int(reused.get('episodes') or 0)}); skipping pre-update holdout"
+            )
         if keep_optimizer:
             warnings.append(
                 "[train] --keep-optimizer: inheriting Adam moments/step from "
@@ -528,11 +574,12 @@ def plan_resume(
                 "[train] --force-stage: fresh Adam (no inherited moments/step); "
                 f"using CLI lr={cli_lr}"
             )
-        warnings.append(
-            "[train] --force-stage: pre-update frozen sampled holdout will "
-            "run before the first PPO collect/update; it does not advance "
-            "the stage or write best.pt"
-        )
+        if reused is None:
+            warnings.append(
+                "[train] --force-stage: pre-update frozen sampled holdout will "
+                "run before the first PPO collect/update; it does not advance "
+                "the stage or write best.pt"
+            )
         warnings.append(
             "[train] --force-stage: extra train maps stay locked on the "
             "canonical map until a sampled holdout clears the unlock bar"
@@ -634,7 +681,7 @@ def format_resume_plan(
         f"keep_optimizer={plan.keep_optimizer} "
         f"need_baseline_eval={plan.need_baseline_eval}",
         f"[dry-run] maps_unlocked={plan.curriculum.maps_unlocked} "
-        f"(canonical until sampled holdout unlock; not episode-count)",
+        f"(canonical until 26/32 mastery unlock; baseline never unlocks)",
         (
             "[dry-run] pre_update_baseline=frozen sampled holdout before "
             "first collect/update; no stage advance; no global-best write"
@@ -705,6 +752,38 @@ def holdout_reference_from_baseline(baseline: dict | None) -> dict:
         "iterations": int(raw.get("iterations") or 0),
         "env_steps": int(raw.get("env_steps") or 0),
     }
+
+
+def reusable_stage_baseline(
+    ckpt: dict,
+    *,
+    stage: str,
+    min_episodes: int = 32,
+) -> dict | None:
+    """Frozen holdout that already describes this checkpoint's policy.
+
+    ``--force-stage`` normally re-measures the loaded weights. A stage-entry
+    snapshot (same stage, same iteration, complete frozen seeds, not
+    pending) is reusable so an independent validation does not replay the
+    multi-hour pre-update holdout. A later ``latest.pt`` (it != baseline it)
+    does not qualify and must not inherit a stale entry bar as a skip.
+    """
+    if ckpt.get("pending_stage_baseline"):
+        return None
+    stored = dict(ckpt.get("stage_baseline") or {})
+    stats_it = int((ckpt.get("stats") or {}).get("iterations") or -1)
+    base_it = int(stored.get("iterations") or -2)
+    seeds = list(stored.get("seeds") or [])
+    n = int(stored.get("episodes") or 0)
+    if (
+        str(stored.get("stage") or "") != str(stage)
+        or n < int(min_episodes)
+        or len(seeds) < int(min_episodes)
+        or base_it != stats_it
+        or str(stored.get("kind") or "") != "pre_update_holdout"
+    ):
+        return None
+    return stored
 
 
 def build_stage_baseline(

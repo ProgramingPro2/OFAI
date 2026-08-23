@@ -79,12 +79,21 @@ class PPOConfig:
     # max 0.69-1.39); a 1.5 nat target races ent_coef to the ceiling.
     # Conditional region entropy is logged only — no bonus.
     ent_target: float = 0.6
+    # "uniform" = current legal-set entropy (fresh-run default).
+    # "effective" = renormalized onto explore-worthy types so always-legal
+    # boat/build/diplomacy/NOOP are not rewarded for being diverse.
+    ent_weighting: str = "uniform"
     ent_coef_min: float = 0.01
     ent_coef_max: float = 0.5
     ent_kp: float = 0.05
     lr: float = 3e-4
     max_grad_norm: float = 0.5
     device: str = "cuda"
+    # Frozen stage-entry reference. coef=0 disables the loss (fresh runs).
+    # Loss is coef * relu(KL(π || π_ref) - target). hard triggers rollback.
+    ref_kl_coef: float = 0.0
+    ref_kl_target: float = 0.02
+    ref_kl_hard: float = 0.50
 
 
 class RolloutBuffer:
@@ -462,6 +471,9 @@ class PPOTrainer:
         self._k = 0
         self._legal_counts = np.zeros(spaces.NUM_ACTION_TYPES, np.int64)
         self._legal_n = 0
+        self.reference: Policy | None = None
+        self.reference_source: str = ""
+        self.elite = None
 
     def _ensure_trackers(self, k: int) -> None:
         if self._k != k or len(self._trackers) != k:
@@ -471,6 +483,60 @@ class PPOTrainer:
     def reset_episode_trackers(self) -> None:
         """Call after env reinit or RolloutInterrupted."""
         self._trackers = [_empty_tracker() for _ in range(self._k)] if self._k else []
+        elite = getattr(self, "elite", None)
+        if elite is not None:
+            elite.discard_open()
+
+    def set_reference(
+        self,
+        state_dict: dict | None = None,
+        *,
+        source: str = "",
+    ) -> None:
+        """Freeze a copy of policy (or `state_dict`) as the stage-entry ref.
+
+        The reference is not an optimizer parameter. Ordinary fresh training
+        leaves this unset / coef=0.
+        """
+        ref = Policy()
+        ref.load_state_dict(state_dict or self.policy.state_dict())
+        ref.to(self.cfg.device)
+        ref.eval()
+        for p in ref.parameters():
+            p.requires_grad_(False)
+        self.reference = ref
+        self.reference_source = source
+
+    def clear_reference(self) -> None:
+        self.reference = None
+        self.reference_source = ""
+
+    def reference_enabled(self) -> bool:
+        return self.reference is not None and float(self.cfg.ref_kl_coef) > 0.0
+
+    def reference_payload(self) -> dict | None:
+        """Explicit resume metadata. Never mixed into model/optimizer."""
+        if self.reference is None:
+            return None
+        return {
+            "enabled": True,
+            "source": self.reference_source,
+            "coef": float(self.cfg.ref_kl_coef),
+            "target": float(self.cfg.ref_kl_target),
+            "hard": float(self.cfg.ref_kl_hard),
+            "model": {k: v.detach().cpu() for k, v in self.reference.state_dict().items()},
+        }
+
+    def load_reference_payload(self, payload: dict | None) -> None:
+        if not payload or not payload.get("model"):
+            return
+        self.set_reference(payload["model"], source=str(payload.get("source") or ""))
+        if "coef" in payload:
+            self.cfg.ref_kl_coef = float(payload["coef"])
+        if "target" in payload:
+            self.cfg.ref_kl_target = float(payload["target"])
+        if "hard" in payload:
+            self.cfg.ref_kl_hard = float(payload["hard"])
 
     def take_legal_frac(self) -> dict[str, float]:
         """Per-iteration fraction of decisions where each action type was legal."""
@@ -493,6 +559,14 @@ class PPOTrainer:
         device = torch.device(cfg.device)
         self._ensure_trackers(env.k)
         completed: list[EpisodeRecord] = []
+        elite = getattr(self, "elite", None)
+        record_elite = (
+            elite is not None
+            and bool(getattr(elite, "enabled", False))
+            and elite.accepts_backend(getattr(env, "backend", None))
+        )
+        if record_elite:
+            elite.configure(env.k)
 
         for step in range(cfg.rollout_len):
             # Store f16 spatial (same quantization evaluate() sees). Pass the
@@ -512,6 +586,9 @@ class PPOTrainer:
                     obs_t = obs_to_tensors(obs_q, device)
                 actions_t, logp_t, value_t = self.policy.act(obs_t, deterministic=False)
             actions = actions_t.cpu().numpy().astype(np.int32)
+            if record_elite:
+                for i in range(env.k):
+                    elite.on_step(i, obs, actions[i])
             batch = env.step(actions)
             buf.actions[step] = actions
             buf.logprobs[step] = logp_t.cpu().numpy()
@@ -571,6 +648,8 @@ class PPOTrainer:
                     self.stats.record_episode(ep)
                     completed.append(ep)
                     self._trackers[i] = _empty_tracker()
+                    if record_elite:
+                        elite.on_done(i, info)
             obs = batch.obs
 
         self.stats.env_steps += cfg.rollout_len * env.k
@@ -616,11 +695,14 @@ class PPOTrainer:
         running_kl_sum = 0.0
         running_kl_count = 0
         pg_loss = ent = v_loss = None
-        action_ent = cond_ent = action_ent_norm = action_ent_max = measured_norm = None
+        action_ent = cond_ent = action_ent_max = measured_norm = None
+        ref_kl_mean = None
+        ref_kl_parts: dict[str, float] = {}
         n_updates = 0
         stop = False
         early_stopped = False
         hard_reverted = False
+        ref_kl_reverted = False
         total_minibatches = cfg.update_epochs * max(1, cfg.num_minibatches)
 
         pre_model = {k2: v2.detach().clone() for k2, v2 in self.policy.state_dict().items()}
@@ -698,18 +780,46 @@ class PPOTrainer:
                 ent = entropy.mean()
                 action_ent = extras["action_entropy"].mean()
                 cond_ent = extras["cond_entropy"].mean()
-                multi = extras["action_entropy_multi"]
+                use_eff = cfg.ent_weighting == "effective"
+                if use_eff and "action_entropy_eff_norm" in extras:
+                    multi = extras["action_entropy_eff_multi"]
+                    norm_key, max_key = "action_entropy_eff_norm", "action_entropy_eff_max"
+                else:
+                    multi = extras["action_entropy_multi"]
+                    norm_key, max_key = "action_entropy_norm", "action_entropy_max"
                 if bool(multi.any()):
-                    measured_norm = extras["action_entropy_norm"][multi].mean()
-                    action_ent_max = extras["action_entropy_max"][multi].mean()
+                    measured_norm = extras[norm_key][multi].mean()
+                    action_ent_max = extras[max_key][multi].mean()
                 else:
                     # No multi-choice samples: fully satisfied, do not demand
                     # more exploration.
-                    measured_norm = extras["action_entropy_norm"].new_tensor(1.0)
-                    action_ent_max = extras["action_entropy_max"].new_tensor(0.0)
+                    measured_norm = extras[norm_key].new_tensor(1.0)
+                    action_ent_max = extras[max_key].new_tensor(0.0)
                 # Bonus the multi-sample normalized action-type head only.
                 # Raw nats and 1024-way region entropy must not drive this.
                 loss = pg_loss - self.ent_coef * measured_norm + cfg.vf_coef * v_loss
+                if self.reference is not None and float(cfg.ref_kl_coef) > 0.0:
+                    ref_kl_b, ref_ex = self.policy.joint_policy_kl(
+                        mb_obs, self.reference
+                    )
+                    ref_kl_mean = ref_kl_b.mean()
+                    excess = (ref_kl_mean - float(cfg.ref_kl_target)).clamp(min=0.0)
+                    loss = loss + float(cfg.ref_kl_coef) * excess
+                    with torch.no_grad():
+                        ref_kl_parts = {
+                            k: float(v.mean().item())
+                            for k, v in ref_ex.items()
+                            if k.startswith("ref_kl")
+                        }
+                    if float(ref_kl_mean.detach().item()) > float(cfg.ref_kl_hard):
+                        self.policy.load_state_dict(pre_model)
+                        self.opt.load_state_dict(pre_opt)
+                        self.ent_coef = pre_ent_coef
+                        hard_reverted = True
+                        ref_kl_reverted = True
+                        n_updates = 0
+                        stop = True
+                        break
 
                 self.opt.zero_grad()
                 loss.backward()
@@ -758,6 +868,11 @@ class PPOTrainer:
             "explained_var": round(explained_var, 4),
             "mean_value": float(b_values.mean()),
             "mean_return_target": float(b_returns.mean()),
+            "ref_kl": float(ref_kl_mean.item()) if ref_kl_mean is not None else 0.0,
+            "ref_kl_reverted": bool(ref_kl_reverted),
+            "ref_kl_coef": float(cfg.ref_kl_coef),
+            "ent_weighting": cfg.ent_weighting,
+            **{k: round(v, 6) for k, v in ref_kl_parts.items() if k != "ref_kl"},
         }
 
     def reset_optimizer(self, lr: float | None = None) -> None:
@@ -790,6 +905,10 @@ class PPOTrainer:
                 "clip_coef": self.cfg.clip_coef,
                 "target_kl": self.cfg.target_kl,
                 "ent_target": self.cfg.ent_target,
+                "ent_weighting": self.cfg.ent_weighting,
+                "ref_kl_coef": self.cfg.ref_kl_coef,
+                "ref_kl_target": self.cfg.ref_kl_target,
+                "ref_kl_hard": self.cfg.ref_kl_hard,
                 "vf_coef": self.cfg.vf_coef,
                 "update_epochs": self.cfg.update_epochs,
                 "num_minibatches": self.cfg.num_minibatches,
@@ -799,6 +918,9 @@ class PPOTrainer:
         }
         if extra:
             payload.update(extra)
+        ref_payload = self.reference_payload()
+        if ref_payload is not None and "reference" not in payload:
+            payload["reference"] = ref_payload
         atomic_torch_save(payload, path)
 
     def load(self, path: str, *, restore_optimizer: bool = True) -> dict:
@@ -832,4 +954,7 @@ class PPOTrainer:
                         setattr(self.stats, k_, v)
         if "ent_coef" in ckpt:
             self.ent_coef = float(ckpt["ent_coef"])
+        raw_ref = ckpt.get("reference")
+        if isinstance(raw_ref, dict) and raw_ref.get("model"):
+            self.load_reference_payload(raw_ref)
         return ckpt

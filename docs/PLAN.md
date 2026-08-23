@@ -11,15 +11,22 @@ private matches.
 
 ```
 +--------------------+        binary TCP frames        +----------------------+
-|  Node/tsx process  |  <----------------------------> |  Python trainer      |
-|  ofai/env/         |   obs tensors / action vectors  |  agent/              |
-|  AgentEnv x K      |                                 |  Policy (CNN+MLP)    |
-|  (deterministic    |                                 |  PPO + GAE           |
-|   src/core sim)    |                                 |  Curriculum          |
+|  Official TS core  |  <----------------------------> |  Python trainer      |
+|  ofai/env/         |   schema-v2 obs / actions       |  agent/              |
+|  sequential|parallel|                                |  Policy (CNN+MLP)    |
+|  (src/core oracle) |                                 |  PPO + GAE           |
++--------------------+                                 |  Curriculum          |
+|  Rust mirror sim/  |  fail-closed fallback=official  |                      |
+|  (supported caps   |  never mid-episode switch       |                      |
+|   only; boats no)  |                                 |                      |
 +--------------------+                                 +----------------------+
 ```
 
-- The game core (`src/core`) runs natively in Node; no browser, no network.
+- The official game core (`src/core`) runs natively in Node; no browser, no
+  public multiplayer. Parallel actors own complete games; sequential is
+  the oracle. The Rust package speaks the same init/step/reset contract
+  but is not enabled for any stage that requires an unsupported
+  capability (boats / nukes / rails / doomsday).
 - The agent is a Human player in a Singleplayer FFA game; opponents are
   Nations (difficulty-scaled AI) and Tribes (filler bots) that live inside
   the sim.
@@ -54,7 +61,7 @@ private matches.
 | spatial | [K,10,64,64] f32 | land/mountain/mine/enemy/ally/border/fallout/defense/structures |
 | players | [K,16,14] f32 | slot 0 = agent |
 | global | [K,10] f32 | tick progress, spawn, tiles/troops/gold, … |
-| action_mask | [K,9] u8 | |
+| action_mask | [K,9] u8 | effective: type can emit a state-changing intent now |
 | **target_masks** | [K,9,16] u8 | per action type (replaces flat `target_mask`) |
 | **quantity_mask** | [K,5] u8 | |
 | unit_mask | [K,10] u8 | |
@@ -83,8 +90,15 @@ terminal `-1.0`, one-time spawn `+0.1`. Shaping is a bounded potential
 milestone return cannot exceed a core win.
 
 `EnvConfig.allowedActions` gates which action types the env marks legal.
-During the spawn window the only legal action is SPAWN (NOOP is illegal
-until the agent has land); a never-spawn at `maxTicks` is `no_spawn`.
+Action masks are **effective**: BOAT requires a `canBuildTransportShip`
+destination plus troops; BUILD requires at least one unit `canBuild` can
+place; ALLY/BREAK_ALLY/EMBARGO require an effective target; ATTACK
+requires wilderness or a bordering attackable player plus troops. Factor
+masks use the same ActionTranslator samplers as intent emission, so a
+legal non-NOOP sample cannot silently no-op. Head order is unchanged
+(schema v2 / `it800.pt` loadable). During the spawn window the only
+legal action is SPAWN (NOOP is illegal until the agent has land); a
+never-spawn at `maxTicks` is `no_spawn`.
 
 ### Metrics (`agent/ppo.py`)
 
@@ -115,13 +129,29 @@ until the agent has land); a never-spawn at `maxTicks` is `no_spawn`.
 - Default `target_kl=0.03` (was 0.3 under 5-head summed accounting).
 - Logs raw `action_entropy`, `action_entropy_max` (`log(n_legal)`),
   `action_entropy_norm` (`H / log(n_legal)` over samples with >1 legal
-  actions), `cond_entropy`, and `ent_coef`.
-- `ent_target` is mask-normalized in `[0, 1]` (default 0.6). Samples with
-  `<=1` legal action are excluded (treated as fully satisfied). A raw-nats
-  target such as 1.5 is unattainable on land stages (2–4 legal ⇒ max
-  0.69–1.39) and races `ent_coef` toward uniform/NOOP.
+  actions), `action_entropy_eff` / `action_entropy_eff_norm` (explore-worthy
+  types only), `cond_entropy`, `ent_coef`, and `ref_kl` (plus per-head
+  `ref_kl_*` when a stage-entry reference is set).
+- `ent_target` is mask-normalized in `[0, 1]` (fresh default 0.6). Samples
+  with `<=1` counted action are excluded (treated as fully satisfied). A
+  raw-nats target such as 1.5 is unattainable on land stages (2–4 legal ⇒
+  max 0.69–1.39) and races `ent_coef` toward uniform/NOOP.
 - Entropy bonus and controller use normalized action-type entropy only.
-  Conditional / 1024-way region entropy is logged, not bonused.
+  Fresh runs keep `ent_weighting=uniform` (all legal types). Transfer /
+  `--v4-ablation` uses `effective`: NOOP / boat / build / diplomacy are
+  dropped from the bonus so always-legal utilities are not rewarded for
+  being diverse. Attack/spawn remain the exploration set; the normalized
+  value stays in `[0, 1]`. Conditional / 1024-way region entropy is
+  logged, not bonused.
+- **Stage-entry reference retention.** `--force-stage` freezes a copy of
+  the loaded policy (e.g. `it800.pt`) that is not an optimizer parameter.
+  The loss is `coef * relu(KL(π || π_ref) - target)` using the exact
+  mask-aware factorized KL
+  `KL(π_a||ρ_a) + Σ_t π_a(t) Σ_{h ∈ H(t)} KL(π_h|t || ρ_h|t)`,
+  not `mean(logp - ref_logp)`. Inactive heads contribute 0. Exceeding
+  `ref_kl_hard` rolls the update back. Fresh training leaves `ref_kl_coef=0`.
+  Checkpoints store `reference` metadata/weights for resume only; schema
+  stays 2.
 - Shard failure: restart dead shards, raise `RolloutInterrupted`, discard
   partial rollout, reset trackers — **never** retry-all (no double-step).
 
@@ -187,16 +217,15 @@ it must not create a positive non-win return.
 **Map sets.** Early stages stay on one canonical map. Extra train maps
 (FourIslands/Hawaii/Caribbean/FaroeIslands, then Halkidiki/Balkans,
 then World/Europe/NorthAmerica) unlock only after a **sampled frozen
-holdout** clears a stage-local unlock bar: `win_rate >= 0.50` and
-Wilson lower bound `>= 0.30` (16/32). That is below 26/32 mastery so
-maps can enter before stage advance, but it is not an episode-count
-lottery. Peninsula Balkans therefore cannot enter at 55/75 episodes
-with a 19% train window. Relock uses hysteresis (`win_rate < 0.35`,
-about 11/32) so 0.35–0.50 noise does not flip-flop. `map_burn_in`
-remains in suite metadata only. Selection among unlocked maps is
-deterministic from the episode seed. Holdout stays on the canonical
-map. Arcade, tournament, The Box, and Giant World are never used.
-Tensor/action schema does not change.
+holdout** clears the **mastery** bar: `win_rate >= 0.80` and Wilson
+lower bound `>= 0.50` (26/32). The pre-update `--force-stage` baseline
+never unlocks maps (a 21/32 peninsula zero-shot previously cleared the
+old 16/32 bar). Relock uses hysteresis (`win_rate < 0.35`, about 11/32)
+so 0.35–0.80 noise does not flip-flop. `map_burn_in` remains in suite
+metadata only. Selection among unlocked maps is deterministic from the
+episode seed. Holdout stays on the canonical map. Arcade, tournament,
+The Box, and Giant World are never used. Tensor/action schema does not
+change.
 
 **Force-stage transfer.** `--force-stage` with a new `--run-name` is
 isolated from the source directory. It resets stage-local curriculum,
@@ -204,9 +233,13 @@ windows, and seed stream; keeps global-best metadata for same-run
 only; **does not inherit Adam moments**. Before the first PPO
 collect/update it runs a frozen sampled holdout, writes
 `stage-entry.pt` plus `stage_baseline`, and must not increment
-`iterations`/`env_steps`, advance the stage, or write `best.pt`.
-A stage-local holdout regression guard compares later evals to that
-baseline (or a better stage-best). On a confirmed collapse (the
+`iterations`/`env_steps`, advance the stage, write `best.pt`, or
+unlock extra maps. The run-global `best.pt` write bar is floored at
+the stage-entry holdout score so 12/32 cannot become `best.pt` after
+a 21/32 entry. A stage-local holdout regression guard compares later
+evals to that baseline (or a better stage-best). Ordinary resume of a
+halted run (`halt_reason` / `stage_regression`) is refused unless
+`--force-stage` or `--allow-collapsed-resume`. On a confirmed collapse (the
 observed ~0.69 → 0.156 / 0-win pattern: current `<= 50%` of baseline,
 absolute drop `>= 0.30`, and Wilson intervals disjoint, or zero-win
 against a competent bar) the run restores `stage-entry.pt` /
@@ -225,6 +258,20 @@ farm (128 envs, batch 16384) with `--lr 1e-4`, `--eval-every 5`,
 `--additional-steps`, and a free `--port`; global defaults for
 fresh training stay `3e-4` and `eval-every 0`. A 4×8 farm would
 cut the minibatch 4× and change PPO noise/KL.
+
+**v4 ablation.** `--v4-ablation` is a bounded transfer experiment: maps
+locked, pre-update baseline first, stage-entry reference retention on,
+eval every 5, 15-update cap if `--max-updates` is unset (the cap still
+runs the due/final holdout and writes the last jsonl row; it does not
+break before eval), `--additional-steps`
+sized for that cap (so `it800` is not blocked by the 10M ceiling),
+effective entropy, recommended `--ent-target 0.3`. Compare `stage_baseline`
+holdout vs later evals (`win_rate`, action_hist / attack share,
+`legal_frac`, `ref_kl`). Success: holdout does not fall below entry
+and the policy does not become boat/build/diplomacy/NOOP. Failure: the
+v3 monotonic 21/32 → 12 → 11 → 7 drop while per-update KL stays
+0.003–0.006. Do not start with 10M steps. Schema v2 / `it800.pt`
+weights stay loadable. No LSTM / self-play / slot-schema break.
 
 **Holdout gate.** `--eval-every` plays the true objective on a **frozen
 per-stage holdout** (canonical map; blake2 mix of
@@ -312,20 +359,85 @@ checkpoints/, logs/     training artifacts
 ## How to run
 
 ```bash
-.venv/bin/python -m agent.train --servers 4 --envs 8 --rollout-len 128 \
-    --run-name run1 --eval-every 25
+.venv/bin/python -m agent.train --servers 8 --envs 8 --workers 2 \
+    --backend official --rollout-len 128 --run-name run1 \
+    --eval-every 25 --total-steps 12000000
 
 .venv/bin/python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 50 \
     --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
 .venv/bin/python -m agent.eval --scripted expander --episodes 20 \
     --map Halkidiki --map-size Compact --bots 1 --max-ticks 8000
 
-.venv/bin/python -m pytest tests/test_rl_pipeline.py -q
+.venv/bin/python -m pytest tests/test_rl_pipeline.py tests/test_baseline_gates.py \
+    tests/test_backend_select.py tests/test_eval_scheduler.py -q
 .venv/bin/python tests/test_env_client.py   # needs live EnvServer
+.venv/bin/python tests/profile_pipeline.py --baseline --quick
+.venv/bin/python tests/profile_pipeline.py --stage duel --layouts 8x8 --workers 2
 ```
+
+From `OpenFrontIO/`:
+
+```bash
+npx vitest run ofai/tests/env.test.ts ofai/tests/fidelity.test.ts \
+    ofai/tests/runtime.test.ts
+```
+
+Rust capability / golden gates:
+
+```bash
+cargo test --manifest-path sim/Cargo.toml
+cargo run --manifest-path sim/Cargo.toml -- --capabilities
+```
+
+## Baseline gates
+
+Before runtime changes, record stage and topology numbers from
+`tests/profile_pipeline.py`. Compare `16x8`, `32x4`, and `64x2` at 128
+envs on `duel`, `nations-easy-peninsula`, and `nations-easy-small`.
+Reports include env-steps/s, latency percentiles, resets, shard
+failures, plus server `simMs` / `maskObsMs` / `serializeMs`.
+
+Fidelity: `AgentEnv.strongStateDigest()` (test-only unless
+`enableDigest`) must match committed goldens and randomized dual-env
+traces at every decision boundary. Tile state, observations, masks,
+rewards, intent counts, and terminal causes are part of the digest; the
+existing 10-tick core hash remains in `info.hash`. Semantic drift fails
+the gate and keeps an optimized backend disabled.
+
+## Simulator backends and fallback
+
+`agent/backend.py` is fail-closed. `--backend official` is the production
+default. `auto`/`rust` query the Rust capability document and the union
+of remaining curriculum stages. If boats, nukes, rails, doomsday, an
+unknown capability, a non-v2 schema, or a missing runtime is required,
+the selector returns official **before** `ShardedVecEnv` creates
+episodes. A Rust farm that later sees an unsupported `nextConfig` raises
+rather than approximating or switching mid-episode.
+
+Implemented official parity: sequential and parallel TypeScript actors
+are byte-equal on goldens and randomized traces (obs, masks, rewards,
+digests, terminals). Rust parity is implemented for spawn / wilderness /
+player land combat / structures / diplomacy / AI roster setup and
+terminals; boat execution fail-closes to official (HPA water path).
+Training therefore stays on the official optimized backend.
+
+Worker topology is chosen by quality-to-wall-clock, not raw SPS. On a
+32-core host the measured overnight pick is **8 servers × 8 envs × 2
+workers** (64 envs, batch 8192, ~1387 duel env-steps/s, 0 shard
+failures). Sequential 4x8 is the cheap-tick baseline; 16x8 remains the
+historical transfer farm. `auto` workers shrink to the CPU/memory
+budget and can fall back to sequential.
+
+Optional official-core elite recording and BC warm-start exist behind
+`--record-elite` / `--bc-dataset`. `best.pt` is never auto-promoted.
+Accept requires the existing official holdout gate (win rate, Wilson,
+diversity, reference-KL). This validation rejected BC for production;
+use a fresh official-core run or the strongest validated non-BC
+checkpoint.
 
 ## Roadmap (not yet built)
 
-- Async/pipelined collection; imitation pretraining; self-play league.
+- Async/pipelined collection; self-play league.
 - Live bridge (gated, explicit user confirmation; ToS-aware private lobbies).
 - Emoji taunts (flavor).
+- Rust boat/HPA parity sufficient to enable rust for a curriculum stage.

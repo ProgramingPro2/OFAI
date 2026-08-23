@@ -69,6 +69,36 @@ def wilson_upper_bound(wins: int, n: int, z: float = 1.96) -> float:
     return wilson_interval(wins, n, z)[1]
 
 
+def cannot_pass_mastery_gate(
+    wins: int,
+    completed: int,
+    planned: int,
+    *,
+    min_episodes: int,
+    win_threshold: float,
+    wilson_floor: float,
+    wilson_z: float = 1.96,
+) -> bool:
+    """True iff winning every remaining episode still cannot pass.
+
+    Remaining trials can only add wins, so a True result is mathematically
+    irreversible. Gate-only evals may stop; scoring / mastery / best-
+    checkpoint suites must still finish the planned seed list.
+    """
+    planned_n = int(planned)
+    done_n = max(0, min(int(completed), planned_n))
+    win_n = max(0, min(int(wins), done_n))
+    if planned_n <= 0 or planned_n < int(min_episodes):
+        return True
+    remaining = planned_n - done_n
+    best_wins = win_n + remaining
+    if (best_wins / planned_n) < float(win_threshold):
+        return True
+    return wilson_lower_bound(best_wins, planned_n, float(wilson_z)) < float(
+        wilson_floor
+    )
+
+
 def sampled_binomial(mode: dict | None) -> tuple[int, int, float]:
     """Return (wins, n, win_rate) from a sampled eval block."""
     samp = dict(mode or {})
@@ -119,14 +149,15 @@ class Stage:
     ood_map_size: str = ""
     # Retained in suite metadata; unlock is holdout-gated, not episode-count.
     map_burn_in: int = -1
-    # Unlock is easier than 26/32 mastery so maps can enter before stage
-    # advance, but n=32 + Wilson 0.30 rejects the 5/32 and 19% collapse
-    # that episode-count unlock allowed. 16/32 is the first integer that
-    # clears both bars; 15/32 does not.
-    unlock_win_threshold: float = 0.50
-    unlock_wilson_floor: float = 0.30
-    # Hysteresis: stay unlocked through 0.35–0.50 noise; relock only when
-    # the holdout is clearly no longer competent (11/32 ≈ 0.344).
+    # Extra train maps unlock only at the sampled mastery bar (26/32 and
+    # Wilson >= 0.50), never from a pre-update transfer baseline. The
+    # weaker 16/32 + Wilson 0.30 bar let a 21/32 peninsula zero-shot
+    # unlock Balkans, then 12/32 became the train mix.
+    unlock_win_threshold: float = 0.80
+    unlock_wilson_floor: float = 0.50
+    # Hysteresis after a mastery-level unlock: stay unlocked through
+    # 0.35–0.80 noise; relock only when the holdout is clearly no longer
+    # competent (11/32 ≈ 0.344).
     relock_win_threshold: float = 0.35
 
     def __post_init__(self) -> None:
@@ -384,6 +415,8 @@ class Curriculum:
         self.stage_episodes = 0
         # Extra train maps stay locked until a holdout unlock judgment.
         self.maps_unlocked = False
+        # When True, apply_unlock never opens extra maps (v4 ablation).
+        self.maps_locked = False
         # Stage-isolated competency window (logged; not an advance gate)
         self._stage_successes: list[float] = []
 
@@ -605,9 +638,10 @@ class Curriculum:
     def judge_unlock(self, ev: dict) -> dict:
         """Decide whether extra train maps may unlock or must relock.
 
-        Separate from stage-advance mastery: 16/32 + Wilson >= 0.30 is
-        enough to mix maps, but 5/32 / 19% never unlocks. Unlock never
-        uses training-window rates or episode counts.
+        Unlock requires the sampled mastery bar (26/32 and Wilson >= 0.50)
+        or an already-unlocked post-mastery consolidation state. The
+        pre-update transfer baseline must not call apply_unlock.
+        Unlock never uses training-window rates or episode counts.
         """
         s = self.stage
         samp = ev.get("sampled") or {}
@@ -646,6 +680,16 @@ class Curriculum:
 
     def apply_unlock(self, ev: dict) -> dict:
         """Update persisted unlock state from a frozen sampled holdout."""
+        if self.maps_locked:
+            judgment = self.judge_unlock(ev)
+            judgment["unlock"] = False
+            judgment["relock"] = False
+            judgment["reason"] = "maps_locked"
+            judgment["action"] = "hold"
+            judgment["maps_unlocked"] = False
+            judgment["prev_maps_unlocked"] = self.maps_unlocked
+            self.maps_unlocked = False
+            return judgment
         judgment = self.judge_unlock(ev)
         prev = self.maps_unlocked
         if judgment["unlock"]:
@@ -698,6 +742,7 @@ class Curriculum:
             # Older checkpoints/tests used this name for the same window.
             "stage_wins": successes,
             "maps_unlocked": self.maps_unlocked,
+            "maps_locked": self.maps_locked,
             "mastery_version": MASTERY_VERSION,
         }
 
@@ -714,6 +759,9 @@ class Curriculum:
         # Missing maps_unlocked → locked. Episode-count burn-in is not
         # inferred, so a collapsed transfer cannot re-open extra maps.
         self.maps_unlocked = bool(d.get("maps_unlocked", False))
+        # Missing maps_locked → unlocked-capable (pre-v4). Ablation CLI
+        # still forces the lock after restore.
+        self.maps_locked = bool(d.get("maps_locked", False))
         if version < MASTERY_VERSION:
             self.last_eval_passed = False
             self.consecutive_eval_passes = 0

@@ -26,8 +26,9 @@ source .venv/bin/activate
 
 # Train (N env-server processes x K games each). Fresh runs truncate their
 # JSONL logs; resume appends. Episode-level metrics go to logs/<run>.episodes.jsonl.
-python -m agent.train --servers 4 --envs 8 --rollout-len 128 --run-name run1 \
-    --eval-every 25 --eval-episodes 32 --total-steps 2000000
+python -m agent.train --servers 8 --envs 8 --workers 2 --backend official \
+    --rollout-len 128 --run-name run1 \
+    --eval-every 25 --eval-episodes 32 --total-steps 12000000
 
 # Resume with an absolute step ceiling, or add more steps beyond the checkpoint:
 python -m agent.train --resume checkpoints/run1/latest.pt --run-name run1 \
@@ -61,10 +62,26 @@ python -m agent.watch --ckpt checkpoints/run1/latest.pt \
     --nations 8 --bots 20 --difficulty Easy
 
 # Unit tests (mocked; no EnvServer required)
-python -m pytest tests/test_rl_pipeline.py -q
+python -m pytest tests/test_rl_pipeline.py tests/test_v4_redesign.py \
+    tests/test_baseline_gates.py tests/test_backend_select.py \
+    tests/test_env_workers.py tests/test_eval_scheduler.py \
+    tests/test_sample_efficiency.py -q
 
 # Live env smoke (requires OpenFrontIO env server)
 python tests/test_env_client.py
+
+# TypeScript env + replay-fidelity + sequential/parallel parity
+# (from OpenFrontIO/)
+npx vitest run ofai/tests/env.test.ts ofai/tests/fidelity.test.ts \
+    ofai/tests/runtime.test.ts
+
+# Rust capability / golden gates
+cargo test --manifest-path sim/Cargo.toml
+
+# Structured stage / topology baseline (writes JSON if --json-out is set)
+python tests/profile_pipeline.py --baseline --quick
+python tests/profile_pipeline.py --stage duel --layouts 4x8,8x8 --workers 2
+python tests/profile_pipeline.py --baseline --layouts 16x8,32x4,64x2
 ```
 
 `agent.watch` supports every curriculum stage via `--preset`: `duel`,
@@ -120,7 +137,10 @@ Use `--windowed` or `--window-size WIDTHxHEIGHT` to start windowed
 the native map and saved-video resolution; display fitting does not alter
 video output.
 
-Key flags: `--servers`, `--envs`, `--total-steps`, `--additional-steps`,
+Key flags: `--servers`, `--envs`, `--workers` (`auto` / `N`; `0`/`1` is
+the sequential official oracle), `--backend` (`official` production
+default; `auto`/`rust` only if every remaining stage is schema-v2
+supported), `--total-steps`, `--additional-steps`,
 `--resume`, `--stage` / `--force-stage` (name or current-table index),
 `--keep-optimizer` (advanced; default `--force-stage` is a fresh Adam
 at `--lr`), `--allow-collapsed-resume`, `--dry-run`,
@@ -129,19 +149,60 @@ at `--lr`), `--allow-collapsed-resume`, `--dry-run`,
 `--eval-det-episodes` (diagnostic),
 `--eval-ood-episodes` (logged only), `--target-kl`
 (default 0.03 active-joint), `--ent-target` (default 0.6 mask-normalized
-action-type entropy in [0, 1]). There is no `--compile` path; rollout
+action-type entropy in [0, 1]; transfer should pass `0.3`),
+`--ent-weighting` (`uniform` fresh default, `effective` for transfer),
+`--ref-kl-coef` / `--ref-kl-target` / `--ref-kl-hard` (stage-entry
+reference retention; `0` coef disables it), `--lock-maps`,
+`--max-updates`, `--v4-ablation`. There is no `--compile` path; rollout
 always uses the eager policy.
 
 `--force-stage` loads policy/value weights, resets Adam unless
 `--keep-optimizer`, then runs a frozen sampled holdout **before** the
-first collect/update. That baseline cannot advance the stage or write
-`best.pt`. Extra train maps stay on the canonical map until a later
-holdout clears the unlock bar (16/32 + Wilson 0.30), not because 55
-or 75 episodes elapsed. A confirmed holdout collapse versus the
-stage-entry/stage-best bar restores those weights, optimizer, RNG,
-curriculum, and seed stream, writes `latest.pt`, and stops without
-the shutdown `finally` rewriting the restored file. `--eval-every 0`
-is warned on `--force-stage` (no later unlock/regression).
+first collect/update. That baseline cannot advance the stage, write
+`best.pt`, or unlock extra train maps. Extra maps unlock only at the
+sampled mastery bar (26/32 and Wilson >= 0.50). The force-stage
+run-global `best.pt` write bar is floored at the stage-entry holdout
+score so a later 12/32 cannot replace 21/32. A confirmed holdout
+collapse versus the stage-entry/stage-best bar restores those weights,
+optimizer, `ent_coef`, RNG, curriculum, and seed stream, writes
+`latest.pt`, and stops without the shutdown `finally` rewriting the
+restored file. Ordinary resume of a checkpoint with `halt_reason` /
+`stage_regression` metadata is refused unless `--force-stage` or
+`--allow-collapsed-resume`. `--eval-every 0` is warned on
+`--force-stage` (no later unlock/regression).
+
+v3 peninsula transfer collapsed with healthy per-update KL (21/32 ->
+12/32 -> 11/32 -> 7/32) because boat/build/diplomacy were mask-legal
+without a valid intent and entropy rewarded those always-legal
+utilities. v4 makes action masks mean "this selected action can emit a
+state-changing intent now," freezes a stage-entry reference KL
+(`ref_kl`), and uses effectiveness-aware entropy on transfer. Schema
+stays v2; `it800.pt` remains loadable.
+
+Recommended first transfer experiment (short ablation, not 10M steps).
+Dry-run first; do not use these as new global fresh-run defaults:
+
+```bash
+python -m agent.train --dry-run --resume checkpoints/v2run1/it800.pt \
+    --stage nations-easy-peninsula --force-stage --run-name v4ablate1 \
+    --v4-ablation --ent-target 0.3 --lr 1e-4 --eval-every 5 \
+    --eval-episodes 32 --servers 16 --envs 8 --port 8765
+
+python -m agent.train --resume checkpoints/v2run1/it800.pt \
+    --stage nations-easy-peninsula --force-stage --run-name v4ablate1 \
+    --v4-ablation --ent-target 0.3 --lr 1e-4 --eval-every 5 \
+    --eval-episodes 32 --servers 16 --envs 8 --port 8765
+```
+
+`--v4-ablation` locks maps, enables reference retention (`ref_kl_coef`
+0.1), sets `--eval-every 5` and `--max-updates 15` if unset, sizes
+`--additional-steps` for that update cap (so `it800` is not blocked by
+the 10M ceiling), and uses effective entropy. The update cap still
+runs the due/final holdout (it800: 805/810/815) before stopping. Ablation success: later
+holdout >= stage-entry
+baseline and attack share does not collapse into boat/build/diplomacy/NOOP.
+Failure: monotonic holdout drop (the v3 21->12->11->7 pattern) or
+utility-action takeover while per-update KL stays small.
 
 Distribution-transfer recovery (do not use these as new global
 defaults): `--lr 1e-4 --eval-every 5` with a **new** `--run-name`,
@@ -163,3 +224,74 @@ baseline, and seed-stream counters are written to checkpoint extras
 and JSONL logs. Old schema-v2 checkpoints load without
 `maps_unlocked` (stay locked) or holdout `stage_baseline` (first
 later holdout becomes the guard).
+
+## Baseline and fidelity gates
+
+`tests/profile_pipeline.py` times env stepping, policy forward, and PPO
+update, then compares farm layouts at a fixed env count. It reports
+throughput, p50/p95/p99 step latency, auto-resets, shard failures, and
+server-side simulation / mask-observation / serialization time.
+Representative stages are `duel`, `nations-easy-peninsula`, and
+`nations-easy-small`. Representative topologies are `16x8`, `32x4`, and
+`64x2` (128 envs). Use `--quick` for a small smoke; `--json-out` writes
+the structured report. Speed claims for later runtime work should use
+the fastest stable measured topology, not an assumption.
+
+Replay fidelity lives in `OpenFrontIO/ofai/tests/fidelity.test.ts`.
+`AgentEnv.strongStateDigest()` hashes tile state, observations, masks,
+rewards, intent counts, and terminal causes at every decision boundary,
+alongside the official 10-tick core hash. Committed goldens under
+`OpenFrontIO/ofai/tests/fixtures/` cover spawn, wilderness/player
+combat, boats, structures, diplomacy, nations, and terminals. Randomized
+dual-actor traces must stay byte-equal. `EnvConfig.enableDigest` puts
+those digests on step info for tests only; training leaves it off.
+Regenerate goldens with `UPDATE_OFAI_GOLDEN=1` only when a deliberate
+semantic change is intended. Any digest drift blocks an optimized
+runtime from being enabled.
+
+## Simulator backends
+
+The official TypeScript core is the only production trainer and the only
+checkpoint-promotion authority. `--backend official` (default) always
+spawns `OpenFrontIO/ofai/env/EnvServer.ts`. `--backend auto` or `rust`
+may select the schema-v2 Rust mirror (`sim/`) only when **every**
+remaining curriculum stage is explicitly supported in the capability
+document (`cargo run --manifest-path sim/Cargo.toml -- --capabilities`).
+Unsupported capabilities — currently boats (HPA water paths), nukes,
+rails, and doomsday — transparently select official **before episode
+creation**. Mid-episode switching and approximation are refused.
+
+Every current curriculum stage includes boat, so `auto` falls back to
+official for training. Rust may still be used for isolated wilderness
+goldens and differential tests. The official farm has two actor modes
+that must stay byte-equal: sequential (`--workers 0`/`1`, the oracle)
+and parallel (`--workers N>1`, each worker owns complete games).
+
+On this 32-core host, measured duel layouts (no shard failures):
+
+| Farm | Workers | Envs | env-steps/s | Notes |
+|------|---------|------|-------------|-------|
+| 2x8 | 1 | 16 | 781 | sequential baseline |
+| 2x8 | 4 | 16 | 930 | fastest small farm; batch 2048 is thin |
+| 4x8 | 1 | 32 | 711 | sequential, batch 4096 |
+| 4x8 | 4 | 32 | 670 | workers add overhead on cheap duel ticks |
+| 8x8 | 2 | 64 | 1387 | best quality-to-wall-clock; batch 8192 |
+| 16x8 / 32x4 / 64x2 | 1 | 128 | 366 / 340 / 396 | nations-easy-small process topologies |
+
+Choose 8x8 workers=2 for overnight official-core training: more
+diversity per update than 4x8, higher stable SPS than sequential 16x8
+nations (mask/obs dominated), and no fidelity loss versus the oracle.
+`16x8` remains the historical transfer farm (batch 16384). Nations-stage
+wall-clock is still dominated by official mask/obs, not PPO.
+
+Optional elite recording (`--record-elite`) keeps official-core wins
+only, atomically, with episode/step caps. Behavior-cloning a candidate
+never writes `best.pt`; accept requires the existing official holdout
+gate (win rate, Wilson, reference-KL, diversity). NLL-only is not an
+accept. This validation rejected BC for production because no BC
+candidate cleared that frozen official-core gate.
+
+Limitations: Rust is not a drop-in nations trainer while boats are
+unsupported. Parallel official workers fall back to sequential if a
+worker farm fails to init. Do not point this stack at public
+multiplayer servers.

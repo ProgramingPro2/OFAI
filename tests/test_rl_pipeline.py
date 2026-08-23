@@ -388,6 +388,100 @@ def test_shard_recovery_no_double_step():
     env.pool.shutdown(wait=False)
 
 
+def test_read_frame_empty_header_is_connection_error():
+    """v4val1 died on json.loads('') from a truncated shard frame."""
+    import socket
+    import struct
+
+    body = struct.pack("<I", 0)
+    frame = struct.pack("<I", len(body)) + body
+    a, b = socket.socketpair()
+    try:
+        a.sendall(frame)
+        with pytest.raises(ConnectionError, match="corrupt env frame"):
+            _read_frame(b)
+    finally:
+        a.close()
+        b.close()
+
+
+def test_step_json_decode_error_is_rollout_interrupted():
+    env = object.__new__(ShardedVecEnv)
+    env.envs_per_server = 1
+    env.k = 2
+    env.ports = [9001, 9002]
+    env.connect = False
+    env._configs = [{}, {}]
+    env.servers = [MagicMock(alive=MagicMock(return_value=True)) for _ in range(2)]
+
+    class FakeClient:
+        def __init__(self, idx):
+            self.idx = idx
+
+        def step(self, actions, next_configs=None):
+            if self.idx == 1:
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            return StepBatch(
+                obs=_numpy_obs(1),
+                rewards=np.zeros(1, np.float32),
+                dones=np.zeros(1, dtype=bool),
+                infos=[{}],
+            )
+
+        def close(self):
+            pass
+
+    env.clients = [FakeClient(0), FakeClient(1)]
+    from concurrent.futures import ThreadPoolExecutor
+
+    env.pool = ThreadPoolExecutor(max_workers=2)
+    env._restart_shard = MagicMock()
+
+    with pytest.raises(RolloutInterrupted) as ei:
+        env.step(np.zeros((2, 5), np.int32))
+    assert 1 in ei.value.failed_shards
+    env._restart_shard.assert_called()
+    env.pool.shutdown(wait=False)
+
+
+def test_init_active_json_decode_error_is_rollout_interrupted():
+    env = object.__new__(ShardedVecEnv)
+    env.envs_per_server = 1
+    env.k = 2
+    env.ports = [9001, 9002]
+    env.connect = False
+    env._configs = [{}, {}]
+    env.servers = [MagicMock(alive=MagicMock(return_value=True)) for _ in range(2)]
+    env._obs_buf = None
+    env._next_config_fn = None
+    env._on_episode_reset = None
+    env._clear_active()
+
+    class FakeClient:
+        def __init__(self, idx):
+            self.idx = idx
+
+        def init(self, cfgs):
+            if self.idx == 1:
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            return _numpy_obs(len(cfgs))
+
+        def close(self):
+            pass
+
+    env.clients = [FakeClient(0), FakeClient(1)]
+    from concurrent.futures import ThreadPoolExecutor
+
+    env.pool = ThreadPoolExecutor(max_workers=2)
+    env._restart_shard = MagicMock()
+
+    with pytest.raises(RolloutInterrupted) as ei:
+        env.init_active([{"seed": "a"}, {"seed": "b"}])
+    assert 1 in ei.value.failed_shards
+    env._restart_shard.assert_called()
+    env.pool.shutdown(wait=False)
+
+
 def test_obs_dict_target_masks_and_quantity():
     s = spaces
     k = 2
@@ -764,6 +858,19 @@ def test_eval_score_uses_true_wins_only():
     assert _eval_score(sampled_master) > _eval_score(milestone_only)
     assert _eval_score(milestone_only)[0] == pytest.approx(0.0)
     assert _eval_score(collapsed)[0] == pytest.approx(0.0)
+
+
+def test_evaluate_exposes_effective_entropy_and_stays_in_unit_interval():
+    torch.manual_seed(4)
+    policy = Policy()
+    obs = make_dummy_obs(5, "cpu")
+    with torch.no_grad():
+        actions, _, _ = policy.act(obs)
+        _, _, _, extras = policy.evaluate(obs, actions)
+    assert extras["action_entropy_eff_norm"].min() >= 0.0
+    assert extras["action_entropy_eff_norm"].max() <= 1.0
+    assert extras["action_entropy_norm"].max() <= 1.0
+    assert extras["action_entropy_eff_multi"].dtype == torch.bool
 
 
 def test_normalized_action_entropy_one_legal():
@@ -1278,8 +1385,8 @@ class _AlwaysInterruptEnv:
 
 
 def test_fixed_seed_eval_retries_same_seeds_no_double_count():
-    """One shard interrupt mid-eval: replay exact seeds, do not keep the
-    finished env-0 win from the discarded attempt."""
+    """One shard interrupt mid-eval: keep the finished env-0 win and retry
+    only the unfinished seed. Do not double-count."""
     env = _EvalInterruptEnv(k=2)
     policy = Policy()
     cur = Curriculum(start=0)
@@ -1290,15 +1397,18 @@ def test_fixed_seed_eval_retries_same_seeds_no_double_count():
     assert env._interrupted_once
     det_seeds = [f"{prefix}-deterministic-0", f"{prefix}-deterministic-1"]
     samp_seeds = [f"{prefix}-sampled-0", f"{prefix}-sampled-1"]
-    # Failed attempt + full retry both start at deterministic with same seeds.
     assert env.init_calls[0] == det_seeds
-    assert env.init_calls[1] == det_seeds
-    assert env.init_calls[2] == samp_seeds
-    assert env.init_calls.count(det_seeds) == 2
+    assert env.init_calls[1][0] == det_seeds[1]
+    assert det_seeds[0] not in env.init_calls[1]
+    assert env.init_calls.count(det_seeds) == 1
+    assert samp_seeds in env.init_calls
     for mode in ("deterministic", "sampled"):
         assert ev[mode]["episodes"] == 2
         assert ev[mode]["win_rate"] == pytest.approx(1.0)
         assert ev[mode]["terminal_causes"] == {"win": 2}
+        assert ev[mode]["seeds"] == (
+            det_seeds if mode == "deterministic" else samp_seeds
+        )
 
 
 def test_fixed_seed_eval_exhausts_retries():

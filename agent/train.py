@@ -6,8 +6,8 @@ holdout sampled-true-win mastery decision (Wilson-guarded). Deterministic
 argmax is a robustness diagnostic and never gates.
 
 Example:
-  .venv/bin/python -m agent.train --servers 4 --envs 8 --rollout-len 128 \
-      --run-name dev --total-steps 1000000
+  .venv/bin/python -m agent.train --servers 4 --envs 8 --workers auto \
+      --rollout-len 128 --run-name dev --total-steps 1000000
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ from .checkpoint import (
     should_rewrite_halt_checkpoint,
     should_write_global_best,
     write_touches_foreign_source,
+    floor_global_best_at_entry,
     should_write_stage_best,
     stage_advance_event_record,
     stage_best_filename,
@@ -58,10 +59,18 @@ from .curriculum import (
     DEFAULT_OOD_EVAL_EPISODES,
     STAGES,
     Curriculum,
+    cannot_pass_mastery_gate,
 )
-from .env_client import RolloutInterrupted, ShardedVecEnv
+from .backend import select_training_backend
+from .env_client import RolloutInterrupted, ShardedVecEnv, resolve_env_workers
 from .model import Policy, obs_to_tensors
 from . import spaces
+from .imitation import (
+    BCConfig,
+    assert_safe_output_path,
+    behavior_clone,
+    is_bc_checkpoint,
+)
 from .ppo import (
     PPOConfig,
     PPOTrainer,
@@ -70,6 +79,7 @@ from .ppo import (
     classify_outcome,
     optimizer_is_fresh,
 )
+from .trajectories import EliteTrajectoryRecorder, load_dataset
 from .seeds import SeedStream, holdout_seed, ood_seed
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +105,22 @@ def parse_stage_arg(value: str) -> int:
     return idx
 
 
+def parse_workers_arg(value: str) -> int | str:
+    """Accept ``auto`` / ``safe`` or a non-negative worker count."""
+    key = str(value).strip().lower()
+    if key in ("auto", "safe"):
+        return "auto"
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"unknown workers {value!r}; expected auto, safe, or an integer >= 0"
+        ) from exc
+    if n < 0:
+        raise argparse.ArgumentTypeError("workers must be >= 0")
+    return n
+
+
 def resolve_holdout_episodes(requested: int, minimum: int) -> int:
     """Raise a too-small `--eval-episodes` to the stage holdout minimum.
 
@@ -114,6 +140,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--envs", type=int, default=8, help="parallel games per server")
     p.add_argument("--servers", type=int, default=4, help="env-server processes")
+    p.add_argument(
+        "--workers",
+        type=parse_workers_arg,
+        default="auto",
+        help="actor threads per env-server: N, 0/1=sequential oracle, "
+        "auto=resource-safe pick (default). Hard-capped at --envs and 32. "
+        "OFAI_ENV_WORKERS supplies N when this is auto.",
+    )
+    p.add_argument(
+        "--backend",
+        type=str,
+        choices=("official", "rust", "auto"),
+        default="official",
+        help="simulator backend. official=TypeScript core (production default). "
+        "rust only when every remaining stage is schema-v2 and fully supported. "
+        "auto selects rust iff the fail-closed capability check passes, else "
+        "official. Unsupported features never approximate or switch mid-episode.",
+    )
     p.add_argument("--port", type=int, default=8765, help="base port (servers use port+i)")
     p.add_argument("--connect", action="store_true", help="connect to already-running servers")
     p.add_argument("--rollout-len", type=int, default=128)
@@ -202,7 +246,187 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="optional OOD episodes logged only (0=skip; default 8)",
     )
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
+        "--ent-weighting",
+        type=str,
+        choices=("uniform", "effective"),
+        default="uniform",
+        help="uniform: legal-set entropy (fresh default). effective: "
+        "exclude always-legal utility types from the entropy bonus",
+    )
+    p.add_argument(
+        "--ref-kl-coef",
+        type=float,
+        default=0.0,
+        help="stage-entry reference KL coefficient (0=off; transfer uses 0.1)",
+    )
+    p.add_argument(
+        "--ref-kl-target",
+        type=float,
+        default=0.02,
+        help="reference KL below this is not penalized",
+    )
+    p.add_argument(
+        "--ref-kl-hard",
+        type=float,
+        default=0.50,
+        help="rollback the PPO update when reference KL exceeds this",
+    )
+    p.add_argument(
+        "--lock-maps",
+        action="store_true",
+        help="never unlock extra train maps this run",
+    )
+    p.add_argument(
+        "--max-updates",
+        type=int,
+        default=0,
+        help="stop after this many PPO updates this run (0=no cap)",
+    )
+    p.add_argument(
+        "--v4-ablation",
+        action="store_true",
+        help="bounded transfer ablation: maps locked, reference retention, "
+        "eval every 5, 15-update cap, effective entropy, ent-target 0.3",
+    )
+    p.add_argument(
+        "--record-elite",
+        action="store_true",
+        help="opt-in: record official-core winning episodes (masks/actions/"
+        "outcomes) to an atomic elite dataset. Disabled by default.",
+    )
+    p.add_argument(
+        "--elite-path",
+        type=str,
+        default="",
+        help="elite dataset path (default: checkpoints/<run>/elite-official.pt)",
+    )
+    p.add_argument(
+        "--elite-max-episodes",
+        type=int,
+        default=64,
+        help="maximum official-core wins kept in the elite dataset",
+    )
+    p.add_argument(
+        "--elite-max-steps",
+        type=int,
+        default=100_000,
+        help="maximum decision rows kept in the elite dataset",
+    )
+    p.add_argument(
+        "--elite-allow-unlabeled",
+        action="store_true",
+        help="treat a missing env backend header as official-core (legacy)",
+    )
+    p.add_argument(
+        "--bc-dataset",
+        type=str,
+        default="",
+        help="validated elite dataset to behavior-clone before PPO fine-tune",
+    )
+    p.add_argument(
+        "--bc-out",
+        type=str,
+        default="",
+        help="BC candidate path (default: checkpoints/<run>/bc-warmstart.pt)",
+    )
+    p.add_argument(
+        "--bc-epochs",
+        type=int,
+        default=4,
+        help="behavior-cloning epochs when --bc-dataset is set",
+    )
     return p.parse_args(argv)
+
+
+def apply_v4_ablation_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Opt-in transfer experiment. Does not change fresh-run defaults."""
+    if not getattr(args, "v4_ablation", False):
+        return args
+    args.lock_maps = True
+    args.ent_weighting = "effective"
+    if float(args.ent_target) == 0.6:
+        args.ent_target = 0.3
+    if int(args.eval_every) == 0:
+        args.eval_every = TRANSFER_EVAL_EVERY
+    if int(args.max_updates) <= 0:
+        args.max_updates = 15
+    if float(args.ref_kl_coef) <= 0.0:
+        args.ref_kl_coef = 0.1
+    # it800-class resumes already exceed the 10M default ceiling.
+    if int(args.additional_steps) <= 0:
+        farm = max(1, int(args.servers) * int(args.envs))
+        args.additional_steps = int(args.max_updates) * int(args.rollout_len) * farm
+    return args
+
+
+def apply_bc_fine_tune_semantics(
+    *,
+    ckpt: dict,
+    resume_plan,
+    trainer: PPOTrainer,
+    args: argparse.Namespace,
+) -> list[str]:
+    """BC candidates must take the official stage-entry holdout.
+
+    Does not write best.pt/latest.pt. Clears inherited eval/baseline so a
+    source policy's holdout cannot skip or auto-promote the clone.
+    """
+    notes = [
+        "[train] BC warm-start: stage-entry official holdout is required "
+        "before PPO collect/update",
+        "[train] BC warm-start: best.pt/latest.pt only via the normal "
+        "official scoring gate (never auto-promoted)",
+    ]
+    resume_plan.pending_stage_baseline = True
+    resume_plan.need_baseline_eval = True
+    resume_plan.stage_baseline = {}
+    resume_plan.last_eval = {}
+    if not args.keep_optimizer:
+        trainer.reset_optimizer(args.lr)
+        resume_plan.reset_optimizer = True
+        notes.append(
+            f"[train] BC warm-start: fresh Adam at lr={args.lr:g} "
+            f"(fresh={optimizer_is_fresh(trainer.opt)})"
+        )
+    trainer.set_reference(source=str(resume_plan.source_checkpoint or args.resume))
+    if trainer.cfg.ref_kl_coef > 0:
+        notes.append(
+            f"[train] BC warm-start: stage-entry reference frozen "
+            f"ref_kl_coef={trainer.cfg.ref_kl_coef:g} "
+            f"hard={trainer.cfg.ref_kl_hard:g}"
+        )
+    if int(args.eval_every) == 0:
+        notes.append(
+            "[train] BC warm-start: --eval-every 0; after the required "
+            "pre-update holdout the regression guard will not run"
+        )
+    bc = ckpt.get("bc") if isinstance(ckpt.get("bc"), dict) else {}
+    if bc.get("accepted") or bc.get("promoted"):
+        notes.append(
+            "[train] warning: candidate metadata claimed accepted/promoted; "
+            "ignoring — official holdout still required"
+        )
+    return notes
+
+
+def should_run_holdout_eval(
+    *,
+    iterations: int,
+    eval_every: int,
+    updates_this_run: int = 0,
+    max_updates: int = 0,
+) -> bool:
+    """Periodic holdout, plus a final holdout when a run hits --max-updates.
+
+    The 15-update ablation must measure update 15. Breaking before this
+    check dropped the last cadence eval (it800: 815) and the jsonl row.
+    """
+    if int(eval_every) <= 0:
+        return False
+    if int(iterations) > 0 and int(iterations) % int(eval_every) == 0:
+        return True
+    return int(max_updates) > 0 and int(updates_this_run) >= int(max_updates)
 
 
 def _rng_state() -> dict:
@@ -234,9 +458,154 @@ def _set_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([_byte_rng(s) for s in state["cuda"]])
 
 
-# Bounded retries for shard death mid-eval. Healthy shards may already
-# have stepped, so a partial attempt is never resumed or merged.
+# Consecutive shard deaths with no newly completed episode. Completing
+# at least one seed resets the counter so a flaky shard cannot discard
+# the rest of a holdout.
 FIXED_SEED_EVAL_RETRIES = 3
+
+EVAL_PURPOSE_SCORE = "score"
+EVAL_PURPOSE_MASTERY = "mastery"
+EVAL_PURPOSE_BEST = "best-checkpoint"
+EVAL_PURPOSE_GATE = "gate"
+_SCORE_EVAL_PURPOSES = frozenset(
+    {EVAL_PURPOSE_SCORE, EVAL_PURPOSE_MASTERY, EVAL_PURPOSE_BEST, "best"}
+)
+_GATE_EVAL_PURPOSES = frozenset({EVAL_PURPOSE_GATE, "gate-only"})
+
+
+def eval_allows_early_reject(purpose: str) -> bool:
+    """Gate-only evals may stop; scoring / mastery / best-checkpoint cannot."""
+    key = str(purpose or EVAL_PURPOSE_SCORE).strip().lower()
+    if key in _GATE_EVAL_PURPOSES:
+        return True
+    if key in _SCORE_EVAL_PURPOSES:
+        return False
+    raise ValueError(
+        f"unknown eval purpose {purpose!r}; expected one of "
+        f"{sorted(_SCORE_EVAL_PURPOSES | _GATE_EVAL_PURPOSES)}"
+    )
+
+
+class PendingSeedScheduler:
+    """Deterministic leftover-seed queue for one eval mode.
+
+    Seeds stay in planned order. Completed results are kept across shard
+    interrupts; only running / pending seeds are retried. Recording the
+    same seed twice is a no-op so failures cannot double-count.
+    """
+
+    def __init__(self, configs: list[dict]):
+        self.configs = list(configs)
+        self._order = [str(c["seed"]) for c in self.configs]
+        self._by_seed = {str(c["seed"]): dict(c) for c in self.configs}
+        self.completed: dict[str, dict] = {}
+        self._pending = list(self._order)
+        self._running: list[str] = []
+
+    @property
+    def planned(self) -> int:
+        return len(self._order)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    @property
+    def completed_count(self) -> int:
+        return len(self.completed)
+
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def claim(self, n: int) -> list[dict]:
+        if n <= 0:
+            return []
+        take = self._pending[:n]
+        self._pending = self._pending[n:]
+        self._running = list(take)
+        return [self._by_seed[seed] for seed in take]
+
+    def complete(self, record: dict) -> None:
+        seed = str(record["seed"])
+        if seed in self.completed:
+            return
+        self.completed[seed] = dict(record)
+        if seed in self._running:
+            self._running.remove(seed)
+
+    def release_incomplete(self) -> None:
+        """Return unfinished running seeds to pending in planned order."""
+        leftover = set(self._running) | set(self._pending)
+        self._running = []
+        self._pending = [
+            seed
+            for seed in self._order
+            if seed in leftover and seed not in self.completed
+        ]
+
+    def abandon_running(self) -> None:
+        """Drop in-flight seeds without completing or retrying them."""
+        self._running = []
+
+    def wins(self) -> int:
+        return sum(1 for rec in self.completed.values() if rec.get("won"))
+
+    def summarize(self, *, stage: str, suite: str, early_rejected: bool = False) -> dict:
+        recs = [self.completed[seed] for seed in self._order if seed in self.completed]
+        n = len(recs)
+        wins = sum(1 for rec in recs if rec.get("won"))
+        stage_hits = sum(1 for rec in recs if rec.get("stage_ok"))
+        deaths = sum(1 for rec in recs if rec.get("death"))
+        kills = sum(int(rec.get("kills") or 0) for rec in recs)
+        rets = [float(rec["ret"]) for rec in recs]
+        peaks = [float(rec["peak"]) for rec in recs]
+        finals = [float(rec["final"]) for rec in recs]
+        ticks = [int(rec["ticks"]) for rec in recs]
+        causes: dict[str, int] = {}
+        hist: dict[str, int] = {}
+        accepted = 0
+        total_a = 0
+        for rec in recs:
+            cause = str(rec.get("cause") or "timeout")
+            causes[cause] = causes.get(cause, 0) + 1
+            for name, count in (rec.get("action_hist") or {}).items():
+                hist[name] = hist.get(name, 0) + int(count)
+            accepted += int(rec.get("accepted") or 0)
+            total_a += int(rec.get("total_a") or 0)
+        return {
+            "episodes": n,
+            "win_rate": (wins / n) if n else 0.0,
+            "stage_success_rate": (stage_hits / n) if n else 0.0,
+            "death_rate": (deaths / n) if n else 0.0,
+            "kills_per_ep": (kills / n) if n else 0.0,
+            "mean_return": float(np.mean(rets)) if rets else 0.0,
+            "mean_peak_tiles": float(np.mean(peaks)) if peaks else 0.0,
+            "mean_final_tiles": float(np.mean(finals)) if finals else 0.0,
+            "mean_ticks": float(np.mean(ticks)) if ticks else 0.0,
+            "terminal_causes": causes,
+            "action_hist": hist,
+            "accept_rate": accepted / max(1, total_a),
+            "stage": stage,
+            "suite": suite,
+            "seeds": [rec["seed"] for rec in recs],
+            "maps": [rec.get("map", "") for rec in recs],
+            "early_rejected": bool(early_rejected),
+            "pending": list(self._pending),
+        }
+
+
+def _empty_eval_mode(*, stage: str, suite: str) -> dict:
+    return {
+        "episodes": 0,
+        "win_rate": 0.0,
+        "stage_success_rate": 0.0,
+        "stage": stage,
+        "suite": suite,
+        "seeds": [],
+        "maps": [],
+        "early_rejected": False,
+        "pending": [],
+    }
 
 
 def _eval_configs(
@@ -279,6 +648,7 @@ def run_fixed_seed_eval(
     n_det: int | None = None,
     n_sampled: int | None = None,
     suite: str = "holdout",
+    purpose: str = EVAL_PURPOSE_SCORE,
 ) -> dict:
     """Inline eval matching the active stage. Runs deterministic then sampled.
 
@@ -286,191 +656,231 @@ def run_fixed_seed_eval(
     iteration. `seed_prefix` overrides that for tests. Milestone
     termination is omitted so `win_rate` is the core 80% FFA outcome.
 
-    `RolloutInterrupted` is recoverable: discard the entire attempt (do not
-    mix finished episodes or mid-step healthy shards), re-init every eval
-    env with the same fixed seeds, and retry from the beginning.
-
-    Episodes are spread across shards via ``init_active`` / ``step_active``
-    so a 32-game holdout uses idle servers instead of packing into the
-    first few processes. Idle lanes are not created or stepped.
+    Completed episodes are kept across ``RolloutInterrupted``. Only
+    failed and still-pending seeds are re-inited; a seed is never
+    counted twice. ``purpose="gate"`` may stop when the mastery bar is
+    already unreachable. Scoring, mastery, and best-checkpoint purposes
+    always finish the planned seed list. Results are aggregated in
+    planned seed order so lane count and retries do not change the
+    reported identities.
     """
     sampled_n = n_sampled if n_sampled is not None else n_episodes
     det_n = n_det if n_det is not None else n_episodes
-    last_exc: RolloutInterrupted | None = None
-    for attempt in range(1, FIXED_SEED_EVAL_RETRIES + 1):
-        try:
-            return _fixed_seed_eval_attempt(
-                policy,
-                env,
-                curriculum,
-                device,
-                sampled_n=sampled_n,
-                det_n=det_n,
-                seed_prefix=seed_prefix,
-                suite=suite,
-            )
-        except RolloutInterrupted as exc:
-            last_exc = exc
-            print(
-                f"[eval] {exc}; discarding partial eval "
-                f"(attempt {attempt}/{FIXED_SEED_EVAL_RETRIES}) "
-                f"and retrying from fixed seeds"
-            )
-    raise RuntimeError(
-        f"fixed-seed eval failed after {FIXED_SEED_EVAL_RETRIES} "
-        f"shard-restart attempts ({last_exc})"
-    ) from last_exc
-
-
-def _fixed_seed_eval_attempt(
-    policy: Policy,
-    env: ShardedVecEnv,
-    curriculum: Curriculum,
-    device: torch.device,
-    *,
-    sampled_n: int,
-    det_n: int,
-    seed_prefix: str | None,
-    suite: str,
-) -> dict:
-    """One clean eval pass. Accumulators are local; callers retry wholesale."""
+    allow_early = eval_allows_early_reject(purpose)
     stage = curriculum.stage
-    k = env.k
     results: dict = {"deterministic": {}, "sampled": {}}
-    stage_frac = float(stage.win_tiles_frac)
+    early_rejected = False
+    if allow_early:
+        modes: tuple[tuple[str, int], ...] = (
+            ("sampled", sampled_n),
+            ("deterministic", det_n),
+        )
+    else:
+        modes = (("deterministic", det_n), ("sampled", sampled_n))
 
-    for mode, n_episodes in (("deterministic", det_n), ("sampled", sampled_n)):
-        if n_episodes <= 0:
-            results[mode] = {
-                "episodes": 0,
-                "win_rate": 0.0,
-                "stage_success_rate": 0.0,
-                "stage": stage.name,
-                "suite": suite,
-                "seeds": [],
-                "maps": [],
-            }
+    for mode, mode_n in modes:
+        if mode_n <= 0 or (early_rejected and mode == "deterministic"):
+            results[mode] = _empty_eval_mode(stage=stage.name, suite=suite)
             continue
-        wins = 0
-        stage_hits = 0
-        deaths = 0
-        kills = 0
-        rets = []
-        peaks = []
-        finals = []
-        ticks = []
-        causes: dict[str, int] = {}
-        accepted = 0
-        total_a = 0
-        hist: dict[str, int] = {}
-        used_seeds: list[str] = []
-        used_maps: list[str] = []
-        remaining = n_episodes
-        while remaining > 0:
-            batch_n = min(k, remaining)
-            offset = n_episodes - remaining
-            cfgs = _eval_configs(
+        scheduler = PendingSeedScheduler(
+            _eval_configs(
                 curriculum,
-                batch_n,
-                offset,
+                mode_n,
+                0,
                 suite=suite,
                 seed_prefix=seed_prefix,
                 mode=mode,
             )
-            used_seeds.extend(str(c["seed"]) for c in cfgs)
-            used_maps.extend(str(c["map"]) for c in cfgs)
-            pad = [
-                {
-                    **curriculum.make_env_config(
-                        f"eval-pad-{suite}-{i}", objective=True, suite=suite
-                    ),
-                    "shaping": 0.0,
-                }
-                for i in range(env.k - batch_n)
-            ]
-            use_active = hasattr(env, "init_active") and hasattr(
-                env, "step_active"
-            )
-            use_leading = hasattr(env, "init_leading") and hasattr(
-                env, "step_leading"
-            )
-            if use_active:
-                obs = env.init_active(cfgs)
-            elif use_leading:
-                obs = env.init_leading(cfgs)
-            else:
-                obs = env.init(cfgs + pad)
-            work_k = int(obs["spatial"].shape[0])
-            ep_ret = np.zeros(work_k, np.float32)
-            active = np.zeros(work_k, dtype=bool)
-            active[:batch_n] = True
-            finished = 0
-            while active[:batch_n].any():
-                with torch.no_grad():
-                    obs_t = obs_to_tensors(obs, device)
-                    acts, _, _ = policy.act(obs_t, deterministic=(mode == "deterministic"))
-                actions = acts.cpu().numpy().astype(np.int32)
-                if use_active:
-                    step = env.step_active(actions)
-                elif use_leading:
-                    step = env.step_leading(actions)
+        )
+        last_exc: RolloutInterrupted | None = None
+        consecutive_fails = 0
+        while scheduler.has_pending():
+            if allow_early and mode == "sampled" and _sampled_gate_unreachable(
+                scheduler, curriculum
+            ):
+                early_rejected = True
+                scheduler.abandon_running()
+                break
+            completed_before = scheduler.completed_count
+            try:
+                finished = _run_pending_eval_batch(
+                    policy,
+                    env,
+                    curriculum,
+                    device,
+                    scheduler,
+                    mode=mode,
+                    suite=suite,
+                    allow_early=allow_early,
+                )
+            except RolloutInterrupted as exc:
+                last_exc = exc
+                made_progress = scheduler.completed_count > completed_before
+                scheduler.release_incomplete()
+                if made_progress:
+                    consecutive_fails = 0
                 else:
-                    step = env.step(actions)
-                ep_ret += step.rewards
-                for i in range(batch_n):
-                    if not active[i]:
-                        continue
-                    info = step.infos[i]
-                    at = int(actions[i, 0])
-                    name = spaces.ACTION_NAMES[at]
-                    hist[name] = hist.get(name, 0) + 1
-                    acc = info.get("actionAccepted", info.get("action_accepted", True))
-                    total_a += 1
-                    if acc:
-                        accepted += 1
-                    if step.dones[i]:
-                        active[i] = False
-                        finished += 1
-                        cause, won, stage_ok = classify_outcome(info, stage_frac)
-                        causes[cause] = causes.get(cause, 0) + 1
-                        if won:
-                            wins += 1
-                        if stage_ok:
-                            stage_hits += 1
-                        if cause == "death":
-                            deaths += 1
-                        kills += int(info.get("kills", 0))
-                        rets.append(float(ep_ret[i]))
-                        peaks.append(float(info.get("peakTilesFrac", info.get("tilesFrac", 0))))
-                        finals.append(float(info.get("tilesFrac", 0)))
-                        ticks.append(int(info.get("tick", 0)))
-                        ep_ret[i] = 0.0
-                obs = step.obs
-            remaining -= batch_n
-
-        n = max(1, len(rets))
-        results[mode] = {
-            "episodes": n,
-            "win_rate": wins / n,
-            "stage_success_rate": stage_hits / n,
-            "death_rate": deaths / n,
-            "kills_per_ep": kills / n,
-            "mean_return": float(np.mean(rets)) if rets else 0.0,
-            "mean_peak_tiles": float(np.mean(peaks)) if peaks else 0.0,
-            "mean_final_tiles": float(np.mean(finals)) if finals else 0.0,
-            "mean_ticks": float(np.mean(ticks)) if ticks else 0.0,
-            "terminal_causes": causes,
-            "action_hist": hist,
-            "accept_rate": accepted / max(1, total_a),
-            "stage": stage.name,
-            "suite": suite,
-            "seeds": used_seeds,
-            "maps": used_maps,
-        }
+                    consecutive_fails += 1
+                print(
+                    f"[eval] {exc}; keeping {scheduler.completed_count} completed "
+                    f"{mode} seed(s), retrying {scheduler.pending_count} pending "
+                    f"(fail {consecutive_fails}/{FIXED_SEED_EVAL_RETRIES})"
+                )
+                if consecutive_fails >= FIXED_SEED_EVAL_RETRIES:
+                    raise RuntimeError(
+                        f"fixed-seed eval failed after {FIXED_SEED_EVAL_RETRIES} "
+                        f"shard-restart attempts ({last_exc})"
+                    ) from last_exc
+                continue
+            if finished:
+                consecutive_fails = 0
+            if allow_early and mode == "sampled" and _sampled_gate_unreachable(
+                scheduler, curriculum
+            ):
+                early_rejected = True
+                scheduler.abandon_running()
+                break
+        results[mode] = scheduler.summarize(
+            stage=stage.name, suite=suite, early_rejected=early_rejected
+        )
     results["suite"] = suite
+    results["purpose"] = purpose
+    results["early_rejected"] = bool(early_rejected)
     results["holdout_map"] = stage.holdout_map
     results["holdout_map_size"] = stage.holdout_map_size
     return results
+
+
+def _sampled_gate_unreachable(
+    scheduler: PendingSeedScheduler, curriculum: Curriculum
+) -> bool:
+    stage = curriculum.stage
+    return cannot_pass_mastery_gate(
+        scheduler.wins(),
+        scheduler.completed_count,
+        scheduler.planned,
+        min_episodes=stage.min_eval_episodes,
+        win_threshold=stage.sampled_win_threshold,
+        wilson_floor=stage.sampled_wilson_floor,
+        wilson_z=stage.sampled_wilson_z,
+    )
+
+
+def _step_active_lanes(env: ShardedVecEnv, actions: np.ndarray, live: np.ndarray):
+    """Call ``step_active`` with a live mask when the env supports it."""
+    try:
+        return env.step_active(actions, live=live)
+    except TypeError:
+        return env.step_active(actions)
+
+
+def _run_pending_eval_batch(
+    policy: Policy,
+    env: ShardedVecEnv,
+    curriculum: Curriculum,
+    device: torch.device,
+    scheduler: PendingSeedScheduler,
+    *,
+    mode: str,
+    suite: str,
+    allow_early: bool,
+) -> int:
+    """Init the next pending prefix and run those lanes to completion.
+
+    Returns how many new episodes finished. On shard death the claimed
+    unfinished seeds stay on the scheduler as running so the caller can
+    requeue them; completed records are already stored.
+    """
+    stage = curriculum.stage
+    stage_frac = float(stage.win_tiles_frac)
+    batch_n = min(int(env.k), scheduler.pending_count)
+    if batch_n <= 0:
+        return 0
+    cfgs = scheduler.claim(batch_n)
+    completed_before = scheduler.completed_count
+    pad = [
+        {
+            **curriculum.make_env_config(
+                f"eval-pad-{suite}-{i}", objective=True, suite=suite
+            ),
+            "shaping": 0.0,
+        }
+        for i in range(max(0, int(env.k) - batch_n))
+    ]
+    use_active = hasattr(env, "init_active") and hasattr(env, "step_active")
+    use_leading = hasattr(env, "init_leading") and hasattr(env, "step_leading")
+    if use_active:
+        obs = env.init_active(cfgs)
+    elif use_leading:
+        obs = env.init_leading(cfgs)
+    else:
+        obs = env.init(cfgs + pad)
+    work_k = int(obs["spatial"].shape[0])
+    ep_ret = np.zeros(work_k, np.float32)
+    active = np.zeros(work_k, dtype=bool)
+    active[:batch_n] = True
+    lane_hist: list[dict[str, int]] = [{} for _ in range(batch_n)]
+    lane_accepted = np.zeros(batch_n, dtype=np.int32)
+    lane_total = np.zeros(batch_n, dtype=np.int32)
+    while active[:batch_n].any():
+        if allow_early and mode == "sampled" and _sampled_gate_unreachable(
+            scheduler, curriculum
+        ):
+            scheduler.abandon_running()
+            break
+        with torch.no_grad():
+            obs_t = obs_to_tensors(obs, device)
+            acts, _, _ = policy.act(obs_t, deterministic=(mode == "deterministic"))
+        actions = acts.cpu().numpy().astype(np.int32)
+        if use_active:
+            step = _step_active_lanes(env, actions, active[:work_k])
+        elif use_leading:
+            step = env.step_leading(actions)
+        else:
+            step = env.step(actions)
+        ep_ret += step.rewards
+        for i in range(batch_n):
+            if not active[i]:
+                continue
+            info = step.infos[i]
+            at = int(actions[i, 0])
+            name = spaces.ACTION_NAMES[at]
+            lane_hist[i][name] = lane_hist[i].get(name, 0) + 1
+            lane_total[i] += 1
+            acc = info.get("actionAccepted", info.get("action_accepted", True))
+            if acc:
+                lane_accepted[i] += 1
+            if not step.dones[i]:
+                continue
+            active[i] = False
+            cause, won, stage_ok = classify_outcome(info, stage_frac)
+            scheduler.complete(
+                {
+                    "seed": str(cfgs[i]["seed"]),
+                    "map": str(cfgs[i]["map"]),
+                    "won": bool(won),
+                    "stage_ok": bool(stage_ok),
+                    "death": cause == "death",
+                    "kills": int(info.get("kills", 0)),
+                    "ret": float(ep_ret[i]),
+                    "peak": float(info.get("peakTilesFrac", info.get("tilesFrac", 0))),
+                    "final": float(info.get("tilesFrac", 0)),
+                    "ticks": int(info.get("tick", 0)),
+                    "cause": cause,
+                    "action_hist": dict(lane_hist[i]),
+                    "accepted": int(lane_accepted[i]),
+                    "total_a": int(lane_total[i]),
+                }
+            )
+            ep_ret[i] = 0.0
+            if allow_early and mode == "sampled" and _sampled_gate_unreachable(
+                scheduler, curriculum
+            ):
+                scheduler.abandon_running()
+                active[:batch_n] = False
+                break
+        obs = step.obs
+    return scheduler.completed_count - completed_before
 
 
 def run_pre_update_baseline(
@@ -526,12 +936,29 @@ def run_pre_update_baseline(
         stage=curriculum.stage.name,
         kind="pre_update_holdout",
     )
-    unlock = curriculum.apply_unlock(ev)
+    # Never unlock extra train maps from the pre-update baseline. A
+    # 21/32 peninsula zero-shot previously cleared the 16/32 bar.
+    unlock = {
+        "unlock": False,
+        "relock": False,
+        "reason": "pre_update_baseline",
+        "action": "hold",
+        "maps_unlocked": curriculum.maps_unlocked,
+        "prev_maps_unlocked": curriculum.maps_unlocked,
+        "sampled_win_rate": baseline.get("win_rate"),
+        "sampled_episodes": baseline.get("episodes"),
+        "stage": curriculum.stage.name,
+    }
     return baseline, ev, ood_ev, unlock
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
+    args = apply_v4_ablation_defaults(parse_args(argv))
+    worker_res = resolve_env_workers(
+        args.workers,
+        envs_per_server=args.envs,
+        num_servers=args.servers,
+    )
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -555,6 +982,10 @@ def main(argv: list[str] | None = None) -> None:
         update_epochs=args.update_epochs,
         num_minibatches=args.num_minibatches,
         ent_target=args.ent_target,
+        ent_weighting=args.ent_weighting,
+        ref_kl_coef=args.ref_kl_coef,
+        ref_kl_target=args.ref_kl_target,
+        ref_kl_hard=args.ref_kl_hard,
         gamma=args.gamma,
         device=args.device if torch.cuda.is_available() else "cpu",
     )
@@ -570,6 +1001,42 @@ def main(argv: list[str] | None = None) -> None:
     halt_checkpoint_committed = False
     resume_plan = None
     ckpt: dict = {}
+
+    if args.bc_dataset:
+        bc_ds = load_dataset(args.bc_dataset, validate=True)
+        print(
+            f"[train] bc dataset schema={bc_ds.schema_version} "
+            f"episodes={bc_ds.n_episodes} steps={bc_ds.n_steps} "
+            f"checksum={bc_ds.checksum}"
+        )
+        if args.dry_run:
+            print(
+                f"[dry-run] bc_dataset={args.bc_dataset} "
+                f"bc_out={args.bc_out or (run_dir / 'bc-warmstart.pt')} "
+                f"bc_epochs={args.bc_epochs} init={resume_path or '(fresh)'} "
+                "(no write)"
+            )
+        else:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            bc_out = Path(args.bc_out) if args.bc_out else run_dir / "bc-warmstart.pt"
+            assert_safe_output_path(bc_out)
+            result = behavior_clone(
+                bc_ds,
+                out_path=bc_out,
+                init_ckpt=resume_path or None,
+                cfg=BCConfig(
+                    epochs=int(args.bc_epochs),
+                    seed=int(args.seed),
+                    device=cfg.device,
+                    lr=float(args.lr),
+                ),
+            )
+            print(
+                f"[train] wrote BC candidate {result.path} "
+                f"nll {result.train_nll:.4f}->{result.final_nll:.4f} "
+                "accepted=false promoted=false"
+            )
+            resume_path = str(result.path)
 
     if resume_path:
         restore_opt = not (args.force_stage and not args.keep_optimizer)
@@ -618,12 +1085,20 @@ def main(argv: list[str] | None = None) -> None:
         for warn in resume_plan.warnings:
             print(warn)
         if args.force_stage:
+            trainer.set_reference(source=str(resume_path))
             print(
                 f"[train] --force-stage {curriculum.stage.name}: "
                 "stage-local curriculum/mastery/windows/seed-stream reset; "
                 "global-best metadata retained; "
                 f"writing to {run_dir}"
             )
+            if trainer.cfg.ref_kl_coef > 0:
+                print(
+                    f"[train] stage-entry reference frozen from {resume_path} "
+                    f"ref_kl_coef={trainer.cfg.ref_kl_coef:g} "
+                    f"target={trainer.cfg.ref_kl_target:g} "
+                    f"hard={trainer.cfg.ref_kl_hard:g}"
+                )
         else:
             print(
                 f"[train] restored stage={curriculum.stage.name} "
@@ -640,9 +1115,30 @@ def main(argv: list[str] | None = None) -> None:
         )
         if budget:
             print(budget)
+        if is_bc_checkpoint(ckpt):
+            for note in apply_bc_fine_tune_semantics(
+                ckpt=ckpt,
+                resume_plan=resume_plan,
+                trainer=trainer,
+                args=args,
+            ):
+                print(note)
+            pending_stage_baseline = True
+            stage_baseline = {}
+            last_eval = {}
+            global_best_score = BEST_SCORE_SENTINEL
+            stage_best_score = BEST_SCORE_SENTINEL
     elif args.stage is not None:
         curriculum = Curriculum(start=args.stage)
 
+    if args.lock_maps:
+        curriculum.maps_locked = True
+        curriculum.maps_unlocked = False
+
+    backend_decision = select_training_backend(
+        getattr(args, "backend", "official"),
+        STAGES[curriculum.idx :],
+    )
     if args.dry_run:
         env_steps = trainer.stats.env_steps
         if resume_plan is None:
@@ -675,6 +1171,40 @@ def main(argv: list[str] | None = None) -> None:
                 "[dry-run] CLI lr after optimizer reset = "
                 f"{args.lr:g}; eval_every={args.eval_every}"
             )
+        if args.v4_ablation:
+            print(
+                "[dry-run] v4-ablation: maps_locked "
+                f"ref_kl_coef={args.ref_kl_coef:g} "
+                f"ref_kl_target={args.ref_kl_target:g} "
+                f"ent_target={args.ent_target:g} "
+                f"ent_weighting={args.ent_weighting} "
+                f"eval_every={args.eval_every} "
+                f"max_updates={args.max_updates} "
+                f"additional_steps={args.additional_steps} "
+                "(short ablation, not 10M steps)"
+            )
+            print(
+                "[dry-run] ablation success: holdout >= baseline and "
+                "attack share does not collapse to boat/build/diplo/noop; "
+                "failure: monotonic holdout drop or utility-action takeover"
+            )
+        if args.record_elite:
+            elite_dest = args.elite_path or str(run_dir / "elite-official.pt")
+            print(
+                f"[dry-run] record_elite=true path={elite_dest} "
+                f"max_episodes={args.elite_max_episodes} "
+                f"max_steps={args.elite_max_steps} "
+                f"allow_unlabeled={args.elite_allow_unlabeled} "
+                "(official backend only; atomic write; no production names)"
+            )
+        if resume_path and is_bc_checkpoint(ckpt):
+            print(
+                "[dry-run] bc_warm_start=true pending_stage_baseline=true "
+                "official holdout required before PPO; "
+                "best.pt only via official scoring gate"
+            )
+        print(worker_res.log_line())
+        print(backend_decision.log_line())
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -686,11 +1216,21 @@ def main(argv: list[str] | None = None) -> None:
     if resume_plan is not None:
         log_f.write(json.dumps(resume_plan.event) + "\n")
 
+    print(worker_res.log_line())
+    print(backend_decision.log_line())
+    if backend_decision.backend != "official":
+        print(
+            "[env] rust selected only because every remaining stage is "
+            "schema-v2 supported; production stays official when tribe/"
+            "nation AI or later systems are required"
+        )
     env = ShardedVecEnv(
         num_servers=args.servers,
         base_port=args.port,
         envs_per_server=args.envs,
         connect=args.connect,
+        workers=worker_res.workers,
+        backend=backend_decision.backend,
     )
     total_envs = env.k
     seed_stream = SeedStream(args.run_name, args.seed, total_envs)
@@ -716,6 +1256,20 @@ def main(argv: list[str] | None = None) -> None:
         f"holdout={curriculum.stage.holdout_map} "
         f"train_maps={curriculum.stage.train_map_set}"
     )
+
+    if args.record_elite:
+        elite_path = (
+            Path(args.elite_path) if args.elite_path else run_dir / "elite-official.pt"
+        )
+        assert_safe_output_path(elite_path)
+        trainer.elite = EliteTrajectoryRecorder(
+            enabled=True,
+            n_envs=total_envs,
+            max_episodes=int(args.elite_max_episodes),
+            max_steps=int(args.elite_max_steps),
+            allow_unlabeled_backend=bool(args.elite_allow_unlabeled),
+            path=elite_path,
+        )
 
     def attach_train_hooks() -> None:
         def next_cfg(env_i: int) -> dict:
@@ -776,6 +1330,19 @@ def main(argv: list[str] | None = None) -> None:
         save_ckpt(run_dir / "untrained.pt")
 
     obs = reinit_envs()
+    print(f"[env] {env.backend_summary()}")
+    if trainer.elite is not None:
+        if trainer.elite.accepts_backend(env.backend):
+            print(
+                f"[train] elite recording enabled backend={env.backend} "
+                f"path={trainer.elite.path} max_episodes={trainer.elite.max_episodes}"
+            )
+        else:
+            trainer.elite.enabled = False
+            print(
+                f"[train] elite recording disabled: backend={env.backend!r} "
+                "is not official-core"
+            )
     buf = RolloutBuffer(cfg.rollout_len, total_envs)
     steps_per_iter = cfg.rollout_len * total_envs
     device = torch.device(cfg.device)
@@ -830,7 +1397,7 @@ def main(argv: list[str] | None = None) -> None:
 
     def run_force_stage_baseline() -> None:
         nonlocal stage_baseline, last_eval, pending_stage_baseline, obs
-        nonlocal stage_best_score
+        nonlocal stage_best_score, global_best_score
         holdout_n = resolve_holdout_episodes(
             args.eval_episodes, curriculum.stage.min_eval_episodes
         )
@@ -844,6 +1411,7 @@ def main(argv: list[str] | None = None) -> None:
             "(no collect/update, no stage advance, no global-best write)"
         )
         env.set_episode_hooks(None)
+        eval_failed = False
         try:
             baseline, ev, ood_ev, unlock = run_pre_update_baseline(
                 policy=policy,
@@ -855,13 +1423,23 @@ def main(argv: list[str] | None = None) -> None:
                 n_det=args.eval_det_episodes,
                 n_ood=args.eval_ood_episodes,
             )
+        except BaseException:
+            eval_failed = True
+            raise
         finally:
-            obs = reinit_envs()
+            try:
+                obs = reinit_envs()
+            except Exception:
+                # A dead shard during reinit must not hide the eval error
+                # (JSONDecodeError on a truncated frame previously did).
+                if not eval_failed:
+                    raise
         if trainer.stats.iterations != it0 or trainer.stats.env_steps != steps0:
             raise RuntimeError("baseline eval advanced trainer counters")
         stage_baseline = baseline
         last_eval = ev
         pending_stage_baseline = False
+        global_best_score = floor_global_best_at_entry(global_best_score, ev)
         score = _eval_score(ev)
         if should_write_stage_best(score, stage_best_score, ev):
             stage_best_score = score
@@ -919,12 +1497,60 @@ def main(argv: list[str] | None = None) -> None:
     )
     eval_s = 0.0
     finalize_reason = "done"
+    updates_this_run = 0
 
     try:
         if pending_stage_baseline or (
             resume_plan is not None and resume_plan.need_baseline_eval
         ):
             run_force_stage_baseline()
+        elif (
+            resume_plan is not None
+            and resume_plan.force_stage
+            and stage_baseline
+        ):
+            reused_ev = last_eval if last_eval else dict(
+                stage_baseline.get("eval") or {}
+            )
+            if reused_ev:
+                global_best_score = floor_global_best_at_entry(
+                    global_best_score, reused_ev
+                )
+            persist_stage_entry(
+                reused_ev,
+                mastery={"baseline": True, "passed": False, "reused": True},
+                unlock={
+                    "action": "hold",
+                    "reason": "reused_stage_baseline",
+                    "maps_unlocked": False,
+                },
+                best_kind="stage_entry",
+            )
+            if log_f is not None:
+                log_f.write(
+                    json.dumps(
+                        baseline_event_record(
+                            it=int(trainer.stats.iterations),
+                            env_steps=int(trainer.stats.env_steps),
+                            stage=curriculum.stage.name,
+                            baseline=stage_baseline,
+                            unlock={
+                                "action": "hold",
+                                "reason": "reused_stage_baseline",
+                                "maps_unlocked": False,
+                            },
+                        )
+                    )
+                    + "\n"
+                )
+            pbar.write(
+                f"[eval] reused stage-entry baseline "
+                f"samp_win={float(stage_baseline.get('win_rate') or 0.0):.3f} "
+                f"n={int(stage_baseline.get('episodes') or 0)} "
+                f"it={trainer.stats.iterations} "
+                f"env_steps={trainer.stats.env_steps} "
+                f"(no pre-update holdout)"
+            )
 
         while trainer.stats.env_steps < args.total_steps:
             t0 = time.time()
@@ -937,6 +1563,13 @@ def main(argv: list[str] | None = None) -> None:
                 obs = reinit_envs()
                 continue
             collect_s = time.time() - t0
+            if trainer.elite is not None:
+                flushed = trainer.elite.flush()
+                if flushed is not None:
+                    pbar.write(
+                        f"[elite] wrote {flushed} episodes={trainer.elite.n_episodes} "
+                        f"steps={trainer.elite.n_steps}"
+                    )
 
             for ep in completed:
                 curriculum.record_episode(ep.stage_success)
@@ -972,6 +1605,16 @@ def main(argv: list[str] | None = None) -> None:
             t0 = time.time()
             metrics = trainer.update(buf, obs)
             update_s = time.time() - t0
+            updates_this_run += 1
+            capped = bool(args.max_updates) and updates_this_run >= int(
+                args.max_updates
+            )
+            if capped:
+                finalize_reason = "max_updates"
+                pbar.write(
+                    f"[train] reached --max-updates={args.max_updates}; "
+                    "running due/final holdout then stopping"
+                )
 
             sps = steps_per_iter / max(1e-9, collect_s + update_s)
             trainer.stats.sps = sps
@@ -1025,7 +1668,12 @@ def main(argv: list[str] | None = None) -> None:
                 persist_stage_entry()
                 run_force_stage_baseline()
 
-            if args.eval_every and st.iterations > 0 and st.iterations % args.eval_every == 0:
+            if should_run_holdout_eval(
+                iterations=st.iterations,
+                eval_every=args.eval_every,
+                updates_this_run=updates_this_run,
+                max_updates=args.max_updates,
+            ):
                 suite_meta = curriculum.suite_meta()
                 holdout_n = resolve_holdout_episodes(
                     args.eval_episodes, curriculum.stage.min_eval_episodes
@@ -1276,6 +1924,8 @@ def main(argv: list[str] | None = None) -> None:
                 save_ckpt(run_dir / "latest.pt")
             if st.iterations % 100 == 0:
                 save_ckpt(run_dir / f"it{st.iterations}.pt")
+            if capped:
+                break
     except StageRegressionHalt as exc:
         finalize_reason = "stage_regression"
         if halt_checkpoint_committed:
@@ -1317,6 +1967,13 @@ def main(argv: list[str] | None = None) -> None:
             log_f.close()
         if ep_log_f is not None:
             ep_log_f.close()
+        if getattr(trainer, "elite", None) is not None:
+            flushed = trainer.elite.flush()
+            if flushed is not None:
+                print(
+                    f"[elite] final {flushed} episodes={trainer.elite.n_episodes} "
+                    f"steps={trainer.elite.n_steps}"
+                )
         env.close()
 
     print(f"done. checkpoints in {run_dir}, log {log_path}, episodes {ep_log_path}")

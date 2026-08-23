@@ -1,0 +1,21 @@
+[package]
+name = "ofai-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Schema-v2-compatible OpenFront training simulator foundation"
+license = "MIT"
+publish = false
+
+[dependencies]
+indexmap = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "ofai-sim"
+path = "src/main.rs"
+
+[lib]
+name = "ofai_sim"
+path = "src/lib.rs"

@@ -39,6 +39,62 @@ def normalized_action_entropy(
     return norm, max_out, multi
 
 
+def explore_action_mask(
+    action_mask: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Legal actions that participate in effectiveness-aware entropy."""
+    w = (
+        torch.as_tensor(spaces.ACTION_ENTROPY_WEIGHTS, device=action_mask.device)
+        if weights is None
+        else weights.to(device=action_mask.device)
+    )
+    return (action_mask.to(dtype=w.dtype) * w) > 0
+
+
+def effective_action_entropy(
+    action_logits: torch.Tensor,
+    action_mask: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Entropy of the policy renormalized onto explore-worthy legal actions.
+
+    Always-legal utilities (NOOP, and low-weight boat/build/diplomacy) are
+    dropped from the bonus so diversity among them is not rewarded.
+    Returns (entropy, norm in [0,1], max_ent, multi).
+    """
+    explore = explore_action_mask(action_mask, weights)
+    n = explore.to(dtype=action_logits.dtype).sum(dim=-1)
+    multi = n > 1
+    masked = action_logits + (explore.to(dtype=action_logits.dtype) - 1.0) * NEG
+    empty = n <= 0
+    if bool(empty.any()):
+        masked = torch.where(
+            empty.unsqueeze(-1), torch.zeros_like(masked), masked
+        )
+    ent = torch.distributions.Categorical(logits=masked).entropy()
+    ent = torch.where(empty | ~multi, torch.zeros_like(ent), ent)
+    max_ent = torch.log(torch.clamp(n, min=2.0))
+    norm = torch.where(
+        multi,
+        (ent / max_ent.clamp(min=1e-6)).clamp(0.0, 1.0),
+        torch.ones_like(ent),
+    )
+    max_out = torch.where(multi, max_ent, torch.zeros_like(max_ent))
+    return ent, norm, max_out, multi
+
+
+def masked_categorical_kl(
+    p_logits: torch.Tensor,
+    q_logits: torch.Tensor,
+) -> torch.Tensor:
+    """KL(p || q) for already-masked categorical logits. [B]"""
+    p = torch.distributions.Categorical(logits=p_logits)
+    q = torch.distributions.Categorical(logits=q_logits)
+    # Numerics can yield tiny negatives; KL is not negative.
+    return torch.distributions.kl.kl_divergence(p, q).clamp(min=0.0)
+
+
 class SpatialEncoder(nn.Module):
     def __init__(self, out_dim: int = 256):
         super().__init__()
@@ -318,14 +374,79 @@ class Policy(nn.Module):
         norm, max_ent, multi = normalized_action_entropy(
             action_ent, obs["action_mask"]
         )
+        eff_ent, eff_norm, eff_max, eff_multi = effective_action_entropy(
+            logits["action"], obs["action_mask"]
+        )
         extras = {
             "action_entropy": action_ent,
             "cond_entropy": cond_ent,
             "action_entropy_norm": norm,
             "action_entropy_max": max_ent,
             "action_entropy_multi": multi,
+            "action_entropy_eff": eff_ent,
+            "action_entropy_eff_norm": eff_norm,
+            "action_entropy_eff_max": eff_max,
+            "action_entropy_eff_multi": eff_multi,
         }
         return total_logp, total_ent, logits["value"], extras
+
+    def joint_policy_kl(
+        self,
+        obs: dict[str, torch.Tensor],
+        other: Policy,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Exact mask-aware KL(self || other) over the factorized policy.
+
+        KL = KL(π_a || ρ_a) + Σ_t π_a(t) Σ_{h ∈ H(t)} KL(π_h|t || ρ_h|t)
+        Only active heads under legal masks enter the sum. Inactive-head
+        logits (and all-zero masks turned into safe-all-ones) contribute 0
+        because those heads are skipped.
+        """
+        h, player_emb = self._embed(obs)
+        with torch.no_grad():
+            h_ref, emb_ref = other._embed(obs)
+        action_logits = self._masked_logits(self.head_action(h), obs["action_mask"])
+        with torch.no_grad():
+            action_logits_ref = other._masked_logits(
+                other.head_action(h_ref), obs["action_mask"]
+            )
+        kl_action = masked_categorical_kl(action_logits, action_logits_ref)
+        probs = torch.softmax(action_logits, dim=-1)
+        per_head = {
+            "action": kl_action,
+            "target": torch.zeros_like(kl_action),
+            "region": torch.zeros_like(kl_action),
+            "quantity": torch.zeros_like(kl_action),
+            "unit": torch.zeros_like(kl_action),
+        }
+        legal = obs["action_mask"]
+        for a in range(spaces.NUM_ACTION_TYPES):
+            if not spaces.active_conditional_heads(a):
+                continue
+            type_legal = legal[:, a] > 0
+            if not bool(type_legal.any()):
+                continue
+            a_t = torch.full(
+                (h.shape[0],), a, device=h.device, dtype=torch.long
+            )
+            logits = self._head_logits(h, player_emb, obs, a_t)
+            with torch.no_grad():
+                logits_ref = other._head_logits(h_ref, emb_ref, obs, a_t)
+            active = self._active_masks(a_t)
+            w = probs[:, a]
+            for name in ("target", "region", "quantity", "unit"):
+                m = active[name] & type_legal
+                if not bool(m.any()):
+                    continue
+                kl_h = masked_categorical_kl(logits[name], logits_ref[name])
+                contrib = torch.where(m, w * kl_h, torch.zeros_like(kl_h))
+                per_head[name] = per_head[name] + contrib
+        kl = kl_action
+        for name in ("target", "region", "quantity", "unit"):
+            kl = kl + per_head[name]
+        extras = {f"ref_kl_{k}": v for k, v in per_head.items()}
+        extras["ref_kl"] = kl
+        return kl, extras
 
     def logits(
         self, obs: dict[str, torch.Tensor], actions: torch.Tensor | None = None
