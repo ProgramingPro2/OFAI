@@ -1221,9 +1221,8 @@ def main(argv: list[str] | None = None) -> None:
     print(backend_decision.log_line())
     if backend_decision.backend != "official":
         print(
-            "[env] rust selected only because every remaining stage is "
-            "schema-v2 supported; production stays official when tribe/"
-            "nation AI or later systems are required"
+            "[env] rust selected because every remaining stage is "
+            "schema-v2 supported; agent.eval stays official-core"
         )
     env = ShardedVecEnv(
         num_servers=args.servers,
