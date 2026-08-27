@@ -250,11 +250,12 @@ pub struct Station {
     pub cluster: Option<u32>,
     pub neighbors: Vec<u32>,
     pub rails: Vec<u32>,
+    pub is_trade: bool,
 }
 
 pub struct Cluster {
     pub id: u32,
-    pub stations: HashSet<u32>,
+    pub stations: IndexSet<u32>,
     pub trade: IndexSet<u32>,
 }
 
@@ -267,6 +268,11 @@ pub struct RailNetwork {
     next_rail: u32,
     next_cluster: u32,
     dirty: HashSet<u32>,
+    rail_closed: Vec<u32>,
+    rail_g_stamp: Vec<u32>,
+    rail_g: Vec<u32>,
+    rail_came: Vec<i32>,
+    rail_stamp: u32,
 }
 
 impl RailNetwork {
@@ -280,11 +286,102 @@ impl RailNetwork {
             next_rail: 0,
             next_cluster: 1,
             dirty: HashSet::new(),
+            rail_closed: Vec::new(),
+            rail_g_stamp: Vec::new(),
+            rail_g: Vec::new(),
+            rail_came: Vec::new(),
+            rail_stamp: 0,
         }
     }
 
     pub fn find_by_unit(&self, unit_id: u32) -> Option<u32> {
         self.by_unit.get(&unit_id).copied()
+    }
+
+    fn ensure_rail_scratch(&mut self, n: usize) {
+        if self.rail_closed.len() != n {
+            self.rail_closed = vec![0; n];
+            self.rail_g_stamp = vec![0; n];
+            self.rail_g = vec![0; n];
+            self.rail_came = vec![-1; n];
+            self.rail_stamp = 0;
+        }
+    }
+
+    fn find_rail_path(&mut self, map: &GameMap, mini: &GameMap, from: TileRef, to: TileRef) -> Vec<TileRef> {
+        let Ok(mini_from) = mini.ref_xy(map.x(from) / 2, map.y(from) / 2) else {
+            return Vec::new();
+        };
+        let Ok(mini_to) = mini.ref_xy(map.x(to) / 2, map.y(to) / 2) else {
+            return Vec::new();
+        };
+        let mini_path = self.astar_rail(mini, mini_from, mini_to);
+        if mini_path.is_empty() {
+            return Vec::new();
+        }
+        fix_rail_extremes(upscale_rail_path(mini, map, &mini_path), to, Some(from))
+    }
+
+    fn astar_rail(&mut self, map: &GameMap, from: TileRef, to: TileRef) -> Vec<TileRef> {
+        let w = map.width();
+        let h = map.height();
+        let n = (w * h) as usize;
+        self.ensure_rail_scratch(n);
+        self.rail_stamp = self.rail_stamp.wrapping_add(1);
+        if self.rail_stamp == 0 {
+            self.rail_closed.fill(0);
+            self.rail_g_stamp.fill(0);
+            self.rail_stamp = 1;
+        }
+        let stamp = self.rail_stamp;
+        let max_pri = (HEURISTIC_WEIGHT * (w + h) as i32 * (1 + WATER_PENALTY + DIR_CHANGE)) as usize + 1;
+        let mut q = BucketQueue::new(max_pri);
+        self.rail_g[from as usize] = 0;
+        self.rail_g_stamp[from as usize] = stamp;
+        self.rail_came[from as usize] = -1;
+        q.push(from, rail_h(map, from, to));
+        let mut iters = 500_000i32;
+        let mut nbuf = [0u32; 4];
+        while !q.is_empty() {
+            iters -= 1;
+            if iters <= 0 {
+                return Vec::new();
+            }
+            let current = q.pop();
+            if self.rail_closed[current as usize] == stamp {
+                continue;
+            }
+            self.rail_closed[current as usize] = stamp;
+            if current == to {
+                let mut path = Vec::new();
+                let mut c = current as i32;
+                while c != -1 {
+                    path.push(c as TileRef);
+                    c = self.rail_came[c as usize];
+                }
+                path.reverse();
+                return path;
+            }
+            let current_g = self.rail_g[current as usize];
+            let prev = self.rail_came[current as usize];
+            let from_shore = map.is_shoreline(current);
+            let count = rail_neighbors(map, current, from_shore, &mut nbuf);
+            for i in 0..count {
+                let nb = nbuf[i];
+                if self.rail_closed[nb as usize] == stamp {
+                    continue;
+                }
+                let cost = rail_cost(map, current, nb, if prev == -1 { None } else { Some(prev as TileRef) });
+                let tentative = current_g + cost as u32;
+                if self.rail_g_stamp[nb as usize] != stamp || tentative < self.rail_g[nb as usize] {
+                    self.rail_came[nb as usize] = current as i32;
+                    self.rail_g[nb as usize] = tentative;
+                    self.rail_g_stamp[nb as usize] = stamp;
+                    q.push(nb, tentative as i32 + rail_h(map, nb, to));
+                }
+            }
+        }
+        Vec::new()
     }
 
     pub fn connect_station(
@@ -294,6 +391,7 @@ impl RailNetwork {
         unit_id: u32,
         tile: TileRef,
         nearby: &[(u32, TileRef, i64)],
+        is_trade: bool,
     ) -> u32 {
         let id = self.next_station;
         self.next_station += 1;
@@ -306,6 +404,7 @@ impl RailNetwork {
                 cluster: None,
                 neighbors: Vec::new(),
                 rails: Vec::new(),
+                is_trade,
             },
         );
         self.by_unit.insert(unit_id, id);
@@ -317,7 +416,7 @@ impl RailNetwork {
 
     fn snap_existing(&mut self, map: &GameMap, sid: u32, tile: TileRef) -> bool {
         let rail_ids: Vec<u32> = self.rails.keys().copied().collect();
-        let mut edited = HashSet::new();
+        let mut edited = IndexSet::new();
         for rid in rail_ids {
             let Some(rail) = self.rails.get(&rid).cloned() else {
                 continue;
@@ -356,7 +455,7 @@ impl RailNetwork {
         sid: u32,
         nearby: &[(u32, TileRef, i64)],
     ) {
-        let mut edited = HashSet::new();
+        let mut edited = IndexSet::new();
         let mut sorted = nearby.to_vec();
         sorted.sort_by_key(|x| x.2);
         let min2 = (TRAIN_STATION_MIN_RANGE as i64) * (TRAIN_STATION_MIN_RANGE as i64);
@@ -388,7 +487,7 @@ impl RailNetwork {
                 cid,
                 Cluster {
                     id: cid,
-                    stations: HashSet::new(),
+                    stations: IndexSet::new(),
                     trade: IndexSet::new(),
                 },
             );
@@ -405,7 +504,7 @@ impl RailNetwork {
                 _ => return false,
             }
         };
-        let path = find_rail_path(map, mini, a, b);
+        let path = self.find_rail_path(map, mini, a, b);
         let max = (TRAIN_STATION_MAX_RANGE as f64 * 1.4142) as usize;
         if path.is_empty() || path.len() >= max {
             return false;
@@ -451,11 +550,19 @@ impl RailNetwork {
 
     fn add_to_cluster(&mut self, cid: u32, sid: u32) {
         if let Some(old) = self.stations.get(&sid).and_then(|s| s.cluster) {
-            if old != cid {
-                if let Some(c) = self.clusters.get_mut(&old) {
+            if old == cid {
+                // Official Cluster.addStation → setCluster: if the station is
+                // already in this cluster, removeStation drops it from
+                // stations/tradeStations before reassigning the same cluster.
+                if let Some(c) = self.clusters.get_mut(&cid) {
                     c.stations.remove(&sid);
                     c.trade.remove(&sid);
                 }
+                return;
+            }
+            if let Some(c) = self.clusters.get_mut(&old) {
+                c.stations.remove(&sid);
+                c.trade.remove(&sid);
             }
         }
         if let Some(s) = self.stations.get_mut(&sid) {
@@ -463,27 +570,36 @@ impl RailNetwork {
         }
         if let Some(c) = self.clusters.get_mut(&cid) {
             c.stations.insert(sid);
+            // Official Cluster.addStation inserts City/Port into tradeStations
+            // at the same moment the station joins the cluster.
+            if self.stations.get(&sid).is_some_and(|s| s.is_trade) {
+                c.trade.insert(sid);
+            }
         }
     }
 
-    fn merge_clusters(&mut self, ids: &HashSet<u32>) {
+    fn merge_clusters(&mut self, ids: &IndexSet<u32>) {
         let nid = self.next_cluster;
         self.next_cluster += 1;
-        let mut stations = HashSet::new();
+        // Official mergeClusters walks the dirty set in insertion order, then
+        // each cluster's stations in insertion order, via addStation.
+        let mut ordered = IndexSet::new();
         for cid in ids {
             if let Some(c) = self.clusters.remove(cid) {
-                stations.extend(c.stations);
+                for sid in c.stations {
+                    ordered.insert(sid);
+                }
             }
         }
         self.clusters.insert(
             nid,
             Cluster {
                 id: nid,
-                stations: HashSet::new(),
+                stations: IndexSet::new(),
                 trade: IndexSet::new(),
             },
         );
-        for sid in stations {
+        for sid in ordered {
             self.add_to_cluster(nid, sid);
         }
     }

@@ -152,11 +152,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--backend",
         type=str,
         choices=("official", "rust", "auto"),
-        default="official",
-        help="simulator backend. official=TypeScript core (production default). "
-        "rust only when every remaining stage is schema-v2 and fully supported. "
-        "auto selects rust iff the fail-closed capability check passes, else "
-        "official. Unsupported features never approximate or switch mid-episode.",
+        default="auto",
+        help="simulator backend. auto (default) selects rust iff every remaining "
+        "stage is schema-v2 and fully supported, else official. rust requests "
+        "the same fail-closed check. official always uses the TypeScript core. "
+        "Unsupported features never approximate or switch mid-episode. "
+        "agent.eval stays official-core regardless of this flag.",
     )
     p.add_argument("--port", type=int, default=8765, help="base port (servers use port+i)")
     p.add_argument("--connect", action="store_true", help="connect to already-running servers")

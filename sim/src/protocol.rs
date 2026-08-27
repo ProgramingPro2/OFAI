@@ -5,6 +5,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use crate::actions::ActionVec;
 use crate::capabilities::Capabilities;
 use crate::env::AgentEnv;
@@ -66,11 +68,21 @@ impl Tensor {
     }
     fn bytes(&self) -> Vec<u8> {
         match self {
-            Self::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::F32(v) => as_le_bytes_f32(v).to_vec(),
             Self::U8(v) => v.clone(),
-            Self::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::I32(v) => as_le_bytes_i32(v).to_vec(),
         }
     }
+}
+
+fn as_le_bytes_f32(v: &[f32]) -> &[u8] {
+    debug_assert!(cfg!(target_endian = "little"));
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
+
+fn as_le_bytes_i32(v: &[i32]) -> &[u8] {
+    debug_assert!(cfg!(target_endian = "little"));
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
 pub struct Frame {
@@ -108,7 +120,7 @@ pub fn decode_frame(payload: &[u8]) -> Result<Frame, String> {
     Ok(Frame { header, tensors })
 }
 
-fn obs_tensors(batch: &[ObsBuffers]) -> Vec<(&'static str, Tensor)> {
+fn encode_obs_to_tensors(batch: &[&ObsBuffers]) -> Vec<(&'static str, Tensor)> {
     let k = batch.len();
     let plane = SPATIAL_CHANNELS * SPATIAL_SIZE * SPATIAL_SIZE;
     let mut spatial = vec![0f32; k * plane];
@@ -152,16 +164,29 @@ fn obs_tensors(batch: &[ObsBuffers]) -> Vec<(&'static str, Tensor)> {
     ]
 }
 
+fn encode_envs(header: serde_json::Value, envs: &[AgentEnv]) -> Vec<u8> {
+    let refs: Vec<&ObsBuffers> = envs.iter().map(|e| e.peek_obs()).collect();
+    encode_frame(header, &encode_obs_to_tensors(&refs))
+}
+
 pub struct Server {
     envs: Vec<AgentEnv>,
     terrain: TerrainCache,
+    workers: usize,
 }
 
 impl Server {
-    pub fn new(maps_dir: std::path::PathBuf) -> Self {
+    pub fn new(maps_dir: std::path::PathBuf, workers: usize) -> Self {
+        let workers = workers.max(1);
+        if workers > 1 {
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build_global();
+        }
         Self {
             envs: Vec::new(),
             terrain: TerrainCache::new(maps_dir),
+            workers,
         }
     }
 
@@ -198,21 +223,37 @@ impl Server {
             .and_then(|e| e.as_array())
             .ok_or_else(|| "init missing envs".to_string())?;
         self.envs.clear();
-        for c in configs {
-            let cfg = EnvConfig::from_json(c)?;
-            self.envs
-                .push(AgentEnv::create(cfg, &mut self.terrain)?);
+        let parsed: Vec<EnvConfig> = configs
+            .iter()
+            .map(EnvConfig::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(first) = parsed.first() {
+            let _ = self.terrain.fresh_terrain(&first.map, first.map_size);
         }
-        let obs: Vec<_> = self.envs.iter().map(|e| e.peek_obs().clone()).collect();
-        Ok(encode_frame(
+        if self.workers > 1 && parsed.len() > 1 {
+            let terrains: Vec<TerrainCache> =
+                (0..parsed.len()).map(|_| self.terrain.clone()).collect();
+            self.envs = parsed
+                .into_par_iter()
+                .zip(terrains.into_par_iter())
+                .map(|(cfg, mut terrain)| AgentEnv::create(cfg, &mut terrain))
+                .collect::<Result<Vec<_>, _>>()?;
+        } else {
+            for cfg in parsed {
+                self.envs
+                    .push(AgentEnv::create(cfg, &mut self.terrain)?);
+            }
+        }
+        Ok(encode_envs(
             serde_json::json!({
                 "type": "inited",
                 "k": self.envs.len(),
                 "backend": "rust",
+                "workers": self.workers,
                 "capabilities": Capabilities::foundation(),
                 "fallback": "official",
             }),
-            &obs_tensors(&obs),
+            &self.envs,
         ))
     }
 
@@ -225,59 +266,75 @@ impl Server {
         if actions.1.len() < k * 20 {
             return Err("actions blob too short".into());
         }
-        let mut rewards = Vec::new();
-        let mut dones = Vec::new();
-        let mut infos = Vec::new();
-        let mut obs_list = Vec::new();
-        let mut profile = serde_json::json!({
-            "simMs": 0.0, "maskObsMs": 0.0, "serializeMs": 0.0, "resetMs": 0.0, "resets": 0.0
-        });
-        for i in 0..k {
-            let off = i * 20;
-            let action = ActionVec {
-                action_type: i32::from_le_bytes(actions.1[off..off + 4].try_into().unwrap()),
-                target: i32::from_le_bytes(actions.1[off + 4..off + 8].try_into().unwrap()),
-                region: i32::from_le_bytes(actions.1[off + 8..off + 12].try_into().unwrap()),
-                quantity: i32::from_le_bytes(actions.1[off + 12..off + 16].try_into().unwrap()),
-                unit: i32::from_le_bytes(actions.1[off + 16..off + 20].try_into().unwrap()),
+        let parsed: Vec<ActionVec> = (0..k)
+            .map(|i| {
+                let off = i * 20;
+                ActionVec {
+                    action_type: i32::from_le_bytes(actions.1[off..off + 4].try_into().unwrap()),
+                    target: i32::from_le_bytes(actions.1[off + 4..off + 8].try_into().unwrap()),
+                    region: i32::from_le_bytes(actions.1[off + 8..off + 12].try_into().unwrap()),
+                    quantity: i32::from_le_bytes(actions.1[off + 12..off + 16].try_into().unwrap()),
+                    unit: i32::from_le_bytes(actions.1[off + 16..off + 20].try_into().unwrap()),
+                }
+            })
+            .collect();
+        let next_all = frame.header.get("nextConfigs").and_then(|a| a.as_array());
+        let results: Vec<(f64, bool, crate::env::StepInfo)> =
+            if self.workers > 1 && k > 1 {
+                self.envs
+                    .par_iter_mut()
+                    .zip(parsed.into_par_iter())
+                    .map(|(env, action)| env.step_apply(action))
+                    .collect()
+            } else {
+                self.envs
+                    .iter_mut()
+                    .zip(parsed.into_iter())
+                    .map(|(env, action)| env.step_apply(action))
+                    .collect()
             };
-            let t0 = Instant::now();
-            let result = self.envs[i].step(action);
-            let sim_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            profile["simMs"] = serde_json::json!(profile["simMs"].as_f64().unwrap_or(0.0) + sim_ms);
-            rewards.push(result.reward);
-            dones.push(if result.done { 1 } else { 0 });
-            infos.push(info_json(&result.info));
-            if result.done {
+        let mut rewards = Vec::with_capacity(k);
+        let mut dones = Vec::with_capacity(k);
+        let mut infos = Vec::with_capacity(k);
+        let mut sim_ms = 0.0;
+        let mut mask_obs_ms = 0.0;
+        let mut reset_ms = 0.0;
+        let mut resets = 0.0;
+        for (i, (reward, done, info)) in results.into_iter().enumerate() {
+            sim_ms += self.envs[i].last_sim_ms;
+            mask_obs_ms += self.envs[i].last_mask_obs_ms;
+            rewards.push(reward);
+            dones.push(if done { 1 } else { 0 });
+            infos.push(info_json(&info));
+            if done {
                 let t_reset = Instant::now();
-                let next = frame
-                    .header
-                    .get("nextConfigs")
-                    .and_then(|a| a.as_array())
-                    .and_then(|a| a.get(i));
+                let next = next_all.and_then(|a| a.get(i));
                 let (spec, fallback) = resolve_auto_reset(next, &self.envs[i]);
                 if fallback {
                     self.envs[i].reset_count += 1;
                 }
-                self.envs[i].reset(&mut self.terrain, spec.as_ref())?;
-                profile["resetMs"] =
-                    serde_json::json!(profile["resetMs"].as_f64().unwrap_or(0.0) + t_reset.elapsed().as_secs_f64() * 1000.0);
-                profile["resets"] = serde_json::json!(profile["resets"].as_f64().unwrap_or(0.0) + 1.0);
-                obs_list.push(self.envs[i].peek_obs().clone());
-            } else {
-                obs_list.push(result.obs);
+                self.envs[i].reset_local(spec.as_ref())?;
+                reset_ms += t_reset.elapsed().as_secs_f64() * 1000.0;
+                resets += 1.0;
             }
         }
         let t_ser = Instant::now();
-        let tensors = obs_tensors(&obs_list);
-        profile["serializeMs"] = serde_json::json!(t_ser.elapsed().as_secs_f64() * 1000.0);
+        let refs: Vec<&ObsBuffers> = self.envs.iter().map(|e| e.peek_obs()).collect();
+        let tensors = encode_obs_to_tensors(&refs);
+        let serialize_ms = t_ser.elapsed().as_secs_f64() * 1000.0;
         Ok(encode_frame(
             serde_json::json!({
                 "type": "step",
                 "rewards": rewards,
                 "dones": dones,
                 "infos": infos,
-                "profile": profile,
+                "profile": {
+                    "simMs": sim_ms,
+                    "maskObsMs": mask_obs_ms,
+                    "serializeMs": serialize_ms,
+                    "resetMs": reset_ms,
+                    "resets": resets,
+                },
             }),
             &tensors,
         ))
@@ -301,9 +358,10 @@ impl Server {
                 .map(|s| serde_json::Value::String(s.to_string()))
         });
         env.reset(&mut self.terrain, patch.as_ref())?;
+        let obs = env.peek_obs();
         Ok(encode_frame(
             serde_json::json!({"type":"reset","index": index}),
-            &obs_tensors(&[env.peek_obs().clone()]),
+            &encode_obs_to_tensors(&[obs]),
         ))
     }
 
@@ -396,13 +454,14 @@ fn info_json(info: &crate::env::StepInfo) -> serde_json::Value {
     v
 }
 
-pub fn serve(port: u16, maps_dir: std::path::PathBuf) -> Result<(), String> {
+pub fn serve(port: u16, maps_dir: std::path::PathBuf, workers: usize) -> Result<(), String> {
     let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
-    eprintln!("[ofai-sim] listening on port {port}");
+    eprintln!("[ofai-sim] listening on port {port} workers={workers}");
     println!("ENV_SERVER_READY port={port}");
-    let mut server = Server::new(maps_dir);
+    let mut server = Server::new(maps_dir, workers);
     for stream in listener.incoming() {
         let mut stream = stream.map_err(|e| e.to_string())?;
+        stream.set_nodelay(true).ok();
         eprintln!("[ofai-sim] client connected");
         if let Err(e) = handle_client(&mut server, &mut stream) {
             eprintln!("[ofai-sim] client error: {e}");

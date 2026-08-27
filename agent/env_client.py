@@ -135,6 +135,21 @@ def detect_mem_available_gb() -> float | None:
     return None
 
 
+# Concurrent Turbofan compilation on Node 22 hit a fatal
+# RepresentationChangerError (FrameState kMachNone -> kRepTagged) on the
+# official EnvServer. NODE_OPTIONS rejects this V8 flag; tsx's re-exec
+# also drops it. Spawn the inner node + tsx loader directly.
+NODE_NO_CONCURRENT_RECOMPILATION = "--no-concurrent-recompilation"
+NODE_REPORT_ON_FATALERROR = "--report-on-fatalerror"
+
+
+def _tsx_loader_args() -> tuple[str, str]:
+    """preflight path and file:// loader URI for the tsx register hooks."""
+    dist = REPO_ROOT / "node_modules" / "tsx" / "dist"
+    loader = dist / "loader.mjs"
+    return str(dist / "preflight.cjs"), loader.resolve().as_uri()
+
+
 def env_server_cmd(
     port: int,
     workers: int = 0,
@@ -143,16 +158,53 @@ def env_server_cmd(
     """EnvServer argv. Official always passes --workers. Rust is the
     schema-v2 mirror and is only spawned after fail-closed selection."""
     if str(backend).strip().lower() == BACKEND_RUST:
-        return rust_sim_cmd(port)
+        return rust_sim_cmd(port, workers)
+    preflight, loader = _tsx_loader_args()
     return [
-        "npx",
-        "tsx",
+        "node",
+        NODE_NO_CONCURRENT_RECOMPILATION,
+        NODE_REPORT_ON_FATALERROR,
+        f"--require={preflight}",
+        f"--import={loader}",
         "ofai/env/EnvServer.ts",
         "--port",
         str(int(port)),
         "--workers",
         str(max(0, int(workers))),
     ]
+
+
+def _describe_shard_failure(
+    index: int,
+    exc: BaseException | None,
+    server: object | None,
+) -> str:
+    """One-line restart cause: exception type plus whether Node is still up."""
+    alive = False
+    rc = None
+    if server is not None:
+        alive_fn = getattr(server, "alive", None)
+        if callable(alive_fn):
+            try:
+                alive = bool(alive_fn())
+            except Exception:
+                alive = False
+        proc = getattr(server, "proc", None)
+        poll = getattr(proc, "poll", None)
+        if callable(poll):
+            try:
+                rc = poll()
+            except Exception:
+                rc = None
+    if exc is None:
+        return (
+            f"[env] shard {index} process-dead "
+            f"alive={str(alive).lower()} rc={rc}"
+        )
+    return (
+        f"[env] shard {index} {type(exc).__name__}: {exc} "
+        f"alive={str(alive).lower()} rc={rc}"
+    )
 
 
 def _parse_env_workers(raw: str | None) -> int | None:
@@ -443,6 +495,19 @@ class EnvServerProcess:
                 f"env server on {port} exited early; see {self.log_path}"
             )
 
+    def rss_mb(self) -> float:
+        pid = getattr(self.proc, "pid", None)
+        if not pid:
+            return 0.0
+        try:
+            with open(f"/proc/{int(pid)}/status", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024.0
+        except (OSError, ValueError, IndexError):
+            return 0.0
+        return 0.0
+
     def _drain_stdout(self) -> None:
         assert self.proc.stdout is not None
         try:
@@ -693,6 +758,7 @@ class ShardedVecEnv:
         connect: bool = False,
         workers: int = 0,
         backend: str = BACKEND_OFFICIAL,
+        timeout_s: float = 180.0,
     ):
         self.envs_per_server = envs_per_server
         self.k = num_servers * envs_per_server
@@ -700,15 +766,23 @@ class ShardedVecEnv:
         self.connect = connect
         self.workers = max(0, int(workers))
         self.sim_backend = str(backend).strip().lower() or BACKEND_OFFICIAL
+        self.timeout_s = float(timeout_s)
         self.backend: str | None = None
         self.reported_workers: int | None = None
         self.servers: list[EnvServerProcess] = []
         if not connect:
             self.servers = [
-                EnvServerProcess(p, workers=self.workers, backend=self.sim_backend)
+                EnvServerProcess(
+                    p,
+                    workers=self.workers,
+                    backend=self.sim_backend,
+                    timeout_s=timeout_s,
+                )
                 for p in self.ports
             ]
-        self.clients = [VecEnv("127.0.0.1", p) for p in self.ports]
+        self.clients = [
+            VecEnv("127.0.0.1", p, timeout_s=timeout_s) for p in self.ports
+        ]
         self.pool = ThreadPoolExecutor(max_workers=num_servers)
         self._configs: list[dict] = []
         self._obs_buf: dict[str, np.ndarray] | None = None
@@ -719,6 +793,9 @@ class ShardedVecEnv:
         self._active_n = 0
         self._next_config_fn: Callable[[int], dict] | None = None
         self._on_episode_reset: Callable[[int, dict], None] | None = None
+
+    def rss_mb(self) -> float:
+        return sum(s.rss_mb() for s in self.servers)
 
     def backend_summary(self) -> str:
         return (
@@ -887,10 +964,13 @@ class ShardedVecEnv:
         if self.connect:
             raise errors[0][1]
         failed = [i for i, _ in errors]
+        by_exc = {i: exc for i, exc in errors}
         for i, s in enumerate(self.servers):
             if not s.alive() and i not in failed:
                 failed.append(i)
         for i in failed:
+            server = self.servers[i] if i < len(self.servers) else None
+            print(_describe_shard_failure(i, by_exc.get(i), server))
             self._restart_shard(i)
         raise RolloutInterrupted(failed, failed_lanes=self._lanes_for_shards(failed))
 
@@ -907,8 +987,13 @@ class ShardedVecEnv:
                 port,
                 workers=int(getattr(self, "workers", 0) or 0),
                 backend=str(getattr(self, "sim_backend", BACKEND_OFFICIAL)),
+                timeout_s=float(getattr(self, "timeout_s", 180.0)),
             )
-        self.clients[i] = VecEnv("127.0.0.1", port)
+        self.clients[i] = VecEnv(
+            "127.0.0.1",
+            port,
+            timeout_s=float(getattr(self, "timeout_s", 180.0)),
+        )
         eps = self.envs_per_server
         # Current per-env configs (updated on each done), not the original init.
         self.clients[i].init(self._configs[i * eps : (i + 1) * eps])

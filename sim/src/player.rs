@@ -72,6 +72,8 @@ pub struct Player {
     pub disconnected: bool,
     pub in_doomsday: bool,
     pub doomsday_ticks: u32,
+    /// Official `Player.largestClusterBoundingBox` after cluster calc.
+    pub largest_cluster_box: Option<(u32, u32, u32, u32)>,
 }
 
 impl Player {
@@ -101,6 +103,7 @@ impl Player {
             disconnected: false,
             in_doomsday: false,
             doomsday_ticks: 0,
+            largest_cluster_box: None,
         }
     }
 

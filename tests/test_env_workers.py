@@ -22,9 +22,11 @@ from agent import spaces
 from agent.env_client import (
     AUTO_ENV_WORKERS,
     MAX_ENV_WORKERS,
+    NODE_NO_CONCURRENT_RECOMPILATION,
     EnvServerProcess,
     ShardedVecEnv,
     VecEnv,
+    _describe_shard_failure,
     env_server_cmd,
     resolve_env_workers,
 )
@@ -161,16 +163,52 @@ def test_resolve_sequential_requests():
 
 
 def test_env_server_cmd_always_passes_workers():
-    assert env_server_cmd(8765, 4) == [
-        "npx",
-        "tsx",
-        "ofai/env/EnvServer.ts",
-        "--port",
-        "8765",
-        "--workers",
-        "4",
-    ]
+    cmd = env_server_cmd(8765, 4)
+    assert cmd[0] == "node"
+    assert NODE_NO_CONCURRENT_RECOMPILATION in cmd
+    assert "--port" in cmd and cmd[cmd.index("--port") + 1] == "8765"
+    assert "--workers" in cmd and cmd[cmd.index("--workers") + 1] == "4"
     assert env_server_cmd(9000, 0)[-1] == "0"
+
+
+def test_env_server_cmd_bypasses_tsx_reexec_for_v8_flag():
+    """npx/tsx re-exec drops --no-concurrent-recompilation; NODE_OPTIONS rejects it."""
+    cmd = env_server_cmd(8820, 2)
+    assert "npx" not in cmd
+    assert cmd[cmd.index("--workers") + 1] == "2"
+    require = next(a for a in cmd if a.startswith("--require="))
+    imported = next(a for a in cmd if a.startswith("--import="))
+    assert require.endswith("preflight.cjs")
+    assert "loader.mjs" in imported
+
+
+def test_describe_shard_failure_classifies_timeout_vs_crash():
+    class Alive:
+        def alive(self):
+            return True
+
+        class proc:
+            @staticmethod
+            def poll():
+                return None
+
+    class Dead:
+        def alive(self):
+            return False
+
+        class proc:
+            @staticmethod
+            def poll():
+                return -6
+
+    timeout = _describe_shard_failure(4, TimeoutError("timed out"), Alive())
+    assert "TimeoutError" in timeout
+    assert "alive=true" in timeout
+    assert "rc=None" in timeout
+    crash = _describe_shard_failure(7, ConnectionError("closed"), Dead())
+    assert "ConnectionError" in crash
+    assert "alive=false" in crash
+    assert "rc=-6" in crash
 
 
 def test_sharded_spawns_and_restarts_with_workers(monkeypatch):
@@ -190,9 +228,10 @@ def test_sharded_spawns_and_restarts_with_workers(monkeypatch):
             return True
 
     class FakeClient:
-        def __init__(self, host, port):
+        def __init__(self, host, port, timeout_s=120.0):
             self.host = host
             self.port = port
+            self.timeout_s = timeout_s
             self.backend = None
             self.workers = None
 
@@ -277,6 +316,8 @@ def test_dry_run_logs_resolved_workers(capsys):
             "8",
             "--workers",
             "4",
+            "--backend",
+            "official",
             "--device",
             "cpu",
         ]

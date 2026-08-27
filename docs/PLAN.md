@@ -17,16 +17,16 @@ private matches.
 |  (src/core oracle) |                                 |  PPO + GAE           |
 +--------------------+                                 |  Curriculum          |
 |  Rust mirror sim/  |  fail-closed fallback=official  |                      |
-|  (supported caps   |  never mid-episode switch       |                      |
-|   only; boats no)  |                                 |                      |
+|  (boats/nations/   |  never mid-episode switch       |                      |
+|   later systems)   |  eval stays official TS         |                      |
 +--------------------+                                 +----------------------+
 ```
 
 - The official game core (`src/core`) runs natively in Node; no browser, no
   public multiplayer. Parallel actors own complete games; sequential is
-  the oracle. The Rust package speaks the same init/step/reset contract
-  but is not enabled for any stage that requires an unsupported
-  capability (boats / nukes / rails / doomsday).
+  the oracle. Training `--backend auto` (default) uses the Rust package
+  when every remaining stage is schema-v2 supported; otherwise it stays
+  official. `python -m agent.eval` is always the official core.
 - The agent is a Human player in a Singleplayer FFA game; opponents are
   Nations (difficulty-scaled AI) and Tribes (filler bots) that live inside
   the sim.
@@ -359,17 +359,24 @@ checkpoints/, logs/     training artifacts
 ## How to run
 
 ```bash
-.venv/bin/python -m agent.train --servers 8 --envs 8 --workers 2 \
-    --backend official --rollout-len 128 --run-name run1 \
+.venv/bin/python -m agent.train --servers 8 --envs 8 --workers 4 \
+    --backend auto --rollout-len 128 --run-name run1 \
     --eval-every 25 --total-steps 12000000
 
 .venv/bin/python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 50 \
-    --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
+    --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30 --workers 2
+.venv/bin/python -m agent.eval --ckpt checkpoints/run1/best.pt \
+    --stage nations-impossible-world --suite holdout \
+    --sampled-episodes 64 --det-episodes 8 --workers 2 --json-out eval-holdout.json
+.venv/bin/python -m agent.eval --ckpt checkpoints/run1/best.pt \
+    --stage nations-impossible-world --suite ood \
+    --sampled-episodes 16 --det-episodes 0 --workers 2 --json-out eval-ood.json
 .venv/bin/python -m agent.eval --scripted expander --episodes 20 \
     --map Halkidiki --map-size Compact --bots 1 --max-ticks 8000
 
 .venv/bin/python -m pytest tests/test_rl_pipeline.py tests/test_baseline_gates.py \
-    tests/test_backend_select.py tests/test_eval_scheduler.py -q
+    tests/test_backend_select.py tests/test_eval_scheduler.py \
+    tests/test_eval_harness.py tests/test_curriculum_generalization.py -q
 .venv/bin/python tests/test_env_client.py   # needs live EnvServer
 .venv/bin/python tests/profile_pipeline.py --baseline --quick
 .venv/bin/python tests/profile_pipeline.py --stage duel --layouts 8x8 --workers 2
@@ -406,20 +413,21 @@ the gate and keeps an optimized backend disabled.
 
 ## Simulator backends and fallback
 
-`agent/backend.py` is fail-closed. `--backend official` is the production
-default. `auto`/`rust` query the Rust capability document and the union
-of remaining curriculum stages. If boats, nukes, rails, doomsday, an
-unknown capability, a non-v2 schema, or a missing runtime is required,
-the selector returns official **before** `ShardedVecEnv` creates
-episodes. A Rust farm that later sees an unsupported `nextConfig` raises
-rather than approximating or switching mid-episode.
+`agent/backend.py` is fail-closed. `--backend auto` (train default)
+queries the Rust capability document and the union of remaining
+curriculum stages. If an unknown capability, a non-v2 schema, or a
+missing runtime is required, the selector returns official **before**
+`ShardedVecEnv` creates episodes. A Rust farm that later sees an
+unsupported `nextConfig` raises rather than approximating or switching
+mid-episode. `--backend official` always uses the TypeScript core.
+Standalone `agent.eval` is official-only.
 
 Implemented official parity: sequential and parallel TypeScript actors
 are byte-equal on goldens and randomized traces (obs, masks, rewards,
-digests, terminals). Rust parity is implemented for spawn / wilderness /
-player land combat / structures / diplomacy / AI roster setup and
-terminals; boat execution fail-closes to official (HPA water path).
-Training therefore stays on the official optimized backend.
+digests, terminals). Rust parity covers spawn / wilderness / player
+land combat / boats / structures / diplomacy / tribe and nation AI /
+rails / nukes / doomsday terminals when the capability document marks
+those slices supported.
 
 Worker topology is chosen by quality-to-wall-clock, not raw SPS. On a
 32-core host the measured overnight pick is **8 servers × 8 envs × 2
@@ -440,4 +448,3 @@ checkpoint.
 - Async/pipelined collection; self-play league.
 - Live bridge (gated, explicit user confirmation; ToS-aware private lobbies).
 - Emoji taunts (flavor).
-- Rust boat/HPA parity sufficient to enable rust for a curriculum stage.

@@ -44,6 +44,12 @@ pub struct NationLater {
     pub hydro_perceived: Option<i64>,
     pub recent_nukes: Vec<(u32, TileRef, UnitType)>,
     pub last_emoji_sent: HashMap<String, u32>,
+    /// Official `NationExecution.embargoMalusApplied`.
+    pub embargo_malus_applied: HashSet<String>,
+    /// Official `NationEmojiBehavior.gameOver`.
+    pub emoji_game_over: bool,
+    /// Official `Player.outgoingEmojis_` last-send tick per recipient id (`*` = all).
+    pub outgoing_emoji_at: HashMap<String, u32>,
 }
 
 impl Game {

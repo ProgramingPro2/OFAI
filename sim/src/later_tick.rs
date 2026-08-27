@@ -21,7 +21,7 @@ pub fn tick_later(game: &mut Game, idx: usize, ticks: u32) {
     let _ = game.swap_later(idx, exec);
 }
 
-fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
+pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
     match exec {
         LaterExec::Port {
             mut active,
@@ -183,10 +183,8 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
                         unit_id,
                         u.tile,
                         &nearby,
+                        is_trade_type(u.ty),
                     );
-                    if is_trade_type(u.ty) {
-                        game.later.rail.mark_trade(sid, true);
-                    }
                     station_id = Some(sid);
                 }
             }
@@ -223,7 +221,9 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
         } => {
             if active && inited {
                 if let Some(eid) = engine {
-                    if !game.units().iter().any(|u| u.id == eid && u.active) {
+                    if !game.units().iter().any(|u| u.id == eid && u.active)
+                        || !train_source_or_dest_active(game, &stations)
+                    {
                         delete_train(game, engine, &cars);
                         active = false;
                     } else if let Some(next) = train_next_tile(
@@ -551,8 +551,13 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
                     match p.increment(speed as f64) {
                         None => {
                             game.move_unit(id, dst);
-                            detonate(game, id, ty, dst);
-                            active = false;
+                            // Official NukeExecution: if a SAM missile targeting this
+                            // nuke is within defaultSamMissileSpeed of the dest, skip
+                            // detonation so the SAM remains the source of truth.
+                            if !sam_missile_blocks_detonate(game, id, dst, &owner) {
+                                detonate(game, id, ty, dst);
+                                active = false;
+                            }
                         }
                         Some((x, y)) => {
                             if let Ok(tile) = game.map.ref_xy(x.floor() as u32, y.floor() as u32) {
@@ -743,7 +748,23 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
             if !sam.active {
                 active = false;
             } else if !sam.under_construction {
-                let cooling = sam.missile_queue.len() >= sam.level as usize;
+                // Official SAMLauncherExecution reloads before targeting so a
+                // cooldown that expires this tick can fire immediately.
+                if let Some(&front) = sam.missile_queue.first() {
+                    if SAM_COOLDOWN.saturating_sub(ticks.saturating_sub(front)) == 0 {
+                        if let Some(s) = game.units_mut().iter_mut().find(|u| u.id == unit_id) {
+                            if !s.missile_queue.is_empty() {
+                                s.missile_queue.remove(0);
+                            }
+                        }
+                    }
+                }
+                let cooling = game
+                    .units()
+                    .iter()
+                    .find(|u| u.id == unit_id)
+                    .map(|s| s.missile_queue.len() >= s.level as usize)
+                    .unwrap_or(true);
                 if !cooling {
                     let targets = sam_valid_targets(game, &sam, ticks);
                     for (nid, tile) in targets {
@@ -771,17 +792,12 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
                             target: nid,
                             dst: tile,
                             last_move: ticks,
+                            air_seed: 0,
+                            air_path: None,
+                            air_index: 0,
+                            air_last_to: None,
                             inited: false,
                         });
-                    }
-                }
-                if let Some(&front) = sam.missile_queue.first() {
-                    if SAM_COOLDOWN.saturating_sub(ticks.saturating_sub(front)) == 0 {
-                        if let Some(s) = game.units_mut().iter_mut().find(|u| u.id == unit_id) {
-                            if !s.missile_queue.is_empty() {
-                                s.missile_queue.remove(0);
-                            }
-                        }
                     }
                 }
             }
@@ -802,10 +818,15 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
             target,
             dst,
             last_move,
+            mut air_seed,
+            mut air_path,
+            mut air_index,
+            mut air_last_to,
             mut inited,
         } => {
             if !inited {
                 inited = true;
+                air_seed = ticks as i32;
                 if let Some(stile) = game.units().iter().find(|u| u.id == sam).map(|u| u.tile) {
                     if let Some(id) = game.build_unit(&owner, UnitType::SamMissile, stile, 0.0) {
                         if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
@@ -820,21 +841,68 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
                 }
             }
             if let Some(id) = unit_id {
-                let tgt_alive = game.units().iter().any(|u| u.id == target && u.active);
-                if !tgt_alive {
-                    game.delete_unit(id);
+                let missile_ok = game.units().iter().any(|u| u.id == id && u.active);
+                if !missile_ok {
                     active = false;
                 } else {
-                    let cur = game.units().iter().find(|u| u.id == id).map(|u| u.tile).unwrap();
-                    // Official SAMMissileExecution flies to the precomputed intercept tile,
-                    // not the nuke's current position.
-                    let next = step_air(game, cur, dst, DEFAULT_SAM_MISSILE_SPEED);
-                    if let Some(n) = next {
-                        game.move_unit(id, n);
-                        if n == dst {
-                            game.delete_unit(target);
-                            game.delete_unit(id);
-                            active = false;
+                    let tgt = game.units().iter().find(|u| u.id == target).cloned();
+                    let sam_ok = game.units().iter().any(|u| u.id == sam && u.active);
+                    let tgt_ok = tgt.as_ref().map(|t| t.active).unwrap_or(false);
+                    let same_owner = tgt.as_ref().map(|t| t.owner_id == owner).unwrap_or(false);
+                    let ty_ok = tgt.as_ref().map(|t| {
+                        matches!(
+                            t.ty,
+                            UnitType::AtomBomb | UnitType::HydrogenBomb | UnitType::MirvWarhead
+                        )
+                    }).unwrap_or(false);
+                    if !tgt_ok || !sam_ok || same_owner || !ty_ok {
+                        if tgt_ok {
+                            if let Some(n) = game.units_mut().iter_mut().find(|u| u.id == target) {
+                                n.targeted_by_sam = false;
+                            }
+                        }
+                        game.delete_unit(id);
+                        active = false;
+                    } else {
+                        // Official SAMMissileExecution uses PathFinding.Air and
+                        // intercepts on PathStatus.COMPLETE, not on arriving at dst.
+                        for _ in 0..DEFAULT_SAM_MISSILE_SPEED {
+                            let cur = game
+                                .units()
+                                .iter()
+                                .find(|u| u.id == id)
+                                .map(|u| u.tile)
+                                .unwrap();
+                            let (st, node) = air_stepper_next(
+                                game,
+                                cur,
+                                dst,
+                                air_seed,
+                                &mut air_path,
+                                &mut air_index,
+                                &mut air_last_to,
+                            );
+                            match st {
+                                PathStatus::Complete => {
+                                    game.delete_unit_by(target, Some(owner.as_str()));
+                                    game.delete_unit(id);
+                                    active = false;
+                                    break;
+                                }
+                                PathStatus::Next => {
+                                    if let Some(n) = node {
+                                        game.move_unit(id, n);
+                                    }
+                                }
+                                PathStatus::NotFound => {
+                                    game.delete_unit(id);
+                                    active = false;
+                                    break;
+                                }
+                            }
+                            if !active {
+                                break;
+                            }
                         }
                     }
                 }
@@ -847,6 +915,10 @@ fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExec {
                 target,
                 dst,
                 last_move,
+                air_seed,
+                air_path,
+                air_index,
+                air_last_to,
                 inited,
             }
         }
@@ -1367,6 +1439,11 @@ fn train_next_tile(
     if stations.len() < 2 || tiles.is_empty() {
         return None;
     }
+    // Official TrainExecution.getNextTile: abort when the next station
+    // cannot trade with the train owner (embargo after spawn).
+    if !train_can_trade_dest(game, owner, stations) {
+        return None;
+    }
     let speed = 2i32;
     save_train_tiles(tiles, used, *current, speed, n_cars);
     *current += speed;
@@ -1405,6 +1482,34 @@ fn train_next_tile(
         return None;
     }
     tiles.get(*current as usize).copied()
+}
+
+fn station_unit_active(game: &Game, sid: u32) -> bool {
+    game.later
+        .rail
+        .stations
+        .get(&sid)
+        .and_then(|st| game.units().iter().find(|u| u.id == st.unit_id && u.active))
+        .is_some()
+}
+
+fn train_source_or_dest_active(game: &Game, stations: &[u32]) -> bool {
+    stations.len() > 1
+        && station_unit_active(game, stations[0])
+        && station_unit_active(game, stations[1])
+}
+
+fn train_can_trade_dest(game: &Game, owner: &str, stations: &[u32]) -> bool {
+    if stations.len() < 2 {
+        return false;
+    }
+    let Some(st) = game.later.rail.stations.get(&stations[1]) else {
+        return false;
+    };
+    let Some(u) = game.units().iter().find(|x| x.id == st.unit_id) else {
+        return false;
+    };
+    u.owner_id == owner || game.can_trade(&u.owner_id, owner)
 }
 
 fn save_train_tiles(
@@ -2194,25 +2299,24 @@ fn drop_mirv_warheads(
     }
 }
 
-fn step_air(game: &Game, from: TileRef, to: TileRef, speed: u32) -> Option<TileRef> {
-    let mut x = game.map.x(from) as i32;
-    let mut y = game.map.y(from) as i32;
-    let tx = game.map.x(to) as i32;
-    let ty = game.map.y(to) as i32;
-    for _ in 0..speed {
-        if x == tx && y == ty {
-            break;
+fn sam_missile_blocks_detonate(
+    game: &Game,
+    nuke_id: u32,
+    dst: TileRef,
+    nuke_owner: &str,
+) -> bool {
+    let r2 = (DEFAULT_SAM_MISSILE_SPEED as i64) * (DEFAULT_SAM_MISSILE_SPEED as i64);
+    game.units().iter().any(|u| {
+        if !u.active || u.ty != UnitType::SamMissile || u.owner_id == nuke_owner {
+            return false;
         }
-        if (tx - x).abs() >= (ty - y).abs() {
-            x += if tx > x { 1 } else { -1 };
-        } else {
-            y += if ty > y { 1 } else { -1 };
+        if u.target_unit != Some(nuke_id) {
+            return false;
         }
-    }
-    if x < 0 || y < 0 {
-        return None;
-    }
-    game.map.ref_xy(x as u32, y as u32).ok()
+        let dx = game.map.x(dst) as i64 - game.map.x(u.tile) as i64;
+        let dy = game.map.y(dst) as i64 - game.map.y(u.tile) as i64;
+        dx * dx + dy * dy <= r2
+    })
 }
 
 fn nuke_tile_targetable(game: &Game, src: Option<TileRef>, dst: TileRef, tile: TileRef) -> bool {

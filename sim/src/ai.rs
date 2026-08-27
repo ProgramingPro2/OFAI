@@ -37,6 +37,7 @@ fn theme_names_for_map(map: &str) -> Vec<&'static str> {
 pub fn create_nations(
     spec: &NationsSpec,
     manifest: &[ManifestNation],
+    additional: &[ManifestNation],
     map_size: MapSize,
     rng: &mut PseudoRandom,
 ) -> Vec<NationSpec> {
@@ -56,15 +57,55 @@ pub fn create_nations(
     match spec {
         NationsSpec::Disabled => Vec::new(),
         NationsSpec::Count(n) => {
-            let shuffled = rng.shuffle_array(manifest);
-            shuffled
-                .iter()
-                .take(*n as usize)
-                .map(|m| to_nation(m, rng))
-                .collect()
+            create_random_nations(*n as usize, manifest, additional, to_nation, rng)
         }
         NationsSpec::Default => manifest.iter().map(|m| to_nation(m, rng)).collect(),
     }
+}
+
+fn create_random_nations(
+    target: usize,
+    manifest: &[ManifestNation],
+    additional: &[ManifestNation],
+    to_nation: impl Fn(&ManifestNation, &mut PseudoRandom) -> NationSpec,
+    rng: &mut PseudoRandom,
+) -> Vec<NationSpec> {
+    let shuffled = rng.shuffle_array(manifest);
+    if target <= manifest.len() {
+        return shuffled
+            .iter()
+            .take(target)
+            .map(|m| to_nation(m, rng))
+            .collect();
+    }
+    let mut nations: Vec<NationSpec> = shuffled.iter().map(|m| to_nation(m, rng)).collect();
+    let mut used: std::collections::HashSet<String> =
+        nations.iter().map(|n| n.name.clone()).collect();
+    let mut remaining = target - manifest.len();
+    if remaining > 0 && !additional.is_empty() {
+        let candidates: Vec<ManifestNation> = additional
+            .iter()
+            .filter(|n| !used.contains(&n.name))
+            .cloned()
+            .collect();
+        let extras = rng.shuffle_array(&candidates);
+        for extra in extras.into_iter().take(remaining) {
+            used.insert(extra.name.clone());
+            nations.push(to_nation(&extra, rng));
+            remaining -= 1;
+        }
+    }
+    for _ in 0..remaining {
+        let name = crate::nation_names::generate_unique_nation_name(rng, &used);
+        used.insert(name.clone());
+        nations.push(NationSpec {
+            name,
+            spawn_x: None,
+            spawn_y: None,
+            id: rng.next_id(),
+        });
+    }
+    nations
 }
 
 pub fn tribe_name(map: &str, rng: &mut PseudoRandom) -> String {

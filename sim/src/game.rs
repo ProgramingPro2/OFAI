@@ -20,14 +20,22 @@ use crate::unit_grid::UnitGrid;
 use crate::player::{Attack, Player, PlayerInfo};
 use crate::rng::{simple_hash, PseudoRandom};
 use crate::spatial::{can_build_transport_ship, target_transport_tile};
-use crate::spec::{Difficulty, PlayerType, TerrainKind};
+use crate::spec::{Difficulty, PlayerType, TerrainKind, NUM_UNIT_TYPES};
+use crate::terrain::MapAssets;
 use crate::units::{
-    city_levels, construction_duration, structure_count, unit_cost, Unit, UnitType, BOAT_MAX_NUMBER,
-    DEFENSE_POST_RANGE, STRUCTURE_MIN_DIST, TRAITOR_DURATION,
+    city_levels, construction_duration, structure_count, unit_cost, Unit, UnitType, UNIT_HEAD_ORDER,
+    BOAT_MAX_NUMBER, DEFENSE_POST_RANGE, STRUCTURE_MIN_DIST, TRAITOR_DURATION,
 };
 
 const MALUS_FOR_RETREAT: f64 = 25.0;
 const RETREAT_DELAY: u32 = 20;
+
+enum NationNamed {
+    VeryWeak,
+    Traitor,
+    Afk,
+    Victim,
+}
 
 #[derive(Clone, Debug)]
 pub enum Intent {
@@ -119,6 +127,8 @@ struct BoatExec {
     unit_id: Option<u32>,
     last_move: u32,
     stepper: PathStepper,
+    /// Official `TransportShipExecution.target` captured at init from `owner(ref)`.
+    orig_target: Option<String>,
 }
 
 pub(crate) struct ConstructionExec {
@@ -219,6 +229,11 @@ pub struct Game {
     boat_cache: Vec<Option<TileRef>>,
     pub(crate) later: LaterState,
     tile_update_pairs: Vec<u32>,
+    build_cache_tick: u32,
+    build_cache_units: usize,
+    build_cache_gold: i64,
+    build_found: [Option<TileRef>; NUM_UNIT_TYPES],
+    build_none: [bool; NUM_UNIT_TYPES],
 }
 
 impl Game {
@@ -229,9 +244,27 @@ impl Game {
         difficulty: Difficulty,
         game_id: String,
     ) -> Self {
-        let water = WaterComponents::compute(&map);
-        let mini_water = WaterComponents::compute(&mini_map);
-        let water_chain = WaterChain::new(&mini_map);
+        Self::from_assets(map, mini_map, humans, difficulty, game_id, None)
+    }
+
+    pub fn from_assets(
+        map: GameMap,
+        mini_map: GameMap,
+        humans: Vec<PlayerInfo>,
+        difficulty: Difficulty,
+        game_id: String,
+        assets: Option<&MapAssets>,
+    ) -> Self {
+        let water = assets
+            .map(|a| a.water.clone())
+            .unwrap_or_else(|| WaterComponents::compute(&map));
+        let mini_water = assets
+            .map(|a| a.mini_water.clone())
+            .unwrap_or_else(|| WaterComponents::compute(&mini_map));
+        let water_chain = match assets {
+            Some(a) => WaterChain::from_graph(&mini_map, a.hpa_graph.clone()),
+            None => WaterChain::new(&mini_map),
+        };
         let later = LaterState::new(UnitGrid::new(&map));
         let mut game = Self {
             map,
@@ -261,6 +294,11 @@ impl Game {
             boat_cache: vec![None; crate::spec::NUM_REGIONS],
             later,
             tile_update_pairs: Vec::new(),
+            build_cache_tick: u32::MAX,
+            build_cache_units: 0,
+            build_cache_gold: 0,
+            build_found: [None; NUM_UNIT_TYPES],
+            build_none: [false; NUM_UNIT_TYPES],
         };
         for info in humans {
             game.add_player(info);
@@ -459,6 +497,7 @@ impl Game {
                         unit_id: None,
                         last_move: 0,
                         stepper: PathStepper::new(),
+                        orig_target: None,
                     }));
                 }
                 Intent::Build { unit, tile } => {
@@ -521,6 +560,16 @@ impl Game {
                 continue;
             }
             self.init_exec(&mut e, t);
+            let alliance_pair = match &e {
+                Exec::AllianceReq(a) => Some((a.requestor.clone(), a.recipient.clone())),
+                _ => None,
+            };
+            if let Some((requestor, recipient)) = alliance_pair {
+                let keep = self.apply_alliance_request(&requestor, &recipient, t);
+                if let Exec::AllianceReq(a) = &mut e {
+                    a.active = keep;
+                }
+            }
             self.execs.push(e);
         }
         let still = self.in_spawn_phase();
@@ -656,6 +705,14 @@ impl Game {
                     }
                     *inited = true;
                     *active = false;
+                }
+                crate::later::LaterExec::SamMissile { .. } => {
+                    // Official SAMMissileExecution.init constructs AirPathFinder
+                    // then immediately calls tick(), so the missile is built and
+                    // takes its first steps on the launch tick.
+                    let dummy = crate::later::LaterExec::RailRecompute { active: false };
+                    let exec = std::mem::replace(e, dummy);
+                    *e = crate::later_tick::tick_one(self, exec, ticks);
                 }
                 _ => {}
             }
@@ -809,7 +866,287 @@ impl Game {
         }
         self.capture_or_delete_structures(&pid);
         self.expire_alliances_for(&pid);
-        let _ = ticks;
+        let (last_calc, tiles, last_change) = self
+            .players
+            .get(&pid)
+            .map(|p| (p.num_tiles(), p.last_tile_change))
+            .map(|(tiles, last_change)| {
+                let last_calc = match &self.execs[idx] {
+                    Exec::Player(pe) => pe.last_calc,
+                    _ => 0,
+                };
+                (last_calc, tiles, last_change)
+            })
+            .unwrap_or((0, 0, 0));
+        if ticks.saturating_sub(last_calc) > 20 || tiles < 100 {
+            if last_change >= last_calc {
+                if let Exec::Player(pe) = &mut self.execs[idx] {
+                    pe.last_calc = ticks;
+                }
+                self.remove_clusters(&pid);
+            }
+        }
+    }
+
+    fn remove_clusters(&mut self, pid: &str) {
+        let clusters = self.calculate_border_clusters(pid);
+        if clusters.is_empty() {
+            if let Some(p) = self.players.get_mut(pid) {
+                p.largest_cluster_box = None;
+            }
+            return;
+        }
+        let mut largest_index = 0usize;
+        let mut largest_size = clusters[0].len();
+        for (i, c) in clusters.iter().enumerate().skip(1) {
+            if c.len() > largest_size {
+                largest_size = c.len();
+                largest_index = i;
+            }
+        }
+        let (min_x, min_y, max_x, max_y) = Self::cluster_bbox(&self.map, &clusters[largest_index]);
+        if let Some(p) = self.players.get_mut(pid) {
+            p.largest_cluster_box = Some((
+                min_x as u32,
+                min_y as u32,
+                max_x as u32,
+                max_y as u32,
+            ));
+        }
+        if let Some(enemy) = self.surrounded_by_same_player(&clusters[largest_index]) {
+            if !self.is_friendly_ids(pid, &enemy) {
+                self.remove_cluster(pid, &clusters[largest_index]);
+            }
+        }
+        for (i, cluster) in clusters.iter().enumerate() {
+            if i == largest_index {
+                continue;
+            }
+            if self.cluster_is_surrounded(cluster) {
+                self.remove_cluster(pid, cluster);
+            }
+        }
+    }
+
+    fn calculate_border_clusters(&self, pid: &str) -> Vec<Vec<TileRef>> {
+        let Some(p) = self.players.get(pid) else {
+            return Vec::new();
+        };
+        if p.border_tiles.is_empty() {
+            return Vec::new();
+        }
+        let borders = &p.border_tiles;
+        let mut visited: HashSet<TileRef> = HashSet::new();
+        let mut clusters = Vec::new();
+        for &start in borders {
+            if !visited.insert(start) {
+                continue;
+            }
+            let mut cluster = vec![start];
+            let mut stack = vec![start];
+            while let Some(tile) = stack.pop() {
+                self.map.for_each_neighbor_diag(tile, |n| {
+                    if borders.contains(&n) && visited.insert(n) {
+                        cluster.push(n);
+                        stack.push(n);
+                    }
+                });
+            }
+            clusters.push(cluster);
+        }
+        clusters
+    }
+
+    fn cluster_bbox(map: &GameMap, tiles: &[TileRef]) -> (i32, i32, i32, i32) {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for &t in tiles {
+            let x = map.x(t) as i32;
+            let y = map.y(t) as i32;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        (min_x, min_y, max_x, max_y)
+    }
+
+    fn box_inscribed(outer: (i32, i32, i32, i32), inner: (i32, i32, i32, i32)) -> bool {
+        outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
+    }
+
+    fn surrounded_by_same_player(&self, cluster: &[TileRef]) -> Option<String> {
+        let Some(&first) = cluster.first() else {
+            return None;
+        };
+        let my = self.map.owner_id(first);
+        let cluster_box = Self::cluster_bbox(&self.map, cluster);
+        let mut enemy: Option<u16> = None;
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut nbuf = [0u32; 4];
+        for &tile in cluster {
+            if self.map.is_ocean_shore(tile) || self.map.is_on_edge(tile) {
+                return None;
+            }
+            let n = self.map.neighbors4(tile, &mut nbuf);
+            for i in 0..n {
+                let oid = self.map.owner_id(nbuf[i]);
+                if oid == 0 {
+                    return None;
+                }
+                if oid != my {
+                    match enemy {
+                        None => enemy = Some(oid),
+                        Some(e) if e != oid => return None,
+                        _ => {}
+                    }
+                    let x = self.map.x(nbuf[i]) as i32;
+                    let y = self.map.y(nbuf[i]) as i32;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+            if enemy.is_none() {
+                return None;
+            }
+        }
+        let enemy = enemy?;
+        if !Self::box_inscribed((min_x, min_y, max_x, max_y), cluster_box) {
+            return None;
+        }
+        self.by_small.get(&enemy).cloned()
+    }
+
+    fn cluster_is_surrounded(&self, cluster: &[TileRef]) -> bool {
+        let Some(&first) = cluster.first() else {
+            return false;
+        };
+        let my = self.map.owner_id(first);
+        let cluster_box = Self::cluster_bbox(&self.map, cluster);
+        let mut has_enemy = false;
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut nbuf = [0u32; 4];
+        for &tile in cluster {
+            if self.map.is_shore(tile) || self.map.is_on_edge(tile) {
+                return false;
+            }
+            let n = self.map.neighbors4(tile, &mut nbuf);
+            for i in 0..n {
+                let oid = self.map.owner_id(nbuf[i]);
+                if oid != 0 && oid != my {
+                    has_enemy = true;
+                    let x = self.map.x(nbuf[i]) as i32;
+                    let y = self.map.y(nbuf[i]) as i32;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        has_enemy && Self::box_inscribed((min_x, min_y, max_x, max_y), cluster_box)
+    }
+
+    fn cluster_capturing_player(&self, pid: &str, cluster: &[TileRef]) -> Option<String> {
+        let my = self.players.get(pid).map(|p| p.small_id)?;
+        let mut counts: IndexMap<u16, u32> = IndexMap::new();
+        let mut nbuf = [0u32; 4];
+        for &tile in cluster {
+            let n = self.map.neighbors4(tile, &mut nbuf);
+            for i in 0..n {
+                let oid = self.map.owner_id(nbuf[i]);
+                if oid == 0 || oid == my {
+                    continue;
+                }
+                let Some(owner_id) = self.by_small.get(&oid) else {
+                    continue;
+                };
+                if !self.players.contains_key(owner_id) {
+                    continue;
+                }
+                if self.is_friendly_ids(owner_id, pid) {
+                    continue;
+                }
+                *counts.entry(oid).or_insert(0) += 1;
+            }
+        }
+        if counts.is_empty() {
+            return None;
+        }
+        let mut best_atk: Option<(String, f64)> = None;
+        for &sid in counts.keys() {
+            let Some(nid) = self.by_small.get(&sid) else {
+                continue;
+            };
+            let Some(n) = self.players.get(nid) else {
+                continue;
+            };
+            for atk in &n.outgoing {
+                if atk.target_player_id.as_deref() == Some(pid) && atk.active {
+                    if best_atk.as_ref().is_none_or(|(_, t)| atk.troops > *t) {
+                        best_atk = Some((nid.clone(), atk.troops));
+                    }
+                }
+            }
+        }
+        if let Some((id, _)) = best_atk {
+            return Some(id);
+        }
+        let mut mode_sid = None;
+        let mut mode_n = 0u32;
+        for (&sid, &c) in &counts {
+            if c > mode_n {
+                mode_n = c;
+                mode_sid = Some(sid);
+            }
+        }
+        mode_sid.and_then(|sid| self.by_small.get(&sid).cloned())
+    }
+
+    fn flood_owned_from(&self, start: TileRef, owner: u16) -> Vec<TileRef> {
+        let mut visited = HashSet::new();
+        let mut out = Vec::new();
+        let mut stack = vec![start];
+        visited.insert(start);
+        let mut nbuf = [0u32; 4];
+        while let Some(tile) = stack.pop() {
+            out.push(tile);
+            let n = self.map.neighbors4(tile, &mut nbuf);
+            for i in 0..n {
+                let nxt = nbuf[i];
+                if self.map.owner_id(nxt) == owner && visited.insert(nxt) {
+                    stack.push(nxt);
+                }
+            }
+        }
+        out
+    }
+
+    fn remove_cluster(&mut self, pid: &str, cluster: &[TileRef]) {
+        if cluster.is_empty() {
+            return;
+        }
+        let Some(capturing) = self.cluster_capturing_player(pid, cluster) else {
+            return;
+        };
+        let owner = self.players.get(pid).map(|p| p.small_id).unwrap_or(0);
+        let tiles = self.flood_owned_from(cluster[0], owner);
+        if self.players.get(pid).map(|p| p.num_tiles() as usize) == Some(tiles.len()) {
+            self.conquer_player(&capturing, pid);
+        }
+        for tile in tiles {
+            self.conquer(&capturing, tile);
+        }
     }
 
     fn init_attack(&mut self, a: &mut AttackExec, _ticks: u32) {
@@ -879,16 +1216,22 @@ impl Game {
             // including boat-sourced ones. A new boat attack is not merged.
             if src.is_none() {
                 let mut extra = 0.0;
+                let mut absorbed = false;
                 for other in owner.outgoing.iter_mut() {
                     if other.id != id && other.target_player_id == a.target_id && other.active {
                         extra += other.troops;
                         other.active = false;
+                        absorbed = true;
                     }
                 }
                 if extra > 0.0 {
                     if let Some(merged) = owner.outgoing.iter_mut().find(|x| x.id == id) {
                         merged.troops += extra;
                     }
+                }
+                // Official AttackExecution always `outgoing.delete()`s absorbed
+                // same-target land attacks, including zero-troop leftovers.
+                if absorbed {
                     owner.outgoing.retain(|x| x.active);
                 }
             }
@@ -1816,6 +2159,9 @@ impl Game {
             let req = self.incoming_requests[i].clone();
             self.incoming_requests[i].status = RequestStatus::Rejected;
             if let Some(p) = self.players.get_mut(&req.requestor) {
+                p.outgoing_requests.retain(|r| {
+                    !(r.recipient == req.recipient && r.requestor == req.requestor)
+                });
                 p.past_outgoing_requests.push(req);
             }
         }
@@ -2093,6 +2439,11 @@ impl Game {
             return;
         }
         let target_sid = self.map.owner_id(b.ref_tile);
+        b.orig_target = if target_sid == 0 {
+            None
+        } else {
+            self.by_small.get(&target_sid).cloned()
+        };
         let (owner_small, owner_type, troops_avail, shores, border, allowed, reject_tid) = {
             let Some(owner) = self.players.get(&b.owner_id) else {
                 b.active = false;
@@ -2182,14 +2533,20 @@ impl Game {
     }
 
     fn tick_boat(&mut self, idx: usize, ticks: u32) {
-        let (owner_id, dst, unit_id, last_move) = {
+        let (owner_id, dst, unit_id, last_move, orig_target) = {
             let Exec::Boat(b) = &self.execs[idx] else {
                 return;
             };
             if !b.active || !b.inited {
                 return;
             }
-            (b.owner_id.clone(), b.dst, b.unit_id, b.last_move)
+            (
+                b.owner_id.clone(),
+                b.dst,
+                b.unit_id,
+                b.last_move,
+                b.orig_target.clone(),
+            )
         };
         let Some(dst) = dst else {
             if let Exec::Boat(b) = &mut self.execs[idx] {
@@ -2236,42 +2593,30 @@ impl Game {
                     return;
                 }
                 self.conquer(&owner_id, dst);
-                let target_id = {
-                    let sid = self.map.owner_id(dst);
-                    if sid == 0 {
-                        None
-                    } else {
-                        self.by_small.get(&sid).cloned()
-                    }
-                };
-                // Landing may have conquered dest; attack the previous owner if still a player tile neighbor.
-                let prev_target = {
-                    let mut nbuf = [0u32; 4];
-                    let n = self.map.neighbors4(dst, &mut nbuf);
-                    let mut tid = target_id;
-                    if tid.as_deref() == Some(owner_id.as_str()) {
-                        tid = None;
-                    }
-                    for i in 0..n {
-                        let os = self.map.owner_id(nbuf[i]);
-                        if os != 0 && os != self.players.get(&owner_id).map(|p| p.small_id).unwrap_or(0)
-                        {
-                            tid = self.by_small.get(&os).cloned();
-                            break;
+                // Official keeps `this.target` from init (`owner(ref)`), not the
+                // post-conquer dest owner or a neighbor.
+                if let Some(tid) = orig_target.as_deref() {
+                    if self.is_friendly_ids(&owner_id, tid) {
+                        if let Some(p) = self.players.get_mut(&owner_id) {
+                            p.add_troops(troops);
                         }
+                        self.delete_unit(uid);
+                        if let Exec::Boat(b) = &mut self.execs[idx] {
+                            b.active = false;
+                        }
+                        return;
                     }
-                    tid
-                };
+                }
                 self.uninit.push(Exec::Attack(AttackExec {
                     active: true,
                     inited: false,
                     start_troops: troops,
                     owner_id: owner_id.clone(),
-                    target_id: prev_target.clone(),
+                    target_id: orig_target.clone(),
                     attack_id: None,
                     owner_small: 0,
                     target_small: 0,
-                    target_is_player: prev_target.is_some(),
+                    target_is_player: orig_target.is_some(),
                     source_tile: Some(dst),
                     remove_troops: false,
                     heap: FlatHeap::new(),
@@ -2431,40 +2776,31 @@ impl Game {
         self.complete_later_structure(uid, ty);
     }
 
-    fn tick_alliance_req(&mut self, idx: usize, ticks: u32) {
-        let Exec::AllianceReq(a) = &self.execs[idx] else {
-            return;
-        };
-        let requestor = a.requestor.clone();
-        let recipient = a.recipient.clone();
-        if !self.players.contains_key(&recipient) {
-            if let Exec::AllianceReq(a) = &mut self.execs[idx] {
-                a.active = false;
-            }
-            return;
+    fn apply_alliance_request(&mut self, requestor: &str, recipient: &str, ticks: u32) -> bool {
+        if !self.players.contains_key(recipient) {
+            return false;
         }
-        let incoming = self.incoming_requests.iter().find(|r| {
-            r.requestor == recipient && r.recipient == requestor && r.status == RequestStatus::Pending
+        let incoming = self.incoming_requests.iter().any(|r| {
+            r.requestor == recipient
+                && r.recipient == requestor
+                && r.status == RequestStatus::Pending
         });
-        if incoming.is_some() {
-            if let Some(p) = self.players.get_mut(&requestor) {
-                p.update_relation(&recipient, 100.0);
+        if incoming {
+            if let Some(p) = self.players.get_mut(requestor) {
+                p.update_relation(recipient, 100.0);
             }
-            if let Some(p) = self.players.get_mut(&recipient) {
-                p.update_relation(&requestor, 100.0);
+            if let Some(p) = self.players.get_mut(recipient) {
+                p.update_relation(requestor, 100.0);
             }
-            self.accept_alliance(&recipient, &requestor, ticks);
-            if let Exec::AllianceReq(a) = &mut self.execs[idx] {
-                a.active = false;
-            }
-            return;
+            self.accept_alliance(recipient, requestor, ticks);
+            return false;
         }
         let can = {
-            let Some(req) = self.players.get(&requestor) else {
-                return;
+            let Some(req) = self.players.get(requestor) else {
+                return false;
             };
-            let Some(rec) = self.players.get(&recipient) else {
-                return;
+            let Some(rec) = self.players.get(recipient) else {
+                return false;
             };
             let last = req
                 .past_outgoing_requests
@@ -2474,7 +2810,7 @@ impl Game {
                 .max();
             can_send_alliance_request(
                 ticks,
-                rec.is_alive(),
+                req.is_alive(),
                 req.disconnected,
                 rec.disconnected,
                 self.is_friendly(req, rec),
@@ -2482,27 +2818,83 @@ impl Game {
                     .iter()
                     .any(|r| r.recipient == recipient && r.status == RequestStatus::Pending),
                 self.incoming_requests.iter().any(|r| {
-                    r.recipient == requestor && r.requestor == recipient && r.status == RequestStatus::Pending
+                    r.recipient == requestor
+                        && r.requestor == recipient
+                        && r.status == RequestStatus::Pending
                 }),
                 last,
             )
         };
         if !can {
+            return false;
+        }
+        let req = AllianceRequest {
+            requestor: requestor.to_string(),
+            recipient: recipient.to_string(),
+            created_at: ticks,
+            status: RequestStatus::Pending,
+        };
+        if let Some(p) = self.players.get_mut(requestor) {
+            p.outgoing_requests.push(req.clone());
+        }
+        self.incoming_requests.push(req);
+        true
+    }
+
+    fn tick_alliance_req(&mut self, idx: usize, ticks: u32) {
+        let Exec::AllianceReq(a) = &self.execs[idx] else {
+            return;
+        };
+        let requestor = a.requestor.clone();
+        let recipient = a.recipient.clone();
+        let pending_created = self.incoming_requests.iter().find_map(|r| {
+            if r.requestor == requestor
+                && r.recipient == recipient
+                && r.status == RequestStatus::Pending
+            {
+                Some(r.created_at)
+            } else {
+                None
+            }
+        });
+        if let Some(created_at) = pending_created {
+            if crate::diplomacy::request_expired(ticks, created_at) {
+                if let Some(i) = self.incoming_requests.iter().position(|r| {
+                    r.requestor == requestor
+                        && r.recipient == recipient
+                        && r.status == RequestStatus::Pending
+                }) {
+                    self.incoming_requests[i].status = RequestStatus::Rejected;
+                }
+                if let Some(p) = self.players.get_mut(&requestor) {
+                    for r in &mut p.outgoing_requests {
+                        if r.recipient == recipient && r.status == RequestStatus::Pending {
+                            r.status = RequestStatus::Rejected;
+                        }
+                    }
+                }
+                if let Exec::AllianceReq(a) = &mut self.execs[idx] {
+                    a.active = false;
+                }
+            }
+            return;
+        }
+        let done = self.incoming_requests.iter().any(|r| {
+            r.requestor == requestor
+                && r.recipient == recipient
+                && r.status != RequestStatus::Pending
+        });
+        if done {
             if let Exec::AllianceReq(a) = &mut self.execs[idx] {
                 a.active = false;
             }
             return;
         }
-        let req = AllianceRequest {
-            requestor: requestor.clone(),
-            recipient: recipient.clone(),
-            created_at: ticks,
-            status: RequestStatus::Pending,
-        };
-        if let Some(p) = self.players.get_mut(&requestor) {
-            p.outgoing_requests.push(req.clone());
+        if !self.apply_alliance_request(&requestor, &recipient, ticks) {
+            if let Exec::AllianceReq(a) = &mut self.execs[idx] {
+                a.active = false;
+            }
         }
-        self.incoming_requests.push(req);
     }
 
     fn tick_break_ally(&mut self, idx: usize, ticks: u32) {
@@ -2963,6 +3355,8 @@ impl Game {
     fn nation_attack_best_target(
         &mut self,
         pid: &str,
+        friends: &[String],
+        enemies: &[String],
         trigger: f64,
         reserve: f64,
         expand: f64,
@@ -2985,84 +3379,229 @@ impl Game {
         if ratio < trigger && !rng.chance(10) {
             return;
         }
-        let nearby = self.nearby(pid);
-        let mut enemies: Vec<String> = nearby
-            .iter()
-            .flatten()
-            .filter(|id| !self.is_allied(pid, id))
-            .cloned()
-            .collect();
-        let mut friends: Vec<String> = nearby
-            .iter()
-            .flatten()
-            .filter(|id| self.is_allied(pid, id))
-            .cloned()
-            .collect();
-        enemies.sort_by_key(|id| self.players.get(id).map(|o| o.troops).unwrap_or(0));
-        friends.sort_by_key(|id| self.players.get(id).map(|o| o.troops).unwrap_or(0));
 
-        // Impossible strategy order.
-        if let Some(atk) = self.incoming_attack_player(pid) {
-            if self.ai_send_attack_official(pid, Some(atk), expand, reserve, rng, true) {
-                return;
+        match self.difficulty {
+            Difficulty::Easy => {
+                if self.nation_try_nuked(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_attack_bots(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_retaliate(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_assist_allies(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_maybe_betray_and_attack(pid, friends, enemies, expand, reserve, rng)
+                {
+                    return;
+                }
+                if self.nation_attack_hated(pid, expand, reserve, rng) {
+                    return;
+                }
+                let _ = self.nation_try_weakest(pid, enemies, expand, reserve, rng);
             }
-        }
-        if self.nation_attack_bots(pid, expand, reserve, rng) {
-            return;
-        }
-        if let Some(id) = self.nation_find_very_weak(pid, &enemies) {
-            if self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false) {
-                return;
+            Difficulty::Medium => {
+                if self.nation_attack_bots(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_nuked(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_retaliate(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_assist_allies(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_maybe_betray_and_attack(pid, friends, enemies, expand, reserve, rng)
+                {
+                    return;
+                }
+                if self.nation_attack_hated(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Afk) {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Traitor)
+                {
+                    return;
+                }
+                if self.nation_try_weakest(pid, enemies, expand, reserve, rng) {
+                    return;
+                }
+                let _ = self.nation_try_island(pid, enemies, expand, reserve, rng);
             }
-        }
-        if self.nation_assist_allies(pid, expand, reserve, rng) {
-            return;
-        }
-        if let Some(id) = self.nation_find_traitor(pid, &enemies) {
-            if self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false) {
-                return;
+            Difficulty::Hard => {
+                if self.nation_attack_bots(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_retaliate(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_assist_allies(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_maybe_betray_and_attack(pid, friends, enemies, expand, reserve, rng)
+                {
+                    return;
+                }
+                if self.nation_try_nuked(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Traitor)
+                {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Afk) {
+                    return;
+                }
+                if self.nation_attack_hated(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::VeryWeak)
+                {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Victim)
+                {
+                    return;
+                }
+                if self.nation_try_weakest(pid, enemies, expand, reserve, rng) {
+                    return;
+                }
+                let _ = self.nation_try_island(pid, enemies, expand, reserve, rng);
             }
-        }
-        if let Some(id) = self.nation_find_afk(pid, &enemies) {
-            if self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false) {
-                return;
-            }
-        }
-        if self.nation_maybe_betray_and_attack(pid, &friends, &enemies, expand, reserve, rng) {
-            return;
-        }
-        if let Some(id) = self.nation_find_victim(pid, &enemies) {
-            if self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false) {
-                return;
-            }
-        }
-        if self.nation_bordering_nuked(pid)
-            && self.ai_send_attack_official(pid, None, expand, reserve, rng, false)
-        {
-            return;
-        }
-        if self.nation_attack_hated(pid, expand, reserve, rng) {
-            return;
-        }
-        if let Some(id) = enemies.first().cloned() {
-            let other_t = self.players.get(&id).map(|o| o.troops_f64()).unwrap_or(0.0);
-            let me_t = self.players.get(pid).map(|o| o.troops_f64()).unwrap_or(0.0);
-            if other_t < me_t
-                && self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false)
-            {
-                return;
-            }
-        }
-        if enemies.is_empty() {
-            if let Some(id) = self.nation_nearest_island_enemy(pid, rng) {
-                let _ = self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false);
+            Difficulty::Impossible => {
+                if self.nation_try_retaliate(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_attack_bots(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::VeryWeak)
+                {
+                    return;
+                }
+                if self.nation_assist_allies(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Traitor)
+                {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Afk) {
+                    return;
+                }
+                if self.nation_maybe_betray_and_attack(pid, friends, enemies, expand, reserve, rng)
+                {
+                    return;
+                }
+                if self.nation_try_named(pid, enemies, expand, reserve, rng, NationNamed::Victim)
+                {
+                    return;
+                }
+                if self.nation_try_nuked(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_attack_hated(pid, expand, reserve, rng) {
+                    return;
+                }
+                if self.nation_try_weakest(pid, enemies, expand, reserve, rng) {
+                    return;
+                }
+                let _ = self.nation_try_island(pid, enemies, expand, reserve, rng);
             }
         }
     }
 
+    fn nation_try_retaliate(
+        &mut self,
+        pid: &str,
+        expand: f64,
+        reserve: f64,
+        rng: &mut PseudoRandom,
+    ) -> bool {
+        let Some(atk) = self.incoming_attack_player(pid) else {
+            return false;
+        };
+        self.ai_send_attack_official(pid, Some(atk), expand, reserve, rng, true)
+    }
+
+    fn nation_try_nuked(
+        &mut self,
+        pid: &str,
+        expand: f64,
+        reserve: f64,
+        rng: &mut PseudoRandom,
+    ) -> bool {
+        self.nation_bordering_nuked(pid)
+            && self.ai_send_attack_official(pid, None, expand, reserve, rng, false)
+    }
+
+    fn nation_try_weakest(
+        &mut self,
+        pid: &str,
+        enemies: &[String],
+        expand: f64,
+        reserve: f64,
+        rng: &mut PseudoRandom,
+    ) -> bool {
+        let Some(id) = enemies.first().cloned() else {
+            return false;
+        };
+        let other_t = self.players.get(&id).map(|o| o.troops_f64()).unwrap_or(0.0);
+        let me_t = self.players.get(pid).map(|o| o.troops_f64()).unwrap_or(0.0);
+        if self.cfg_team_mode() || other_t < me_t {
+            return self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false);
+        }
+        false
+    }
+
+    fn nation_try_island(
+        &mut self,
+        pid: &str,
+        enemies: &[String],
+        expand: f64,
+        reserve: f64,
+        rng: &mut PseudoRandom,
+    ) -> bool {
+        if !enemies.is_empty() {
+            return false;
+        }
+        let Some(id) = self.nation_nearest_island_enemy(pid, rng) else {
+            return false;
+        };
+        self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false)
+    }
+
+    fn nation_try_named(
+        &mut self,
+        pid: &str,
+        enemies: &[String],
+        expand: f64,
+        reserve: f64,
+        rng: &mut PseudoRandom,
+        kind: NationNamed,
+    ) -> bool {
+        let id = match kind {
+            NationNamed::VeryWeak => self.nation_find_very_weak(pid, enemies),
+            NationNamed::Traitor => self.nation_find_traitor(pid, enemies),
+            NationNamed::Afk => self.nation_find_afk(pid, enemies),
+            NationNamed::Victim => self.nation_find_victim(pid, enemies),
+        };
+        let Some(id) = id else {
+            return false;
+        };
+        self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false)
+    }
+
     fn nation_has_neighboring_bot_with_structures(&self, pid: &str) -> bool {
         self.nearby(pid).into_iter().flatten().any(|id| {
-            !self.is_allied(pid, &id)
+            !self.is_friendly_ids(pid, &id)
                 && self
                     .players
                     .get(&id)
@@ -3134,13 +3673,19 @@ impl Game {
             Difficulty::Hard => 3,
             Difficulty::Impossible => 100,
         };
-        let mut sent_any = false;
+        let mut bot_sent = 0.0;
         for id in bots.into_iter().take(limit) {
-            if self.ai_send_attack_official(pid, Some(id), expand, reserve, rng, false) {
-                sent_any = true;
-            }
+            self.ai_send_attack_official_budget(
+                pid,
+                Some(id),
+                expand,
+                reserve,
+                rng,
+                false,
+                &mut bot_sent,
+            );
         }
-        sent_any
+        bot_sent > 0.0
     }
 
     fn nation_find_very_weak(&self, pid: &str, enemies: &[String]) -> Option<String> {
@@ -3273,19 +3818,31 @@ impl Game {
         let Some(o) = self.players.get(other) else {
             return false;
         };
-        if matches!(self.difficulty, Difficulty::Hard | Difficulty::Impossible) {
+        if !matches!(self.difficulty, Difficulty::Easy | Difficulty::Medium) {
             let cities = city_levels(&self.units, other);
             let max = crate::config::max_troops(o.player_type(), self.difficulty, o.num_tiles(), cities);
             let outgoing: f64 = o.outgoing.iter().filter(|a| a.active).map(|a| a.troops).sum();
             if o.troops_f64() + outgoing < max * 0.2 && o.troops_f64() < me.troops_f64() {
                 return true;
             }
-            if o.traitor && o.troops_f64() < me.troops_f64() * 1.2 {
-                return true;
-            }
-            if bordering == 1 && o.troops_f64() * 3.0 < me.troops_f64() {
-                return true;
-            }
+        }
+        if matches!(self.difficulty, Difficulty::Easy | Difficulty::Medium)
+            && !(self.difficulty == Difficulty::Easy && o.player_type() == PlayerType::Human)
+            && me.troops_f64() >= o.troops_f64() * 10.0
+        {
+            return true;
+        }
+        if self.difficulty != Difficulty::Easy
+            && o.traitor
+            && o.troops_f64() < me.troops_f64() * 1.2
+        {
+            return true;
+        }
+        if self.difficulty != Difficulty::Easy
+            && bordering == 1
+            && o.troops_f64() * 3.0 < me.troops_f64()
+        {
+            return true;
         }
         false
     }
@@ -3318,26 +3875,28 @@ impl Game {
         rng: &mut PseudoRandom,
     ) -> bool {
         let me_t = self.players.get(pid).map(|p| p.troops_f64()).unwrap_or(0.0);
-        let mut rels: Vec<(String, f64)> = self
+        let rels_raw: Vec<(String, f64)> = self
             .players
             .get(pid)
             .map(|p| p.relations.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
+        let mut rels: Vec<(String, f64)> = rels_raw
+            .into_iter()
+            .filter(|(k, _)| self.players.get(k).is_some_and(|o| o.is_alive()))
+            .collect();
         rels.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         for (oid, val) in rels {
             if crate::diplomacy::Relation::from_value(val) != crate::diplomacy::Relation::Hostile {
                 continue;
             }
-            if self.is_allied(pid, &oid) {
+            if self.is_friendly_ids(pid, &oid) {
                 continue;
             }
             let other_t = self.players.get(&oid).map(|o| o.troops_f64()).unwrap_or(0.0);
-            if other_t > me_t * 3.0 {
+            if !self.cfg_team_mode() && other_t > me_t * 3.0 {
                 continue;
             }
-            if self.ai_send_attack_official(pid, Some(oid), expand, reserve, rng, false) {
-                return true;
-            }
+            return self.ai_send_attack_official(pid, Some(oid), expand, reserve, rng, false);
         }
         false
     }
@@ -3357,7 +3916,7 @@ impl Game {
             return None;
         }
         let me_t = p.troops_f64();
-        let my_center = player_border_center(&self.map, p);
+        let my_center = player_center(&self.map, p);
         let my_shores: Vec<TileRef> = p
             .border_tiles
             .iter()
@@ -3367,9 +3926,14 @@ impl Game {
         let mut ranked: Vec<(u32, String)> = self
             .players
             .values()
-            .filter(|o| o.id() != pid && !self.is_allied(pid, o.id()) && o.troops_f64() < me_t)
+            .filter(|o| {
+                o.is_alive()
+                    && o.id() != pid
+                    && !self.is_friendly_ids(pid, o.id())
+                    && o.troops_f64() < me_t
+            })
             .map(|o| {
-                let c = player_border_center(&self.map, o);
+                let c = player_center(&self.map, o);
                 let dx = my_center.0.abs_diff(c.0);
                 let dy = my_center.1.abs_diff(c.1);
                 (dx + dy, o.id().to_string())
@@ -3468,6 +4032,20 @@ impl Game {
         rng: &mut PseudoRandom,
         force: bool,
     ) -> bool {
+        let mut bot_sent = 0.0;
+        self.ai_send_attack_official_budget(pid, target, expand, reserve, rng, force, &mut bot_sent)
+    }
+
+    fn ai_send_attack_official_budget(
+        &mut self,
+        pid: &str,
+        target: Option<String>,
+        expand: f64,
+        reserve: f64,
+        rng: &mut PseudoRandom,
+        force: bool,
+        bot_sent: &mut f64,
+    ) -> bool {
         if !force && !self.ai_should_attack(pid, target.as_deref(), rng) {
             return false;
         }
@@ -3485,10 +4063,89 @@ impl Game {
             }
         };
         if land {
-            self.ai_send_land_attack(pid, target, expand, reserve, rng)
+            self.ai_send_land_attack(pid, target, expand, reserve, rng, bot_sent)
         } else {
-            self.ai_send_boat_attack(pid, target, rng)
+            self.ai_send_boat_attack(pid, target, expand, reserve, rng, bot_sent)
         }
+    }
+
+    /// Official `AiAttackBehavior.calculateBotAttackTroops`.
+    fn calculate_bot_attack_troops(
+        &self,
+        target_troops: f64,
+        max_troops: f64,
+        bot_sent: &mut f64,
+    ) -> f64 {
+        if self.difficulty == Difficulty::Easy {
+            *bot_sent += max_troops;
+            return max_troops;
+        }
+        let mut troops = target_troops * 4.0;
+        if troops > max_troops {
+            troops = if max_troops < target_troops * 2.0 {
+                0.0
+            } else {
+                max_troops
+            };
+        }
+        *bot_sent += troops;
+        troops
+    }
+
+    /// Official `AiAttackBehavior.calculateAttackTroops`.
+    fn calculate_attack_troops(
+        &self,
+        pid: &str,
+        target: Option<&str>,
+        expand: f64,
+        reserve: f64,
+        boat: bool,
+        bot_sent: &mut f64,
+    ) -> Option<f64> {
+        let Some(p) = self.players.get(pid) else {
+            return None;
+        };
+        let cities = city_levels(&self.units, pid);
+        let max = crate::config::max_troops(p.player_type(), self.difficulty, p.num_tiles(), cities);
+        let bot_with_structs = target
+            .and_then(|t| self.players.get(t))
+            .map(|o| {
+                o.player_type() == PlayerType::Bot
+                    && self
+                        .units
+                        .iter()
+                        .any(|u| u.active && u.owner_id == o.id() && u.ty.is_structure())
+            })
+            .unwrap_or(false);
+        let use_reserve = target.is_some() && !bot_with_structs;
+        let keep = max * if use_reserve { reserve } else { expand };
+        let target_is_bot = target
+            .and_then(|t| self.players.get(t))
+            .map(|o| o.player_type() == PlayerType::Bot)
+            .unwrap_or(false);
+        let mut troops = if target_is_bot && p.player_type() != PlayerType::Bot {
+            let other_t = target
+                .and_then(|t| self.players.get(t))
+                .map(|o| o.troops_f64())
+                .unwrap_or(0.0);
+            self.calculate_bot_attack_troops(other_t, p.troops_f64() - keep - *bot_sent, bot_sent)
+        } else if boat {
+            p.troops_f64() / 5.0
+        } else {
+            p.troops_f64() - keep
+        };
+        if target.is_some() {
+            troops = troops.min(self.troop_send_cap(pid));
+        }
+        if troops < 1.0 {
+            return None;
+        }
+        if let Some(tid) = target {
+            if self.is_attack_too_weak(pid, tid, troops) {
+                return None;
+            }
+        }
+        Some(troops)
     }
 
     /// Official `NationEmojiBehavior.maybeSendAttackEmoji` after a valid
@@ -3534,51 +4191,14 @@ impl Game {
         expand: f64,
         reserve: f64,
         rng: &mut PseudoRandom,
+        bot_sent: &mut f64,
     ) -> bool {
-        let Some(p) = self.players.get(pid) else {
+        let Some(troops) =
+            self.calculate_attack_troops(pid, target.as_deref(), expand, reserve, false, bot_sent)
+        else {
             return false;
         };
-        let cities = city_levels(&self.units, pid);
-        let max = crate::config::max_troops(p.player_type(), self.difficulty, p.num_tiles(), cities);
-        let bot_with_structs = target
-            .as_ref()
-            .and_then(|t| self.players.get(t))
-            .map(|o| {
-                o.player_type() == PlayerType::Bot
-                    && self
-                        .units
-                        .iter()
-                        .any(|u| u.active && u.owner_id == o.id() && u.ty.is_structure())
-            })
-            .unwrap_or(false);
-        let use_reserve = target.is_some() && !bot_with_structs;
-        let keep = max * if use_reserve { reserve } else { expand };
-        let mut troops = if target
-            .as_ref()
-            .and_then(|t| self.players.get(t))
-            .map(|o| o.player_type() == PlayerType::Bot)
-            .unwrap_or(false)
-            && p.player_type() != PlayerType::Bot
-        {
-            let other_t = target
-                .as_ref()
-                .and_then(|t| self.players.get(t))
-                .map(|o| o.troops_f64())
-                .unwrap_or(0.0);
-            (p.troops_f64() - keep).min(other_t * 4.0)
-        } else {
-            p.troops_f64() - keep
-        };
-        if target.is_some() {
-            troops = troops.min(self.troop_send_cap(pid));
-        }
-        if troops < 1.0 {
-            return false;
-        }
         if let Some(tid) = target.as_deref() {
-            if self.is_attack_too_weak(pid, tid, troops) {
-                return false;
-            }
             self.maybe_send_attack_emoji(pid, tid, rng);
         }
         self.ai_send_attack(pid, target, troops);
@@ -3589,7 +4209,10 @@ impl Game {
         &mut self,
         pid: &str,
         target: Option<String>,
+        expand: f64,
+        reserve: f64,
         rng: &mut PseudoRandom,
+        bot_sent: &mut f64,
     ) -> bool {
         if self.is_unit_disabled(UnitType::TransportShip) {
             return false;
@@ -3597,30 +4220,16 @@ impl Game {
         if self.boat_count(pid) >= BOAT_MAX_NUMBER {
             return false;
         }
-        let (mut troops, my_shores) = {
+        let my_shores: Vec<TileRef> = {
             let Some(p) = self.players.get(pid) else {
                 return false;
             };
-            let troops = p.troops_f64() / 5.0;
-            let shores: Vec<TileRef> = p
-                .border_tiles
+            p.border_tiles
                 .iter()
                 .copied()
                 .filter(|&t| self.map.is_shore(t))
-                .collect();
-            (troops, shores)
+                .collect()
         };
-        if target.is_some() {
-            troops = troops.min(self.troop_send_cap(pid));
-        }
-        if troops < 1.0 {
-            return false;
-        }
-        if let Some(tid) = target.as_deref() {
-            if self.is_attack_too_weak(pid, tid, troops) {
-                return false;
-            }
-        }
         if my_shores.is_empty() {
             return false;
         }
@@ -3644,6 +4253,11 @@ impl Game {
         if self.can_build_boat(pid, dst).is_none() {
             return false;
         }
+        let Some(troops) =
+            self.calculate_attack_troops(pid, target.as_deref(), expand, reserve, true, bot_sent)
+        else {
+            return false;
+        };
         if let Some(tid) = target.as_deref() {
             self.maybe_send_attack_emoji(pid, tid, rng);
         }
@@ -3658,6 +4272,7 @@ impl Game {
             unit_id: None,
             last_move: 0,
             stepper: PathStepper::new(),
+            orig_target: None,
         }));
         true
     }
@@ -3759,6 +4374,7 @@ impl Game {
                     unit_id: None,
                     last_move: 0,
                     stepper: PathStepper::new(),
+                    orig_target: None,
                 }));
                 return;
             }
@@ -3874,6 +4490,23 @@ impl Game {
             } else if spawn_added {
                 return;
             }
+            // Official: nations with no spawn cell use random SpawnExecution.
+            if spawn_x.is_none() || spawn_y.is_none() {
+                self.uninit.push(Exec::Spawn(SpawnExec {
+                    active: true,
+                    player_id: pid.clone(),
+                    game_id: self.game_id.clone(),
+                    tile: None,
+                    info: None,
+                    rng: PseudoRandom::new(
+                        simple_hash(&pid).wrapping_add(simple_hash(&self.game_id)),
+                    ),
+                }));
+                if let Exec::Nation(n) = &mut self.execs[idx] {
+                    n.spawn_added = true;
+                }
+                return;
+            }
             let tile = self.nation_spawn_tile(idx, spawn_x, spawn_y);
             if let Some(tile) = tile {
                 self.uninit.push(Exec::Spawn(SpawnExec {
@@ -3935,6 +4568,8 @@ impl Game {
             return;
         }
         self.nation_consume_emoji_rng(idx, &pid, ticks);
+        // Official: updateRelationsFromEmbargos() before alliance decisions.
+        self.nation_update_relations_from_embargos(&pid);
         self.nation_handle_alliances(&pid, idx, ticks);
         crate::nation_later::consider_mirv(self, &pid, idx);
         crate::nation_later::handle_structures(self, &pid, idx);
@@ -3972,31 +4607,118 @@ impl Game {
         None
     }
 
+    fn num_spawn_phase_turns(&self) -> u32 {
+        // Official Config.numSpawnPhaseTurns(): singleplayer is 100.
+        100
+    }
+
+    fn nation_emoji_cooldown() -> u32 {
+        50
+    }
+
+    /// Official `NationEmojiBehavior.sendEmoji`: shouldSendEmoji(false) then
+    /// canSendEmoji, then randElement of the list.
+    fn nation_send_emoji(
+        &mut self,
+        pid: &str,
+        target: Option<&str>,
+        list_len: u32,
+        rng: &mut PseudoRandom,
+    ) {
+        if let Some(tid) = target {
+            if tid == pid {
+                return;
+            }
+            let Some(other) = self.players.get(tid) else {
+                return;
+            };
+            if other.player_type() != PlayerType::Human {
+                return;
+            }
+        }
+        let key = target.unwrap_or("*");
+        let ticks = self.ticks();
+        {
+            let st = self.later.nations.entry(pid.to_string()).or_default();
+            if let Some(&last) = st.outgoing_emoji_at.get(key) {
+                if ticks.saturating_sub(last) < Self::nation_emoji_cooldown() {
+                    return;
+                }
+            }
+        }
+        if list_len > 0 {
+            let _ = rng.next_int(0.0, list_len as f64);
+        }
+        self.later
+            .nations
+            .entry(pid.to_string())
+            .or_default()
+            .outgoing_emoji_at
+            .insert(key.to_string(), ticks);
+    }
+
+    /// Official `NationExecution.updateRelationsFromEmbargos`.
+    fn nation_update_relations_from_embargos(&mut self, pid: &str) {
+        let others: Vec<String> = self
+            .players
+            .keys()
+            .filter(|id| *id != pid)
+            .cloned()
+            .collect();
+        let mut applied = self
+            .later
+            .nations
+            .get(pid)
+            .map(|s| s.embargo_malus_applied.clone())
+            .unwrap_or_default();
+        for other in others {
+            let other_has = self
+                .players
+                .get(&other)
+                .map(|p| p.has_embargo_against(pid))
+                .unwrap_or(false);
+            if other_has && !applied.contains(&other) {
+                if let Some(p) = self.players.get_mut(pid) {
+                    p.update_relation(&other, -20.0);
+                }
+                applied.insert(other);
+            } else if !other_has && applied.contains(&other) {
+                if let Some(p) = self.players.get_mut(pid) {
+                    p.update_relation(&other, 20.0);
+                }
+                applied.remove(&other);
+            }
+        }
+        self.later
+            .nations
+            .entry(pid.to_string())
+            .or_default()
+            .embargo_malus_applied = applied;
+    }
+
     fn nation_consume_emoji_rng(&mut self, idx: usize, pid: &str, ticks: u32) {
-        let incoming_human: Vec<(String, f64)> = self
+        if self
+            .later
+            .nations
+            .get(pid)
+            .is_some_and(|s| s.emoji_game_over)
+        {
+            return;
+        }
+        let incoming: Vec<(String, f64, PlayerType)> = self
             .players
             .values()
             .flat_map(|o| {
                 o.outgoing.iter().filter_map(move |a| {
-                    if a.active
-                        && a.target_player_id.as_deref() == Some(pid)
-                        && o.player_type() == PlayerType::Human
-                    {
-                        Some((o.id().to_string(), a.troops))
+                    if a.active && a.target_player_id.as_deref() == Some(pid) {
+                        Some((o.id().to_string(), a.troops, o.player_type()))
                     } else {
                         None
                     }
                 })
             })
             .collect();
-        let incoming_sum: f64 = self
-            .players
-            .values()
-            .flat_map(|o| o.outgoing.iter())
-            .filter(|a| a.active && a.target_player_id.as_deref() == Some(pid))
-            .map(|a| a.troops)
-            .sum();
-        let incoming_any = incoming_sum > 0.0;
+        let incoming_sum: f64 = incoming.iter().map(|(_, t, _)| *t).sum();
         let ours = self.players.get(pid).map(|p| p.troops_f64()).unwrap_or(0.0);
         let human_allies: Vec<String> = self
             .alliances
@@ -4006,7 +4728,7 @@ impl Game {
             .filter(|oid| {
                 self.players
                     .get(oid)
-                    .map(|p| p.player_type() == PlayerType::Human)
+                    .map(|p| p.player_type() == PlayerType::Human && p.is_alive())
                     .unwrap_or(false)
             })
             .collect();
@@ -4014,10 +4736,11 @@ impl Game {
             .players
             .values()
             .filter(|p| {
-                p.player_type() == PlayerType::Human
+                p.is_alive()
+                    && p.player_type() == PlayerType::Human
                     && p.traitor
                     && p.id() != pid
-                    && !self.is_allied(pid, p.id())
+                    && !self.is_friendly_ids(pid, p.id())
             })
             .map(|p| p.id().to_string())
             .collect();
@@ -4032,51 +4755,94 @@ impl Game {
                     .unwrap_or(false)
             })
             .collect();
+        let largest_alive = self
+            .players
+            .values()
+            .filter(|p| p.is_alive())
+            .max_by_key(|p| p.num_tiles())
+            .map(|p| p.id().to_string());
         let mut rng = {
             let Exec::Nation(n) = &self.execs[idx] else {
                 return;
             };
             n.rng.clone()
         };
-        let e16 = rng.chance(16);
-        if e16 && incoming_any && incoming_sum >= ours * 3.0 {
-            let _ = rng.next_int(0.0, 8.0);
+        // Official checkOverwhelmedByAttacks → sendEmoji(AllPlayers, 8).
+        if rng.chance(16) && !incoming.is_empty() && incoming_sum >= ours * 3.0 {
+            self.nation_send_emoji(pid, None, 8, &mut rng);
         }
-        if rng.chance(8) {
-            for (hid, troops) in &incoming_human {
-                if ours > 0.0 && *troops < ours * 0.1 {
-                    let list_len = if rng.chance(2) { 2.0 } else { 1.0 };
-                    let skip = self
-                        .later
-                        .nations
-                        .get(pid)
-                        .and_then(|s| s.last_emoji_sent.get(hid))
-                        .is_some_and(|&last| ticks.saturating_sub(last) <= 300);
-                    if !skip {
-                        self.later
-                            .nations
-                            .entry(pid.to_string())
-                            .or_default()
-                            .last_emoji_sent
-                            .insert(hid.clone(), ticks);
-                        let _ = rng.next_int(0.0, list_len);
+        // Official checkVerySmallAttack → maybeSendEmoji (300-tick lastEmojiSent).
+        if rng.chance(8) && !incoming.is_empty() && ours > 0.0 {
+            for (hid, troops, ptype) in &incoming {
+                if *ptype != PlayerType::Human || *troops >= ours * 0.1 {
+                    continue;
+                }
+                let list_len = if rng.chance(2) { 2 } else { 1 };
+                let skip = self
+                    .later
+                    .nations
+                    .get(pid)
+                    .and_then(|s| s.last_emoji_sent.get(hid))
+                    .is_some_and(|&last| ticks.saturating_sub(last) <= 300);
+                if skip {
+                    continue;
+                }
+                self.later
+                    .nations
+                    .entry(pid.to_string())
+                    .or_default()
+                    .last_emoji_sent
+                    .insert(hid.clone(), ticks);
+                self.nation_send_emoji(pid, Some(hid), list_len, &mut rng);
+            }
+        }
+        // Official congratulateWinner: sets gameOver but still runs later
+        // casual-emoji draws on this attack tick.
+        if self.winner.is_some() {
+            self.later
+                .nations
+                .entry(pid.to_string())
+                .or_default()
+                .emoji_game_over = true;
+            if !self.cfg_team_mode() {
+                if let Some(wid) = self.winner.clone() {
+                    if self
+                        .players
+                        .get(&wid)
+                        .is_some_and(|p| p.player_type() == PlayerType::Human)
+                    {
+                        let largest_nation = self
+                            .players
+                            .values()
+                            .filter(|p| p.player_type() == PlayerType::Nation && p.is_alive())
+                            .max_by_key(|p| p.num_tiles())
+                            .map(|p| p.id().to_string());
+                        if largest_nation.as_deref() == Some(pid) {
+                            self.nation_send_emoji(pid, Some(&wid), 1, &mut rng);
+                        }
                     }
                 }
             }
         }
-        let _ = rng.chance(300);
+        // Official brag: chance(300), then sendEmoji only if largest alive player.
+        if rng.chance(300) && largest_alive.as_deref() == Some(pid) {
+            self.nation_send_emoji(pid, None, 3, &mut rng);
+        }
         if rng.chance(250) && !human_allies.is_empty() {
-            let _ = rng.rand_element(&human_allies);
+            let ally = rng.rand_element(&human_allies);
             let _ = rng.chance(3);
+            self.nation_send_emoji(pid, Some(&ally), 3, &mut rng);
         }
         if rng.chance(40) && !traitors.is_empty() {
-            let _ = rng.rand_element(&traitors);
+            let traitor = rng.rand_element(&traitors);
+            self.nation_send_emoji(pid, Some(&traitor), 2, &mut rng);
         }
         if ticks >= 6000 {
             let _ = rng.chance(10000);
         }
         if ticks <= 600 && rng.chance(250) && !greet_humans.is_empty() {
-            let _ = rng.rand_element(&greet_humans);
+            let neighbor = rng.rand_element(&greet_humans);
+            self.nation_send_emoji(pid, Some(&neighbor), 1, &mut rng);
         }
         if let Exec::Nation(n) = &mut self.execs[idx] {
             n.rng = rng;
@@ -4090,8 +4856,9 @@ impl Game {
             .filter(|r| r.recipient == pid && r.status == RequestStatus::Pending)
             .map(|r| (r.requestor.clone(), r.created_at))
             .collect();
+        let spawn_reject = self.num_spawn_phase_turns() + 1;
         for (other, created) in incoming {
-            if created <= 101 {
+            if created <= spawn_reject {
                 self.reject_incoming_from(pid, &other);
                 continue;
             }
@@ -4133,7 +4900,7 @@ impl Game {
     }
 
     fn nation_alliance_decision(
-        &self,
+        &mut self,
         pid: &str,
         other: &str,
         is_response: bool,
@@ -4144,8 +4911,8 @@ impl Game {
         }
         let traitor = self.players.get(other).map(|p| p.traitor).unwrap_or(false);
         if traitor && rng.next_int(0.0, 100.0) >= 10 {
-            if is_response {
-                let _ = rng.chance(3);
+            if is_response && rng.chance(3) {
+                self.nation_send_emoji(pid, Some(other), 2, rng);
             }
             return false;
         }
@@ -4153,11 +4920,11 @@ impl Game {
             return false;
         }
         if self.nation_partner_is_threat(pid, other) {
-            if !is_response {
-                let _ = rng.chance(6);
+            if !is_response && rng.chance(6) {
+                self.nation_send_emoji(pid, Some(other), 2, rng);
             }
-            if is_response {
-                let _ = rng.chance(6);
+            if is_response && rng.chance(6) {
+                self.nation_send_emoji(pid, Some(other), 3, rng);
             }
             return true;
         }
@@ -4170,13 +4937,15 @@ impl Game {
             .map(|p| p.relation(other))
             .unwrap_or(crate::diplomacy::Relation::Neutral);
         if (rel as i32) < (crate::diplomacy::Relation::Neutral as i32) {
-            if is_response {
-                let _ = rng.chance(3);
+            if is_response && rng.chance(3) {
+                self.nation_send_emoji(pid, Some(other), 2, rng);
             }
             return false;
         }
         if self.nation_partner_is_friendly(pid, other, rng) {
-            let _ = rng.chance(3);
+            if rng.chance(3) {
+                self.nation_send_emoji(pid, Some(other), 1, rng);
+            }
             return true;
         }
         if self.nation_already_enough_alliances(pid, other, rng) {
@@ -4204,7 +4973,7 @@ impl Game {
         let total = self
             .players
             .values()
-            .filter(|p| p.player_type() != PlayerType::Bot)
+            .filter(|p| p.player_type() != PlayerType::Bot && p.is_alive())
             .count();
         let n = self
             .alliances
@@ -4348,7 +5117,7 @@ impl Game {
     }
 
     fn nation_is_earlygame(&self, rng: &mut PseudoRandom) -> bool {
-        let spawn = 100u32;
+        let spawn = self.num_spawn_phase_turns();
         match self.difficulty {
             Difficulty::Easy => {
                 self.ticks() < 3000 + spawn && rng.next_int(0.0, 100.0) >= 10
@@ -4452,7 +5221,30 @@ impl Game {
             .filter(|id| *id != pid)
             .cloned()
             .collect();
+        let higher = matches!(self.difficulty, Difficulty::Hard | Difficulty::Impossible);
+        let team = self.cfg_team_mode();
+        let ticks = self.ticks;
         for other in others {
+            if team
+                && higher
+                && self
+                    .players
+                    .get(&other)
+                    .is_some_and(|p| p.player_type() != PlayerType::Bot)
+                && !self.same_team(pid, &other)
+            {
+                let has = self
+                    .players
+                    .get(pid)
+                    .map(|p| p.has_embargo_against(&other))
+                    .unwrap_or(false);
+                if !has {
+                    if let Some(p) = self.players.get_mut(pid) {
+                        p.add_embargo(&other, ticks, false);
+                    }
+                }
+                continue;
+            }
             let rel = self
                 .players
                 .get(pid)
@@ -4463,9 +5255,25 @@ impl Game {
                 .get(pid)
                 .map(|p| p.has_embargo_against(&other))
                 .unwrap_or(false);
-            if (rel as i32) <= (crate::diplomacy::Relation::Hostile as i32) && !has {
+            let same = self.same_team(pid, &other);
+            if (rel as i32) <= (crate::diplomacy::Relation::Hostile as i32) && !has && !same
+            {
                 if let Some(p) = self.players.get_mut(pid) {
-                    p.add_embargo(&other, self.ticks, false);
+                    p.add_embargo(&other, ticks, false);
+                }
+            } else if (rel as i32) >= (crate::diplomacy::Relation::Neutral as i32)
+                && has
+                && !higher
+            {
+                if let Some(p) = self.players.get_mut(pid) {
+                    p.stop_embargo(&other);
+                }
+            } else if (rel as i32) >= (crate::diplomacy::Relation::Friendly as i32)
+                && has
+                && self.difficulty != Difficulty::Impossible
+            {
+                if let Some(p) = self.players.get_mut(pid) {
+                    p.stop_embargo(&other);
                 }
             }
         }
@@ -4673,6 +5481,7 @@ impl Game {
             unit_id: None,
             last_move: 0,
             stepper: PathStepper::new(),
+            orig_target: None,
         }));
     }
 
@@ -4690,9 +5499,7 @@ impl Game {
             };
             n.rng.clone()
         };
-        // Official maybeAttack: TN (land or nearby) first, then boat/alliance/best.
-        let nearby = self.nearby(pid);
-        let has_tn = nearby.iter().any(|n| n.is_none()) || self.has_land_tn_border(pid);
+        let (friends, enemies, has_tn) = self.nation_bordering_sets(pid);
         if has_tn {
             let sent = self.ai_send_attack_official(pid, None, expand, reserve, &mut rng, false);
             if sent {
@@ -4702,9 +5509,6 @@ impl Game {
                 return;
             }
         }
-        let mut enemies: Vec<String> = nearby.into_iter().flatten().collect();
-        enemies.retain(|id| !self.is_allied(pid, id));
-        enemies.sort_by_key(|id| self.players.get(id).map(|p| p.troops).unwrap_or(0));
         if enemies.is_empty() {
             if rng.chance(5) {
                 self.nation_attack_with_random_boat(pid, &enemies, &mut rng);
@@ -4736,10 +5540,61 @@ impl Game {
                 }
             }
         }
-        self.nation_attack_best_target(pid, trigger, reserve, expand, &mut rng);
+        self.nation_attack_best_target(pid, &friends, &enemies, trigger, reserve, expand, &mut rng);
         if let Exec::Nation(n) = &mut self.execs[idx] {
             n.rng = rng;
         }
+    }
+
+    /// Official `AiAttackBehavior.maybeAttack` bordering player set:
+    /// land-border owners plus `nearby()`, sorted by troops, split by `isFriendly`.
+    fn nation_bordering_sets(&self, pid: &str) -> (Vec<String>, Vec<String>, bool) {
+        let Some(p) = self.players.get(pid) else {
+            return (Vec::new(), Vec::new(), false);
+        };
+        let sid = p.small_id;
+        let mut set: IndexSet<String> = IndexSet::new();
+        let mut border_tn = false;
+        let mut nbuf = [0u32; 4];
+        for &t in &p.border_tiles {
+            let n = self.map.neighbors4(t, &mut nbuf);
+            for i in 0..n {
+                let nb = nbuf[i];
+                if !self.map.is_land(nb) || self.map.is_impassable(nb) {
+                    continue;
+                }
+                if self.map.owner_id(nb) == sid {
+                    continue;
+                }
+                if let Some(oid) = self.owner_id_opt(self.map.owner_id(nb)) {
+                    set.insert(oid);
+                }
+                if !self.map.has_owner(nb) && !self.map.has_fallout(nb) {
+                    border_tn = true;
+                }
+            }
+        }
+        let nearby = self.nearby(pid);
+        let nearby_tn = nearby.iter().any(|n| n.is_none());
+        for n in nearby.into_iter().flatten() {
+            set.insert(n);
+        }
+        let mut players: Vec<String> = set.into_iter().collect();
+        players.sort_by(|a, b| {
+            let ta = self.players.get(a).map(|p| p.troops_f64()).unwrap_or(0.0);
+            let tb = self.players.get(b).map(|p| p.troops_f64()).unwrap_or(0.0);
+            ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut friends = Vec::new();
+        let mut enemies = Vec::new();
+        for id in players {
+            if self.is_friendly_ids(pid, &id) {
+                friends.push(id);
+            } else {
+                enemies.push(id);
+            }
+        }
+        (friends, enemies, border_tn || nearby_tn)
     }
 
     pub fn find_boat_in_region(&mut self, player_id: &str, region: i32) -> Option<TileRef> {
@@ -4822,17 +5677,40 @@ impl Game {
         if ty.is_nuke() {
             return self.find_nuke_anywhere(player_id, ty);
         }
+        let idx = UNIT_HEAD_ORDER.iter().position(|&t| t == ty).unwrap_or(0);
+        let tick = self
+            .players
+            .get(player_id)
+            .map(|p| p.last_tile_change)
+            .unwrap_or(0);
+        let gold = self.players.get(player_id).map(|p| p.gold).unwrap_or(0);
+        let nunits = self.units.len();
+        let same_tiles = tick == self.build_cache_tick && nunits == self.build_cache_units;
+        if same_tiles {
+            if let Some(cached) = self.build_found[idx] {
+                if self.can_build(player_id, ty, cached).is_some() {
+                    return Some(cached);
+                }
+            } else if self.build_none[idx] && gold <= self.build_cache_gold {
+                return None;
+            }
+        }
         let tiles: Vec<TileRef> = self
             .players
             .get(player_id)
             .map(|p| p.tiles.iter().copied().collect())
             .unwrap_or_default();
-        for t in tiles {
-            if let Some(s) = self.can_build(player_id, ty, t) {
-                return Some(s);
-            }
+        let found = tiles.into_iter().find_map(|t| self.can_build(player_id, ty, t));
+        if !same_tiles {
+            self.build_cache_tick = tick;
+            self.build_cache_units = nunits;
+            self.build_found = [None; NUM_UNIT_TYPES];
+            self.build_none = [false; NUM_UNIT_TYPES];
         }
-        None
+        self.build_cache_gold = gold;
+        self.build_found[idx] = found;
+        self.build_none[idx] = found.is_none();
+        found
     }
 
     fn find_warship_in_region(&mut self, player_id: &str, region: i32) -> Option<TileRef> {
@@ -4982,6 +5860,16 @@ impl Game {
     pub fn alliances(&self) -> &[Alliance] {
         &self.alliances
     }
+}
+
+fn player_center(map: &GameMap, p: &Player) -> (u32, u32) {
+    if let Some((min_x, min_y, max_x, max_y)) = p.largest_cluster_box {
+        return (
+            min_x + (max_x - min_x) / 2,
+            min_y + (max_y - min_y) / 2,
+        );
+    }
+    player_border_center(map, p)
 }
 
 fn player_border_center(map: &GameMap, p: &Player) -> (u32, u32) {

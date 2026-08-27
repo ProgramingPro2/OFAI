@@ -54,9 +54,9 @@ def test_capabilities_cli_declares_foundation_and_fallback():
     assert caps["unsupported"]["boats"] is False
     assert caps["supported"]["structures"] is True
     assert caps["supported"]["diplomacy"] is True
-    assert caps["supported"]["nations_ai"] is False
+    assert caps["supported"]["nations_ai"] is True
     assert caps["supported"]["tribe_ai"] is True
-    assert caps["unsupported"]["nations_ai"] is True
+    assert caps["unsupported"]["nations_ai"] is False
     assert caps["unsupported"]["tribe_ai"] is False
     assert caps["unsupported"]["nukes"] is False
     assert caps["unsupported"]["rails"] is False

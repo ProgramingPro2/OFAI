@@ -14,7 +14,7 @@ use crate::spec::{
     EnvConfig, PlayerType, TerminalCause, ACTION_NOOP, ELIMINATION_SHAPING_WEIGHT, REWARD_DEATH,
     REWARD_LOSS_ALIVE, REWARD_NO_SPAWN, REWARD_SPAWN, REWARD_TIMEOUT, REWARD_WIN,
 };
-use crate::terrain::TerrainCache;
+use crate::terrain::{MapAssets, TerrainCache};
 
 pub struct RewardTerms {
     pub terminal: f64,
@@ -58,6 +58,7 @@ pub struct StepResult {
 pub struct AgentEnv {
     pub cfg: EnvConfig,
     game: Game,
+    assets: MapAssets,
     me_id: String,
     extractor: ObsExtractor,
     obs: ObsBuffers,
@@ -72,6 +73,8 @@ pub struct AgentEnv {
     initial_opponents: f64,
     last_step: StepDigestInput,
     pub reset_count: u32,
+    pub last_sim_ms: f64,
+    pub last_mask_obs_ms: f64,
 }
 
 impl AgentEnv {
@@ -82,19 +85,19 @@ impl AgentEnv {
                 e.reasons.join("; ")
             )
         })?;
+        let fresh = terrain.fresh_terrain(&cfg.map, cfg.map_size)?;
+        let assets = fresh.assets.clone();
         let mut env = Self {
             cfg: cfg.clone(),
-            game: Game::new(
-                terrain
-                    .fresh_terrain(&cfg.map, cfg.map_size)?
-                    .game_map,
-                terrain
-                    .fresh_terrain(&cfg.map, cfg.map_size)?
-                    .mini_map,
+            game: Game::from_assets(
+                fresh.game_map,
+                fresh.mini_map,
                 vec![],
                 cfg.difficulty,
                 cfg.seed.clone(),
+                Some(&assets),
             ),
+            assets,
             me_id: String::new(),
             extractor: ObsExtractor::new(),
             obs: ObsBuffers::new(),
@@ -109,8 +112,10 @@ impl AgentEnv {
             initial_opponents: 1.0,
             last_step: StepDigestInput::default(),
             reset_count: 0,
+            last_sim_ms: 0.0,
+            last_mask_obs_ms: 0.0,
         };
-        env.reset_inner(terrain, None)?;
+        env.reset_inner()?;
         Ok(env)
     }
 
@@ -131,6 +136,24 @@ impl AgentEnv {
         terrain: &mut TerrainCache,
         next: Option<&serde_json::Value>,
     ) -> Result<&ObsBuffers, String> {
+        self.apply_next_config(next, Some(terrain))?;
+        self.reset_inner()?;
+        Ok(&self.obs)
+    }
+
+    pub fn reset_local(&mut self, next: Option<&serde_json::Value>) -> Result<&ObsBuffers, String> {
+        self.apply_next_config(next, None)?;
+        self.reset_inner()?;
+        Ok(&self.obs)
+    }
+
+    fn apply_next_config(
+        &mut self,
+        next: Option<&serde_json::Value>,
+        terrain: Option<&mut TerrainCache>,
+    ) -> Result<(), String> {
+        let old_map = self.cfg.map.clone();
+        let old_size = self.cfg.map_size;
         if let Some(v) = next {
             if let Some(s) = v.as_str() {
                 self.cfg.seed = s.to_string();
@@ -144,16 +167,18 @@ impl AgentEnv {
                 })?;
             }
         }
-        self.reset_inner(terrain, None)?;
-        Ok(&self.obs)
+        if self.cfg.map != old_map || self.cfg.map_size != old_size {
+            let cache = terrain.ok_or_else(|| {
+                "map change requires terrain cache; refusing mid-batch map switch".to_string()
+            })?;
+            let fresh = cache.fresh_terrain(&self.cfg.map, self.cfg.map_size)?;
+            self.assets = fresh.assets;
+        }
+        Ok(())
     }
 
-    fn reset_inner(
-        &mut self,
-        terrain: &mut TerrainCache,
-        _extra: Option<PlayerInfo>,
-    ) -> Result<(), String> {
-        let fresh = terrain.fresh_terrain(&self.cfg.map, self.cfg.map_size)?;
+    fn reset_inner(&mut self) -> Result<(), String> {
+        let (game_map, mini_map) = self.assets.fresh_maps()?;
         let mut rng = PseudoRandom::new(simple_hash(&self.cfg.seed));
         let me = PlayerInfo {
             name: "OFAI".into(),
@@ -162,16 +187,18 @@ impl AgentEnv {
             id: rng.next_id(),
         };
         self.me_id = me.id.clone();
-        let mut game = Game::new(
-            fresh.game_map,
-            fresh.mini_map,
+        let mut game = Game::from_assets(
+            game_map,
+            mini_map,
             vec![me],
             self.cfg.difficulty,
             self.cfg.seed.clone(),
+            Some(&self.assets),
         );
         let nations = create_nations(
             &self.cfg.nations,
-            &fresh.nations,
+            &self.assets.nations,
+            &self.assets.additional_nations,
             self.cfg.map_size,
             &mut rng,
         );
@@ -258,6 +285,18 @@ impl AgentEnv {
     }
 
     pub fn step(&mut self, action: ActionVec) -> StepResult {
+        let (reward, done, info) = self.step_apply(action);
+        StepResult {
+            obs: self.obs.clone(),
+            reward,
+            done,
+            info,
+        }
+    }
+
+    /// Step without cloning observation tensors. Server encodes from `peek_obs`.
+    pub fn step_apply(&mut self, action: ActionVec) -> (f64, bool, StepInfo) {
+        let t0 = std::time::Instant::now();
         let (intents, unsupported) = translate(
             &mut self.game,
             &self.me_id,
@@ -272,6 +311,7 @@ impl AgentEnv {
         self.tick_once();
         let rest = self.cfg.decision_interval.saturating_sub(1);
         self.run_ticks(rest);
+        self.last_sim_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         if self.game.player(&self.me_id).map(|p| p.has_spawned()).unwrap_or(false) {
             self.spawned_once = true;
@@ -371,7 +411,9 @@ impl AgentEnv {
             peak_tiles_frac: self.peak_tiles,
             kills: self.kills,
         };
+        let t_obs = std::time::Instant::now();
         self.extract_obs();
+        self.last_mask_obs_ms = t_obs.elapsed().as_secs_f64() * 1000.0;
 
         let mut info = StepInfo {
             tick: self.game.ticks(),
@@ -408,12 +450,7 @@ impl AgentEnv {
             info.obs_digest = Some(b.obs_digest);
             info.step_digest = Some(b.step_digest);
         }
-        StepResult {
-            obs: self.obs.clone(),
-            reward: self.last_step.reward,
-            done,
-            info,
-        }
+        (self.last_step.reward, done, info)
     }
 
     fn elim_progress(&self) -> f64 {

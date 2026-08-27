@@ -169,6 +169,10 @@ pub enum LaterExec {
         target: u32,
         dst: TileRef,
         last_move: u32,
+        air_seed: i32,
+        air_path: Option<Vec<TileRef>>,
+        air_index: usize,
+        air_last_to: Option<TileRef>,
         inited: bool,
     },
     Shell {

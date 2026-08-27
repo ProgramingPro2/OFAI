@@ -375,7 +375,7 @@ impl ObsExtractor {
             self.build_static(game, me_id);
         }
 
-        out.spatial.fill(0.0);
+        out.spatial[CH_MY_STRUCTURES * PLANE..(CH_ENEMY_STRUCTURES + 1) * PLANE].fill(0.0);
         out.spatial[..PLANE].copy_from_slice(&self.land_bins);
         out.spatial[CH_MOUNTAIN * PLANE..CH_MOUNTAIN * PLANE + PLANE]
             .copy_from_slice(&self.mountain_bins);
@@ -480,6 +480,9 @@ impl ObsExtractor {
                 ally_signal: false,
             });
         }
+        if overflow {
+            write_overflow_aggregate(&mut out.players, me, land, game, &metas[n..]);
+        }
 
         // Incoming attacks on me live on other players' outgoing lists.
         let mut my_incoming = 0.0;
@@ -522,6 +525,71 @@ fn incoming_troops_from(game: &Game, me_id: &str, other_id: &str) -> f64 {
                 .sum()
         })
         .unwrap_or(0.0)
+}
+
+fn write_overflow_aggregate(
+    players: &mut [f32],
+    me: &crate::player::Player,
+    land: f64,
+    game: &Game,
+    rest: &[(i64, u16, String, bool, bool, bool)],
+) {
+    let mut tiles = 0.0;
+    let mut troops = 0.0;
+    let mut gold = 0.0;
+    let mut incoming = 0.0;
+    let mut alive = 0u32;
+    let mut spawned = 0u32;
+    let mut nation_tiles = 0.0;
+    let mut bot_tiles = 0.0;
+    let mut border = 0u32;
+    let mut relation_sum = 0.0;
+    for meta in rest {
+        let Some(p) = game.player(&meta.2) else {
+            continue;
+        };
+        let owned = p.num_tiles() as f64;
+        tiles += owned;
+        troops += p.troops_f64();
+        gold += p.gold as f64;
+        if p.is_alive() {
+            alive += 1;
+        }
+        if p.has_spawned() {
+            spawned += 1;
+        }
+        if p.player_type() == PlayerType::Nation {
+            nation_tiles += owned;
+        }
+        if p.player_type() == PlayerType::Bot {
+            bot_tiles += owned;
+        }
+        if meta.3 {
+            border += 1;
+        }
+        relation_sum += me.relation(p.id()) as i32 as f64;
+        incoming += incoming_troops_from(game, me.id(), p.id());
+    }
+    let _ = (nation_tiles, bot_tiles);
+    let b = (NUM_PLAYER_SLOTS - 1) * PLAYER_FEATURES;
+    players[b] = 1.0;
+    players[b + 1] = 0.0;
+    players[b + 2] = obs_f32(tiles / land);
+    players[b + 3] = obs_f32(troops.ln_1p() / 15.0);
+    players[b + 4] = obs_f32(gold.ln_1p() / 20.0);
+    players[b + 5] = if alive > 0 { 1.0 } else { 0.0 };
+    players[b + 6] = 1.0;
+    players[b + 7] = 1.0;
+    players[b + 8] = 0.0;
+    players[b + 9] = 0.0;
+    players[b + 10] = obs_f32(incoming.ln_1p() / 15.0);
+    players[b + 11] = if border > 0 { 1.0 } else { 0.0 };
+    players[b + 12] = if rest.is_empty() {
+        0.0
+    } else {
+        obs_f32(relation_sum / rest.len() as f64 / 3.0)
+    };
+    players[b + 13] = if spawned > 0 { 1.0 } else { 0.0 };
 }
 
 fn write_self(players: &mut [f32], me: &crate::player::Player, land: f64) {

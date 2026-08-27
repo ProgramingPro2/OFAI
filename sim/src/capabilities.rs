@@ -65,14 +65,14 @@ impl Capabilities {
                 structures: true,
                 diplomacy: true,
                 tribe_ai: true,
-                nations_ai: false, // Nation structure/nuke placement not bit-exact yet.
+                nations_ai: true,
                 terminals: ["no_spawn", "timeout", "death", "win", "loss_alive"],
             },
             unsupported: UnsupportedCaps {
                 boats: false,
                 structures: false,
                 diplomacy: false,
-                nations_ai: true,
+                nations_ai: false,
                 tribe_ai: false,
                 doomsday: false,
                 nukes: false,
@@ -94,9 +94,7 @@ pub struct UnsupportedConfig {
 
 impl UnsupportedConfig {
     pub fn check(_cfg: &EnvConfig) -> Result<(), Self> {
-        // Tribe AI is proven. Rails/nukes/doomsday execute in-process.
-        // Nation AI stays capability-false: structure/nuke placement is
-        // not yet a line-for-line NationStructureBehavior port.
+        // Tribe AI, Nation AI, rails, nukes, and doomsday execute in-process.
         Ok(())
     }
 }

@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use ofai_sim::actions::ActionVec;
 use ofai_sim::capabilities::Capabilities;
 use ofai_sim::env::AgentEnv;
+use ofai_sim::obs::ObsBuffers;
 use ofai_sim::spec::{
-    EnvConfig, MapSize, NationsSpec, ACTION_ATTACK, ACTION_BOAT, ACTION_BUILD, ACTION_SPAWN,
+    EnvConfig, MapSize, NationsSpec, ACTION_ATTACK, ACTION_ALLY, ACTION_BOAT, ACTION_BREAK_ALLY,
+    ACTION_BUILD, ACTION_EMBARGO, ACTION_NOOP, ACTION_SPAWN, NUM_PLAYER_SLOTS, NUM_QUANTITIES,
+    NUM_REGIONS, NUM_UNIT_TYPES,
 };
 use ofai_sim::terrain::TerrainCache;
 
@@ -36,7 +39,7 @@ fn capabilities_declare_ported_slices_and_later_system_boundary() {
     assert!(caps.supported.structures);
     assert!(caps.supported.diplomacy);
     assert!(caps.supported.tribe_ai);
-    assert!(!caps.supported.nations_ai);
+    assert!(caps.supported.nations_ai);
     assert!(!caps.unsupported.nukes);
     assert!(!caps.unsupported.rails);
     assert!(!caps.unsupported.doomsday);
@@ -618,10 +621,305 @@ fn later_feature_official_vs_rust_traces() {
             .unwrap_or_else(|e| panic!("{seed} official replay: {e}"));
         assert_eq!(rust_init, off_init, "{seed} init tileDigest");
         for (i, (got, exp)) in rust_bounds.iter().zip(off_bounds.iter()).enumerate() {
-            assert_eq!(got.tile_digest, exp["tileDigest"].as_str().unwrap(), "{seed} step {i} tileDigest");
-            assert_eq!(got.core_hash, exp["coreHash"].as_f64(), "{seed} step {i} coreHash");
-            assert_eq!(got.obs_digest, exp["obsDigest"].as_str().unwrap(), "{seed} step {i} obsDigest");
-            assert_eq!(got.digest, exp["digest"].as_str().unwrap(), "{seed} step {i} digest");
+            assert_full_boundary(seed, i, got, exp);
+        }
+    }
+}
+
+fn first_set_index(mask: &[u8]) -> i32 {
+    mask.iter()
+        .position(|&b| b != 0)
+        .map(|i| i as i32)
+        .unwrap_or(0)
+}
+
+fn system_trace_action(obs: &ObsBuffers, step: usize) -> ActionVec {
+    if obs.action_mask[ACTION_SPAWN as usize] != 0 {
+        return ActionVec {
+            action_type: ACTION_SPAWN,
+            target: 0,
+            region: first_set_index(&obs.spawn_regions).max(2),
+            quantity: 0,
+            unit: 0,
+        };
+    }
+    let prefer = match step % 7 {
+        1 => ACTION_BUILD,
+        2 => ACTION_BOAT,
+        3 => ACTION_ALLY,
+        4 => ACTION_EMBARGO,
+        5 => ACTION_BREAK_ALLY,
+        _ => ACTION_ATTACK,
+    };
+    let chosen = if obs.action_mask.get(prefer as usize).copied().unwrap_or(0) != 0 {
+        prefer
+    } else if obs.action_mask[ACTION_ATTACK as usize] != 0 {
+        ACTION_ATTACK
+    } else if obs.action_mask[ACTION_BUILD as usize] != 0 {
+        ACTION_BUILD
+    } else if obs.action_mask[ACTION_BOAT as usize] != 0 {
+        ACTION_BOAT
+    } else {
+        ACTION_NOOP
+    };
+    let region = match chosen {
+        ACTION_SPAWN => first_set_index(&obs.spawn_regions),
+        ACTION_BUILD => first_set_index(&obs.build_regions),
+        ACTION_BOAT => first_set_index(&obs.boat_regions),
+        _ => (step % NUM_REGIONS) as i32,
+    };
+    let unit = if chosen == ACTION_BUILD {
+        let idx = (step / 7) % NUM_UNIT_TYPES;
+        if obs.unit_mask.get(idx).copied().unwrap_or(0) != 0 {
+            idx as i32
+        } else {
+            first_set_index(&obs.unit_mask)
+        }
+    } else {
+        first_set_index(&obs.unit_mask)
+    };
+    ActionVec {
+        action_type: chosen,
+        target: first_legal_target(&obs.target_masks, chosen as usize, NUM_PLAYER_SLOTS),
+        region,
+        quantity: first_set_index(&obs.quantity_mask).min((NUM_QUANTITIES - 1) as i32),
+        unit,
+    }
+}
+
+fn assert_full_boundary(
+    label: &str,
+    i: usize,
+    got: &ofai_sim::digest::DecisionBoundary,
+    exp: &serde_json::Value,
+) {
+    if got.tile_digest != exp["tileDigest"].as_str().unwrap() {
+        panic!(
+            "{label} step {i} tileDigest rust_tick={} off_tick={:?} rust_hash={:?} off_hash={:?}\nrust_tile={}\noff_tile={}",
+            got.tick,
+            exp["tick"].as_u64(),
+            got.core_hash,
+            exp["coreHash"].as_f64(),
+            got.tile_digest,
+            exp["tileDigest"].as_str().unwrap_or(""),
+        );
+    }
+    assert_eq!(
+        got.core_hash,
+        exp["coreHash"].as_f64(),
+        "{label} step {i} coreHash"
+    );
+    assert_eq!(
+        got.obs_digest,
+        exp["obsDigest"].as_str().unwrap(),
+        "{label} step {i} obsDigest"
+    );
+    assert_eq!(
+        got.step_digest,
+        exp["stepDigest"].as_str().unwrap(),
+        "{label} step {i} stepDigest"
+    );
+    assert_eq!(
+        got.digest,
+        exp["digest"].as_str().unwrap(),
+        "{label} step {i} digest"
+    );
+    assert_eq!(
+        got.reward,
+        exp["reward"].as_f64().unwrap(),
+        "{label} step {i} reward"
+    );
+    assert_eq!(
+        got.intent_count as u64,
+        exp["intentCount"].as_u64().unwrap(),
+        "{label} step {i} intentCount"
+    );
+    assert_eq!(
+        got.action_accepted,
+        exp["actionAccepted"].as_bool().unwrap(),
+        "{label} step {i} actionAccepted"
+    );
+    assert_eq!(
+        got.terminal_cause.as_str(),
+        exp["terminalCause"].as_str().unwrap(),
+        "{label} step {i} terminalCause"
+    );
+    assert_eq!(got.win, exp["win"].as_bool().unwrap(), "{label} step {i} win");
+    assert_eq!(
+        got.tick as u64,
+        exp["tick"].as_u64().unwrap(),
+        "{label} step {i} tick"
+    );
+}
+
+#[test]
+fn long_randomized_official_vs_rust_system_traces() {
+    use ofai_sim::spec::Difficulty;
+    let cases: &[(&str, &str, u32, serde_json::Value, Difficulty, i64, usize)] = &[
+        (
+            "sys-boats-easy",
+            "boats",
+            4,
+            serde_json::json!("disabled"),
+            Difficulty::Easy,
+            2_500_000,
+            16,
+        ),
+        (
+            "sys-rails-hard",
+            "port-factory",
+            0,
+            serde_json::json!("disabled"),
+            Difficulty::Hard,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-naval-impossible",
+            "warships-combat",
+            0,
+            serde_json::json!("disabled"),
+            Difficulty::Impossible,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-nukes-atom",
+            "nukes-atom",
+            0,
+            serde_json::json!("disabled"),
+            Difficulty::Hard,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-sam-nations",
+            "sam-intercept",
+            0,
+            serde_json::json!(3),
+            Difficulty::Impossible,
+            50_000_000,
+            24,
+        ),
+        (
+            "sys-sam-nations-easy",
+            "sam-intercept",
+            0,
+            serde_json::json!(3),
+            Difficulty::Easy,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-sam-nations-hard",
+            "sam-intercept",
+            0,
+            serde_json::json!(3),
+            Difficulty::Hard,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-mirv-nations",
+            "nukes-mirv",
+            2,
+            serde_json::json!(2),
+            Difficulty::Hard,
+            50_000_000,
+            24,
+        ),
+        (
+            "sys-mirv-nations-impossible",
+            "nukes-mirv",
+            2,
+            serde_json::json!(2),
+            Difficulty::Impossible,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-diplomacy-nations",
+            "diplomacy",
+            4,
+            serde_json::json!(3),
+            Difficulty::Easy,
+            5_000_000,
+            24,
+        ),
+        (
+            "sys-diplomacy-nations-medium",
+            "diplomacy",
+            4,
+            serde_json::json!(3),
+            Difficulty::Medium,
+            5_000_000,
+            16,
+        ),
+        (
+            "sys-diplomacy-nations-hard",
+            "diplomacy",
+            4,
+            serde_json::json!(3),
+            Difficulty::Hard,
+            5_000_000,
+            16,
+        ),
+        (
+            "sys-win-terminal",
+            "win",
+            0,
+            serde_json::json!("disabled"),
+            Difficulty::Impossible,
+            50_000_000,
+            16,
+        ),
+        (
+            "sys-pangaea-bots",
+            "boats",
+            6,
+            serde_json::json!("disabled"),
+            Difficulty::Medium,
+            10_000_000,
+            12,
+        ),
+    ];
+    let mut cache = terrain();
+    for (seed, template, bots, nations, difficulty, gold, steps) in cases {
+        let mut raw = load_golden(template)["config"].clone();
+        raw["seed"] = serde_json::json!(seed);
+        raw["bots"] = serde_json::json!(bots);
+        raw["nations"] = nations.clone();
+        raw["difficulty"] = serde_json::json!(format!("{difficulty:?}"));
+        raw["startingGold"] = serde_json::json!(gold);
+        raw["enableDigest"] = serde_json::json!(true);
+        raw["maxTicks"] = serde_json::json!(1200);
+        if *seed == "sys-pangaea-bots" {
+            raw["map"] = serde_json::json!("Pangaea");
+            raw["mapSize"] = serde_json::json!("Compact");
+        }
+        let cfg = EnvConfig::from_json(&raw).unwrap();
+        let mut rust = AgentEnv::create(cfg, &mut cache).unwrap_or_else(|e| panic!("{seed} create: {e}"));
+        let rust_init = rust.strong_state_digest();
+        let mut actions = Vec::new();
+        let mut rust_bounds = Vec::new();
+        for i in 0..*steps {
+            let act = system_trace_action(rust.peek_obs(), i);
+            actions.push([act.action_type, act.target, act.region, act.quantity, act.unit]);
+            let step = rust.step(act);
+            rust_bounds.push(rust.strong_state_digest());
+            if let Some(reason) = step.info.fallback.as_deref() {
+                panic!("{seed} rust fallback at step {i}: {reason}");
+            }
+            if step.done {
+                break;
+            }
+        }
+        let (off_init, off_bounds) = official_replay_boundaries(&raw, &actions)
+            .unwrap_or_else(|e| panic!("{seed} official replay: {e}"));
+        assert_eq!(rust_init.tile_digest, off_init, "{seed} init tileDigest");
+        assert_eq!(off_bounds.len(), rust_bounds.len(), "{seed} boundary count");
+        for (i, (got, exp)) in rust_bounds.iter().zip(off_bounds.iter()).enumerate() {
+            assert_full_boundary(seed, i, got, exp);
         }
     }
 }

@@ -1,8 +1,10 @@
 # OFAI
 
 Reinforcement-learning agent for OpenFront. Trains headlessly against the
-game's built-in AI (Nations/Tribes) using the deterministic TypeScript core
-as the environment and a PyTorch PPO stack as the learner.
+game's built-in AI (Nations/Tribes) using a schema-v2 env (Rust sim by
+default when supported, official TypeScript core otherwise) and a
+PyTorch PPO stack as the learner. Standalone eval is always the official
+core.
 
 See `docs/PLAN.md` for architecture, observation/action spaces, reward
 protocol, curriculum, checkpoint schema, and roadmap.
@@ -26,7 +28,7 @@ source .venv/bin/activate
 
 # Train (N env-server processes x K games each). Fresh runs truncate their
 # JSONL logs; resume appends. Episode-level metrics go to logs/<run>.episodes.jsonl.
-python -m agent.train --servers 8 --envs 8 --workers 2 --backend official \
+python -m agent.train --servers 8 --envs 8 --workers 4 --backend auto \
     --rollout-len 128 --run-name run1 \
     --eval-every 25 --eval-episodes 32 --total-steps 12000000
 
@@ -37,7 +39,14 @@ python -m agent.train --resume checkpoints/run1/latest.pt --run-name run1 \
 # Evaluate true 80% FFA objective (no milestone termination).
 # Sampled is the deployed policy; --mode deterministic is a greedy diagnostic.
 python -m agent.eval --ckpt checkpoints/run1/best.pt --episodes 20 \
-    --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30
+    --map Halkidiki --map-size Compact --bots 1 --stage-tiles-frac 0.30 --workers 2
+# Frozen Impossible holdout / SouthAmerica OOD (see docs/eval.md)
+python -m agent.eval --ckpt checkpoints/run1/best.pt \
+    --stage nations-impossible-world --suite holdout \
+    --sampled-episodes 64 --det-episodes 8 --workers 2 --json-out eval-holdout.json
+python -m agent.eval --ckpt checkpoints/run1/best.pt \
+    --stage nations-impossible-world --suite ood \
+    --sampled-episodes 16 --det-episodes 0 --workers 2 --json-out eval-ood.json
 
 # Watch (sampled policy; recommended fast preview).
 # Interactive: one fullscreen pygame window for dropdown configuration,
@@ -65,7 +74,7 @@ python -m agent.watch --ckpt checkpoints/run1/latest.pt \
 python -m pytest tests/test_rl_pipeline.py tests/test_v4_redesign.py \
     tests/test_baseline_gates.py tests/test_backend_select.py \
     tests/test_env_workers.py tests/test_eval_scheduler.py \
-    tests/test_sample_efficiency.py -q
+    tests/test_eval_harness.py tests/test_sample_efficiency.py -q
 
 # Live env smoke (requires OpenFrontIO env server)
 python tests/test_env_client.py
@@ -138,9 +147,9 @@ the native map and saved-video resolution; display fitting does not alter
 video output.
 
 Key flags: `--servers`, `--envs`, `--workers` (`auto` / `N`; `0`/`1` is
-the sequential official oracle), `--backend` (`official` production
-default; `auto`/`rust` only if every remaining stage is schema-v2
-supported), `--total-steps`, `--additional-steps`,
+the sequential official oracle), `--backend` (`auto` default: rust when every remaining stage is
+schema-v2 supported, else official; `official` forces the TypeScript
+core; `rust` is the same fail-closed check as auto), `--total-steps`, `--additional-steps`,
 `--resume`, `--stage` / `--force-stage` (name or current-table index),
 `--keep-optimizer` (advanced; default `--force-stage` is a fresh Adam
 at `--lr`), `--allow-collapsed-resume`, `--dry-run`,
@@ -251,21 +260,18 @@ runtime from being enabled.
 
 ## Simulator backends
 
-The official TypeScript core is the only production trainer and the only
-checkpoint-promotion authority. `--backend official` (default) always
-spawns `OpenFrontIO/ofai/env/EnvServer.ts`. `--backend auto` or `rust`
-may select the schema-v2 Rust mirror (`sim/`) only when **every**
-remaining curriculum stage is explicitly supported in the capability
-document (`cargo run --manifest-path sim/Cargo.toml -- --capabilities`).
-Unsupported capabilities — currently boats (HPA water paths), nukes,
-rails, and doomsday — transparently select official **before episode
-creation**. Mid-episode switching and approximation are refused.
+Training `--backend auto` (default) selects the schema-v2 Rust mirror
+(`sim/`) when **every** remaining curriculum stage is supported in the
+capability document (`cargo run --manifest-path sim/Cargo.toml -- --capabilities`).
+`--backend official` always spawns `OpenFrontIO/ofai/env/EnvServer.ts`.
+Standalone `python -m agent.eval` is official-core only and is the
+checkpoint-quality authority for Impossible wins. Unsupported or unknown
+capabilities select official **before episode creation**. Mid-episode
+switching and approximation are refused.
 
-Every current curriculum stage includes boat, so `auto` falls back to
-official for training. Rust may still be used for isolated wilderness
-goldens and differential tests. The official farm has two actor modes
-that must stay byte-equal: sequential (`--workers 0`/`1`, the oracle)
-and parallel (`--workers N>1`, each worker owns complete games).
+The official farm has two actor modes that must stay byte-equal:
+sequential (`--workers 0`/`1`, the oracle) and parallel (`--workers N>1`,
+each worker owns complete games).
 
 On this 32-core host, measured duel layouts (no shard failures):
 
@@ -291,7 +297,7 @@ gate (win rate, Wilson, reference-KL, diversity). NLL-only is not an
 accept. This validation rejected BC for production because no BC
 candidate cleared that frozen official-core gate.
 
-Limitations: Rust is not a drop-in nations trainer while boats are
-unsupported. Parallel official workers fall back to sequential if a
+Limitations: a Rust farm that cannot declare a required capability stays
+on official. Parallel official workers fall back to sequential if a
 worker farm fails to init. Do not point this stack at public
 multiplayer servers.

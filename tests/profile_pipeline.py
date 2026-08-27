@@ -10,7 +10,8 @@ Representative baseline (duel, peninsula, nations; 16x8 vs 32x4 vs 64x2):
   .venv/bin/python tests/profile_pipeline.py --stage nations-easy-small
   .venv/bin/python tests/profile_pipeline.py --layouts 16x8,32x4,64x2 --iters 6
 
-Uses unused ports; keep away from an active v2run1 range 8980-8995.
+Uses unused ports; keep away from the live impossible1 trainer (8820-8827)
+and leftover 8790 watch/debug servers. Default 9400.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import spaces
+from agent.backend import BACKEND_OFFICIAL, parse_backend_arg
 from agent.curriculum import STAGES
 from agent.env_client import (
     EnvServerProcess,
@@ -39,14 +41,23 @@ from agent.env_client import (
 from agent.model import Policy, obs_to_tensors
 from agent.ppo import PPOConfig, PPOTrainer, RolloutBuffer
 
-# Far from v2run1 (8980-8995) and leftover 8790 watch/debug servers.
-DEFAULT_PORT = 9120
+# Far from impossible1 (8820-8827), v2run1 (8980-8995), and leftover 8790.
+DEFAULT_PORT = 9400
 REPRESENTATIVE_STAGES = (
     "duel",
     "nations-easy-peninsula",
     "nations-easy-small",
 )
+HIGH_SPEED_STAGES = (
+    "duel",
+    "tribes20",
+    "island-ffa",
+    "nations-easy-small",
+    "nations-impossible-world",
+)
 REPRESENTATIVE_LAYOUTS = ((16, 8), (32, 4), (64, 2))
+HIGH_SPEED_LAYOUTS = ((2, 8),)
+WORLD_LAYOUTS = ((2, 4),)
 QUICK_LAYOUTS = ((1, 4), (2, 2), (4, 1))
 PROFILE_KEYS = ("simMs", "maskObsMs", "serializeMs", "resetMs", "resets")
 
@@ -210,12 +221,17 @@ def print_step_report(label: str, k: int, report: dict[str, Any]) -> None:
         f"{report['env_steps_per_s']:6.1f} env-steps/s  "
         f"resets={int(report['resets'])} fail={report['shard_failures']}"
     )
+    extra = ""
+    if report.get("rss_mb") is not None:
+        extra += f"  rss={report['rss_mb']:.0f} MB"
+    if report.get("init_ms") is not None:
+        extra += f"  init={report['init_ms']:.0f} ms"
     print(
         f"{'':28}  sim={report['sim_ms']:6.1f} ms  "
         f"mask/obs={report['mask_obs_ms']:6.1f} ms  "
         f"serialize={report['serialize_ms']:6.1f} ms  "
         f"reset={report['reset_ms']:6.1f} ms  "
-        f"K={k}"
+        f"K={k}{extra}"
     )
 
 
@@ -230,25 +246,34 @@ def run_single_server(
     device: torch.device,
     include_policy: bool,
     workers: int = 0,
+    backend: str = BACKEND_OFFICIAL,
 ) -> dict[str, Any]:
     cfg = stage_cfg(stage)
     print(
-        f"stage={stage} map={cfg['map']} size={cfg['mapSize']} "
-        f"nations={cfg['nations']} bots={cfg['bots']} port={port} device={device}"
+        f"stage={stage} backend={backend} map={cfg['map']} size={cfg['mapSize']} "
+        f"nations={cfg['nations']} bots={cfg['bots']} port={port} workers={workers}"
     )
-    server = EnvServerProcess(port, workers=workers)
+    server = EnvServerProcess(port, workers=workers, backend=backend)
     out: dict[str, Any] = {
         "stage": stage,
         "topology": format_layout(1, k),
         "config": cfg,
+        "backend": backend,
+        "workers": workers,
     }
     try:
         env = VecEnv("127.0.0.1", port)
+        t_init = time.perf_counter()
         obs = env.init([{**cfg, "seed": f"prof-{i}"} for i in range(k)])
+        init_ms = (time.perf_counter() - t_init) * 1000.0
+        out["init_ms"] = init_ms
+        print(f"init {init_ms:.0f} ms  rss={server.rss_mb():.0f} MB")
         if burnin:
             step_env(env, k, burnin, 0, obs)
             print(f"burn-in {burnin} decision steps")
         report = step_env(env, k, iters, warmup, obs)
+        report["rss_mb"] = server.rss_mb()
+        report["init_ms"] = init_ms
         print_step_report(f"env.step (K={k})", k, report)
         out["env_step"] = report
 
@@ -355,18 +380,25 @@ def run_layout(
     warmup: int,
     burnin: int,
     workers: int = 0,
+    backend: str = BACKEND_OFFICIAL,
 ) -> dict[str, Any]:
     cfg = stage_cfg(stage)
     n = servers * envs_each
     topology = format_layout(servers, envs_each)
-    sharded = ShardedVecEnv(servers, port, envs_each, workers=workers)
+    sharded = ShardedVecEnv(
+        servers, port, envs_each, workers=workers, backend=backend
+    )
     try:
+        t_init = time.perf_counter()
         lobs = sharded.init(
             [{**cfg, "seed": f"lay-{topology}-{i}"} for i in range(n)]
         )
+        init_ms = (time.perf_counter() - t_init) * 1000.0
         if burnin:
             step_env(sharded, n, burnin, 0, lobs)
         report = step_env(sharded, n, iters, warmup, lobs)
+        report["rss_mb"] = sharded.rss_mb()
+        report["init_ms"] = init_ms
         print_step_report(f"  {topology}", n, report)
         return {
             "stage": stage,
@@ -375,6 +407,9 @@ def run_layout(
             "envs_each": envs_each,
             "total_envs": n,
             "workers": workers,
+            "backend": backend,
+            "init_ms": init_ms,
+            "rss_mb": report["rss_mb"],
             **report,
         }
     except Exception as exc:
@@ -386,6 +421,7 @@ def run_layout(
             "envs_each": envs_each,
             "total_envs": n,
             "workers": workers,
+            "backend": backend,
             "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
@@ -401,13 +437,14 @@ def run_layout_compare(
     warmup: int,
     burnin: int,
     workers: int = 0,
+    backend: str = BACKEND_OFFICIAL,
 ) -> list[dict[str, Any]]:
     totals = {s * e for s, e in layouts}
     if len(totals) != 1:
         raise SystemExit("layouts must share the same total env count")
     print(
         f"\nlayout compare total_envs={next(iter(totals))} "
-        f"stage={stage} workers={workers}"
+        f"stage={stage} workers={workers} backend={backend}"
     )
     rows: list[dict[str, Any]] = []
     base = port
@@ -422,6 +459,7 @@ def run_layout_compare(
                 warmup=warmup,
                 burnin=burnin,
                 workers=workers,
+                backend=backend,
             )
         )
         base += servers + 1
@@ -447,18 +485,20 @@ def run_baseline(
     device: torch.device,
     skip_layouts: bool,
     workers: int = 0,
+    backend: str = BACKEND_OFFICIAL,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "kind": "baseline",
         "stages": stages,
         "layouts": [format_layout(s, e) for s, e in layouts],
         "workers": workers,
+        "backend": backend,
         "single_server": [],
         "topology": [],
         "fastest_stable": {},
     }
     for i, stage in enumerate(stages):
-        print(f"\n=== stage {stage} ===")
+        print(f"\n=== stage {stage} backend={backend} ===")
         report["single_server"].append(
             run_single_server(
                 stage=stage,
@@ -470,6 +510,7 @@ def run_baseline(
                 device=device,
                 include_policy=i == 0,
                 workers=workers,
+                backend=backend,
             )
         )
         if skip_layouts:
@@ -483,6 +524,7 @@ def run_baseline(
             warmup=max(1, warmup // 2),
             burnin=burnin,
             workers=workers,
+            backend=backend,
         )
         report["topology"].extend(rows)
         best = pick_fastest_stable(rows)
@@ -491,11 +533,79 @@ def run_baseline(
                 "topology": best["topology"],
                 "env_steps_per_s": best["env_steps_per_s"],
                 "p50_ms": best["latency"]["p50_ms"],
+                "rss_mb": best.get("rss_mb"),
+                "init_ms": best.get("init_ms"),
             }
             print(
                 f"  fastest stable {stage}: {best['topology']} "
                 f"{best['env_steps_per_s']:.1f} env-steps/s"
             )
+    return report
+
+
+def stage_layouts(stage: str, layouts: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if stage == "nations-impossible-world":
+        return list(WORLD_LAYOUTS)
+    return layouts
+
+
+def run_high_speed(
+    *,
+    stages: list[str],
+    layouts: list[tuple[int, int]],
+    port: int,
+    iters: int,
+    warmup: int,
+    burnin: int,
+    workers: int,
+    backend: str,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "kind": "high-speed",
+        "backend": backend,
+        "workers": workers,
+        "iters": iters,
+        "warmup": warmup,
+        "burnin": burnin,
+        "stages": stages,
+        "topology": [],
+        "fastest_stable": {},
+    }
+    print(
+        f"high-speed backend={backend} workers={workers} "
+        f"iters={iters} warmup={warmup} burnin={burnin} port={port}"
+    )
+    base = port
+    for stage in stages:
+        used = stage_layouts(stage, layouts)
+        print(f"\n=== high-speed {stage} backend={backend} layouts={used} ===")
+        rows = run_layout_compare(
+            stage=stage,
+            layouts=used,
+            port=base,
+            iters=iters,
+            warmup=warmup,
+            burnin=burnin,
+            workers=workers,
+            backend=backend,
+        )
+        report["topology"].extend(rows)
+        best = pick_fastest_stable(rows)
+        if best:
+            report["fastest_stable"][stage] = {
+                "topology": best["topology"],
+                "env_steps_per_s": best["env_steps_per_s"],
+                "p50_ms": best["latency"]["p50_ms"],
+                "p95_ms": best["latency"]["p95_ms"],
+                "sim_ms": best.get("sim_ms"),
+                "mask_obs_ms": best.get("mask_obs_ms"),
+                "serialize_ms": best.get("serialize_ms"),
+                "rss_mb": best.get("rss_mb"),
+                "init_ms": best.get("init_ms"),
+                "resets": best.get("resets"),
+                "shard_failures": best.get("shard_failures"),
+            }
+        base += sum(s for s, _ in used) + 8
     return report
 
 
@@ -545,14 +655,55 @@ def main() -> None:
         "--workers",
         type=int,
         default=0,
-        help="official-core actor threads per EnvServer (0/1=sequential oracle)",
+        help="actor threads per EnvServer (official 0/1=sequential; rust parallelizes envs)",
+    )
+    p.add_argument(
+        "--backend",
+        type=str,
+        default=BACKEND_OFFICIAL,
+        help="official (TypeScript) or rust",
+    )
+    p.add_argument(
+        "--high-speed",
+        action="store_true",
+        help="rust-high-speed classes: duel, tribes20, island-ffa, nations-easy-small, World",
     )
     args = p.parse_args()
+    backend = parse_backend_arg(args.backend)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     iters = 4 if args.quick and args.iters == 12 else args.iters
     warmup = 1 if args.quick and args.warmup == 3 else args.warmup
     k = 2 if args.quick and args.k == 8 else args.k
+
+    if args.high_speed:
+        stages = (
+            [s.strip() for s in args.stages.split(",") if s.strip()]
+            if args.stages
+            else list(HIGH_SPEED_STAGES)
+        )
+        layouts = (
+            parse_layouts(args.layouts)
+            if args.layouts
+            else list(HIGH_SPEED_LAYOUTS)
+        )
+        hs_iters = 8 if args.iters == 12 else args.iters
+        hs_warmup = 3 if args.warmup == 3 else args.warmup
+        hs_burnin = 4 if args.burnin == 0 else args.burnin
+        report = run_high_speed(
+            stages=stages,
+            layouts=layouts,
+            port=args.port,
+            iters=hs_iters,
+            warmup=hs_warmup,
+            burnin=hs_burnin,
+            workers=args.workers,
+            backend=backend,
+        )
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
+            print(f"\nwrote {args.json_out}")
+        return
 
     if args.baseline:
         stages = (
@@ -578,6 +729,7 @@ def main() -> None:
             device=device,
             skip_layouts=args.skip_layouts,
             workers=args.workers,
+            backend=backend,
         )
         if args.json_out:
             Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
@@ -594,9 +746,15 @@ def main() -> None:
         device=device,
         include_policy=True,
         workers=args.workers,
+        backend=backend,
     )
     layouts = parse_layouts(args.layouts) if args.layouts else []
-    report: dict[str, Any] = {"kind": "single", "single_server": [single], "topology": []}
+    report: dict[str, Any] = {
+        "kind": "single",
+        "backend": backend,
+        "single_server": [single],
+        "topology": [],
+    }
     if layouts:
         report["topology"] = run_layout_compare(
             stage=args.stage,
@@ -606,6 +764,7 @@ def main() -> None:
             warmup=warmup,
             burnin=args.burnin,
             workers=args.workers,
+            backend=backend,
         )
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")

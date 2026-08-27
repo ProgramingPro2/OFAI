@@ -1,7 +1,7 @@
 """Narrow rust-features capability and fail-closed checks.
 
 Does not start training or the official env client. Verifies the expanded
-capability document and that HPA water paths / later systems stay official-only.
+capability document including boats, structures, diplomacy, and AI.
 """
 
 from __future__ import annotations
@@ -36,11 +36,11 @@ def test_capabilities_cli_declares_ported_slices_and_official_boundary():
     assert caps["supported"]["structures"] is True
     assert caps["supported"]["diplomacy"] is True
     assert caps["supported"]["tribe_ai"] is True
-    assert caps["supported"]["nations_ai"] is False
+    assert caps["supported"]["nations_ai"] is True
     assert caps["supported"]["boats"] is True
     assert caps["unsupported"]["boats"] is False
     assert caps["unsupported"]["tribe_ai"] is False
-    assert caps["unsupported"]["nations_ai"] is True
+    assert caps["unsupported"]["nations_ai"] is False
     assert caps["unsupported"]["nukes"] is False
     assert caps["unsupported"]["rails"] is False
     assert caps["unsupported"]["doomsday"] is False

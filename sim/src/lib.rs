@@ -19,6 +19,7 @@ pub mod js_math;
 pub mod later;
 pub mod later_tick;
 pub mod nation_later;
+pub mod nation_names;
 pub mod map;
 pub mod obs;
 pub mod parabola;

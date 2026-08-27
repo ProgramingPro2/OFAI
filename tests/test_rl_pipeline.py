@@ -33,6 +33,7 @@ from agent.env_client import (
     ShardedVecEnv,
     StepBatch,
     _concat_obs,
+    _describe_shard_failure,
     _encode_frame,
     _obs_dict,
     _read_frame,
@@ -386,6 +387,24 @@ def test_shard_recovery_no_double_step():
     assert step_counts[1] == 1
     env._restart_shard.assert_called()
     env.pool.shutdown(wait=False)
+
+
+def test_restart_failed_shards_logs_exception_and_liveness(capsys):
+    env = object.__new__(ShardedVecEnv)
+    env.connect = False
+    dead = MagicMock()
+    dead.alive.return_value = False
+    dead.proc.poll.return_value = 1
+    env.servers = [dead]
+    env._restart_shard = MagicMock()
+    env._lanes_for_shards = MagicMock(return_value=[0])
+    with pytest.raises(RolloutInterrupted):
+        env._restart_failed_shards([(0, TimeoutError("timed out"))])
+    out = capsys.readouterr().out
+    assert "TimeoutError" in out
+    assert "alive=false" in out
+    assert "rc=1" in out
+    assert _describe_shard_failure(0, TimeoutError("timed out"), dead) in out
 
 
 def test_read_frame_empty_header_is_connection_error():

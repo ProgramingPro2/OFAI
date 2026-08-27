@@ -1,5 +1,7 @@
 //! Packed OpenFront GameMap (terrain byte + uint16 owner/fallout/defense).
 
+use std::sync::Arc;
+
 use crate::spec::TerrainKind;
 
 pub type TileRef = u32;
@@ -19,13 +21,22 @@ pub struct GameMap {
     width: u32,
     height: u32,
     num_land_tiles: u32,
-    terrain: Vec<u8>,
+    terrain: Arc<[u8]>,
     state: Vec<u16>,
     num_fallout: u32,
 }
 
 impl GameMap {
     pub fn new(width: u32, height: u32, terrain: Vec<u8>, num_land_tiles: u32) -> Result<Self, String> {
+        Self::from_shared(width, height, Arc::<[u8]>::from(terrain), num_land_tiles)
+    }
+
+    pub fn from_shared(
+        width: u32,
+        height: u32,
+        terrain: Arc<[u8]>,
+        num_land_tiles: u32,
+    ) -> Result<Self, String> {
         let n = (width as usize)
             .checked_mul(height as usize)
             .ok_or_else(|| "map dimensions overflow".to_string())?;
@@ -45,6 +56,10 @@ impl GameMap {
             state: vec![0; n],
             num_fallout: 0,
         })
+    }
+
+    pub fn terrain_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.terrain)
     }
 
     pub fn width(&self) -> u32 {
@@ -306,8 +321,8 @@ impl GameMap {
 /// Connected water-body labels (cardinal). IDs are local; only equality matters.
 #[derive(Clone)]
 pub struct WaterComponents {
-    ids: Vec<i32>,
-    sizes: Vec<u32>,
+    ids: Arc<[i32]>,
+    sizes: Arc<[u32]>,
 }
 
 impl WaterComponents {
@@ -340,7 +355,10 @@ impl WaterComponents {
                 }
             }
         }
-        Self { ids, sizes }
+        Self {
+            ids: Arc::from(ids),
+            sizes: Arc::from(sizes),
+        }
     }
 
     pub fn water_id(&self, tile: TileRef) -> Option<i32> {

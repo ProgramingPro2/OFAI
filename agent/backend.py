@@ -5,11 +5,11 @@ every required capability is explicitly supported. Unsupported features
 select the official TypeScript core *before* episode creation. Mid-episode
 switching and approximation are forbidden.
 
-Production training defaults to official. Auto/rust requests still fall
-back whenever nation AI or an unknown capability is required. Boat,
-structure, diplomacy, tribe, rails, nukes, and doomsday episodes may
-use Rust. Nation stages stay official until Nation later-system
-placement is bit-exact.
+Training defaults to auto: Rust when the capability document supports
+every remaining stage (boats, structures, diplomacy, tribe/nation AI,
+rails, nukes, doomsday). Unknown or unsupported capabilities select
+the official TypeScript core before episode creation. agent.eval is
+always official-core.
 """
 
 from __future__ import annotations
@@ -174,16 +174,22 @@ def load_rust_capabilities(
     if not manifest.is_file():
         return default_rust_capabilities()
     try:
-        out = subprocess.check_output(
-            [
+        binary = rust_sim_binary()
+        if binary is not None:
+            cap_cmd = [str(binary), "--capabilities"]
+        else:
+            cap_cmd = [
                 "cargo",
                 "run",
                 "--quiet",
+                "--release",
                 "--manifest-path",
                 str(manifest),
                 "--",
                 "--capabilities",
-            ],
+            ]
+        out = subprocess.check_output(
+            cap_cmd,
             cwd=SIM_DIR,
             text=True,
             timeout=120,
@@ -198,27 +204,46 @@ def load_rust_capabilities(
     return caps
 
 
+def rust_sim_binary() -> Path | None:
+    """Prefer the release binary for throughput; fall back to debug."""
+    release = SIM_DIR / "target" / "release" / "ofai-sim"
+    if release.is_file():
+        return release
+    debug = SIM_DIR / "target" / "debug" / "ofai-sim"
+    if debug.is_file():
+        return debug
+    return None
+
+
 def rust_runtime_available() -> bool:
-    binary = SIM_DIR / "target" / "debug" / "ofai-sim"
-    if binary.is_file():
+    if rust_sim_binary() is not None:
         return True
     return (SIM_DIR / "Cargo.toml").is_file()
 
 
-def rust_sim_cmd(port: int) -> list[str]:
-    binary = SIM_DIR / "target" / "debug" / "ofai-sim"
-    if binary.is_file():
-        return [str(binary), "--port", str(int(port))]
-    return [
-        "cargo",
-        "run",
-        "--quiet",
-        "--manifest-path",
-        str(SIM_DIR / "Cargo.toml"),
-        "--",
-        "--port",
-        str(int(port)),
-    ]
+def rust_sim_cmd(port: int, workers: int = 0) -> list[str]:
+    """Argv for the schema-v2 Rust env server.
+
+    Always passes ``--workers`` so a single process can own K games with
+    deterministic per-env threads. Prefers ``target/release/ofai-sim``.
+    """
+    binary = rust_sim_binary()
+    if binary is not None:
+        cmd = [str(binary), "--port", str(int(port))]
+    else:
+        cmd = [
+            "cargo",
+            "run",
+            "--quiet",
+            "--release",
+            "--manifest-path",
+            str(SIM_DIR / "Cargo.toml"),
+            "--",
+            "--port",
+            str(int(port)),
+        ]
+    cmd.extend(["--workers", str(max(0, int(workers)))])
+    return cmd
 
 
 def rust_blocked_capabilities(

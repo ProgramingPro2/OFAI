@@ -79,7 +79,7 @@ fn capabilities_fail_closed_for_later_features() {
     assert!(caps.supported.boats);
     assert!(!caps.unsupported.boats);
     assert!(caps.supported.tribe_ai);
-    assert!(!caps.supported.nations_ai);
+    assert!(caps.supported.nations_ai);
     assert!(!caps.unsupported.nukes);
     assert!(!caps.unsupported.rails);
     assert_eq!(caps.fallback, "official");
@@ -95,7 +95,7 @@ fn later_systems_are_declared_supported() {
     assert!(!caps.unsupported.nukes);
     assert!(!caps.unsupported.rails);
     assert!(!caps.unsupported.doomsday);
-    assert!(!caps.supported.nations_ai);
+    assert!(caps.supported.nations_ai);
 }
 
 fn replay_named(name: &str) -> (serde_json::Value, ofai_sim::digest::DecisionBoundary, Vec<ofai_sim::digest::DecisionBoundary>) {

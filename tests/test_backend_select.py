@@ -50,13 +50,13 @@ SUPPORTED_CAPS = {
         "structures": True,
         "diplomacy": True,
         "tribe_ai": True,
-        "nations_ai": False,
+        "nations_ai": True,
     },
     "unsupported": {
         "boats": False,
         "structures": False,
         "diplomacy": False,
-        "nations_ai": True,
+        "nations_ai": False,
         "tribe_ai": False,
         "doomsday": False,
         "nukes": False,
@@ -89,9 +89,9 @@ def test_parse_backend_and_cli_default_official():
     with pytest.raises(ValueError, match="backend"):
         parse_backend_arg("mixed")
     args = parse_args(["--run-name", "be-cli"])
-    assert args.backend == "official"
-    rust = parse_args(["--run-name", "be-rust", "--backend", "auto"])
-    assert rust.backend == "auto"
+    assert args.backend == "auto"
+    official = parse_args(["--run-name", "be-off", "--backend", "official"])
+    assert official.backend == "official"
 
 
 def test_required_capabilities_from_actions_and_opponents():
@@ -169,9 +169,18 @@ def test_rust_request_fails_closed_without_approximating():
         capabilities=SUPPORTED_CAPS,
         rust_available=True,
     )
-    assert dec.backend == BACKEND_OFFICIAL
-    assert dec.fallback is True
-    assert "nations_ai" in dec.blocked
+    assert dec.backend == BACKEND_RUST
+    assert dec.fallback is False
+    assert "nations_ai" not in dec.blocked
+    empty = select_sim_backend(
+        "rust",
+        [nations],
+        capabilities={"schema": "v2", "fallback": "official", "supported": {}},
+        rust_available=True,
+    )
+    assert empty.backend == BACKEND_OFFICIAL
+    assert empty.fallback is True
+    assert "nations_ai" in empty.blocked
 
 
 def test_unknown_or_missing_caps_fail_closed():
@@ -203,17 +212,18 @@ def test_unknown_or_missing_caps_fail_closed():
     assert "schema" in bad_schema
 
 
-def test_curriculum_union_keeps_production_on_official():
+def test_curriculum_union_selects_rust_when_nations_are_supported():
     dec = select_training_backend(
         "auto",
         STAGES,
         capabilities=SUPPORTED_CAPS,
         rust_available=True,
     )
-    assert dec.backend == BACKEND_OFFICIAL
-    assert dec.fallback is True
+    assert dec.backend == BACKEND_RUST
+    assert dec.fallback is False
     assert "boats" in dec.required
-    assert "tribe_ai" in dec.blocked or "nations_ai" in dec.blocked
+    assert "nations_ai" in dec.required
+    assert "nations_ai" not in dec.blocked
     duel_cfg = stage_env_config(STAGES[0])
     assert "boat" in duel_cfg["allowedActions"]
 
@@ -235,22 +245,18 @@ def test_no_mid_episode_switch_to_unsupported_config():
 
 def test_env_server_cmd_official_unchanged_and_rust_uses_sim():
     official = env_server_cmd(8765, 4)
-    assert official == [
-        "npx",
-        "tsx",
-        "ofai/env/EnvServer.ts",
-        "--port",
-        "8765",
-        "--workers",
-        "4",
-    ]
+    assert official[0] == "node"
+    assert "--no-concurrent-recompilation" in official
+    assert official[official.index("--port") + 1] == "8765"
+    assert official[official.index("--workers") + 1] == "4"
     rust = env_server_cmd(8765, 4, backend="rust")
-    assert rust == rust_sim_cmd(8765)
+    assert rust == rust_sim_cmd(8765, 4)
     assert "--port" in rust
     assert "8765" in rust
+    assert rust[rust.index("--workers") + 1] == "4"
 
 
-def test_dry_run_reports_official_fallback(capsys):
+def test_dry_run_reports_rust_when_nations_are_supported(capsys):
     from agent import train as train_mod
 
     train_mod.main(
@@ -265,7 +271,6 @@ def test_dry_run_reports_official_fallback(capsys):
         ]
     )
     out = capsys.readouterr().out
-    assert "sim_backend=official" in out
+    assert "sim_backend=rust" in out
     assert "requested=auto" in out
-    assert "fallback=true" in out
-    assert "tribe_ai" in out or "nations_ai" in out
+    assert "fallback=false" in out

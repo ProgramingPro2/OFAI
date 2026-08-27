@@ -329,7 +329,7 @@ pub struct AbstractGraph {
 }
 
 impl AbstractGraph {
-    fn node_count(&self) -> usize {
+    pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
     fn get_node(&self, id: u32) -> Option<&AbstractNode> {
@@ -924,7 +924,7 @@ impl AbstractAStar {
 }
 
 pub struct WaterHpa {
-    graph: AbstractGraph,
+    graph: std::sync::Arc<AbstractGraph>,
     abs_astar: AbstractAStar,
     local: AStarWaterBounded,
     local_multi: AStarWaterBounded,
@@ -934,7 +934,10 @@ pub struct WaterHpa {
 
 impl WaterHpa {
     pub fn new(mini: &GameMap) -> Self {
-        let graph = build_abstract_graph(mini);
+        Self::from_graph(mini, std::sync::Arc::new(build_abstract_graph(mini)))
+    }
+
+    pub fn from_graph(mini: &GameMap, graph: std::sync::Arc<AbstractGraph>) -> Self {
         let cs = graph.cluster_size as usize;
         let abs_astar = AbstractAStar::new(&graph);
         Self {
@@ -1568,11 +1571,21 @@ pub struct WaterChain {
 
 impl WaterChain {
     pub fn new(mini: &GameMap) -> Self {
-        let hpa = WaterHpa::new(mini);
-        let use_hpa = hpa.node_count() >= HPA_NODE_THRESHOLD;
+        let graph = std::sync::Arc::new(build_abstract_graph(mini));
+        Self::from_graph(mini, Some(graph))
+    }
+
+    pub fn from_graph(mini: &GameMap, graph: Option<std::sync::Arc<AbstractGraph>>) -> Self {
+        let hpa = graph.and_then(|g| {
+            if g.node_count() >= HPA_NODE_THRESHOLD {
+                Some(WaterHpa::from_graph(mini, g))
+            } else {
+                None
+            }
+        });
         Self {
             simple: crate::path::AStarWater::new(mini),
-            hpa: if use_hpa { Some(hpa) } else { None },
+            hpa,
             smooth: AStarWaterBounded::new(mini, LOCAL_ASTAR_MAX_AREA),
         }
     }
