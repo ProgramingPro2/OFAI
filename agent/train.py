@@ -16,6 +16,7 @@ import argparse
 import json
 import random
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -61,7 +62,7 @@ from .curriculum import (
     Curriculum,
     cannot_pass_mastery_gate,
 )
-from .backend import select_training_backend
+from .backend import resolve_holdout_backend, select_training_backend
 from .env_client import RolloutInterrupted, ShardedVecEnv, resolve_env_workers
 from .model import Policy, obs_to_tensors
 from . import spaces
@@ -157,7 +158,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "stage is schema-v2 and fully supported, else official. rust requests "
         "the same fail-closed check. official always uses the TypeScript core. "
         "Unsupported features never approximate or switch mid-episode. "
+        "Holdout/mastery defaults to official-core when collect is rust. "
         "agent.eval stays official-core regardless of this flag.",
+    )
+    p.add_argument(
+        "--eval-backend",
+        type=str,
+        choices=("auto", "official", "train"),
+        default="auto",
+        help="holdout/mastery farm. auto (default) and official score on the "
+        "TypeScript core even when --backend rust/auto collects on rust. "
+        "train reuses the collect farm (A/B escape hatch).",
+    )
+    p.add_argument(
+        "--eval-port",
+        type=int,
+        default=0,
+        help="base port for a separate official holdout farm (0 = --port+200)",
+    )
+    p.add_argument(
+        "--eval-farm-servers",
+        type=int,
+        default=2,
+        help="official holdout EnvServer count when eval farm is separate",
+    )
+    p.add_argument(
+        "--eval-farm-envs",
+        type=int,
+        default=4,
+        help="games per official holdout server when eval farm is separate",
+    )
+    p.add_argument(
+        "--eval-farm-workers",
+        type=int,
+        default=2,
+        help="actor threads per official holdout server",
     )
     p.add_argument("--port", type=int, default=8765, help="base port (servers use port+i)")
     p.add_argument("--connect", action="store_true", help="connect to already-running servers")
@@ -254,6 +289,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="uniform",
         help="uniform: legal-set entropy (fresh default). effective: "
         "exclude always-legal utility types from the entropy bonus",
+    )
+    p.add_argument(
+        "--qty-ent-coef",
+        type=float,
+        default=0.0,
+        help="mask-normalized quantity-head entropy bonus on ATTACK/BOAT "
+        "(0=off; pairs with --ent-weighting effective for transfer)",
     )
     p.add_argument(
         "--ref-kl-coef",
@@ -354,6 +396,8 @@ def apply_v4_ablation_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.max_updates = 15
     if float(args.ref_kl_coef) <= 0.0:
         args.ref_kl_coef = 0.1
+    if float(args.qty_ent_coef) <= 0.0:
+        args.qty_ent_coef = 0.03
     # it800-class resumes already exceed the 10M default ceiling.
     if int(args.additional_steps) <= 0:
         farm = max(1, int(args.servers) * int(args.envs))
@@ -636,6 +680,41 @@ def _eval_configs(
         cfg["shaping"] = 0.0
         cfgs.append(cfg)
     return cfgs
+
+
+@contextmanager
+def holdout_farm(train_env: ShardedVecEnv, args, train_backend: str):
+    """Yield the env used for mastery/regression holdout.
+
+    When collect is rust and --eval-backend is auto/official, spawn a
+    short-lived official farm so the gate measures OpenFront, not rust.
+    """
+    holdout_backend = resolve_holdout_backend(train_backend, args.eval_backend)
+    train_sim = str(getattr(train_env, "sim_backend", train_backend)).strip().lower()
+    if holdout_backend == train_sim:
+        yield train_env
+        return
+    port = int(args.eval_port) if int(args.eval_port) > 0 else int(args.port) + 200
+    servers = max(1, int(args.eval_farm_servers))
+    envs = max(1, int(args.eval_farm_envs))
+    workers = max(0, int(args.eval_farm_workers))
+    print(
+        f"[eval] holdout_backend={holdout_backend} farm=separate "
+        f"port={port} servers={servers} envs={envs} workers={workers}",
+        flush=True,
+    )
+    extra = ShardedVecEnv(
+        num_servers=servers,
+        base_port=port,
+        envs_per_server=envs,
+        connect=False,
+        workers=workers,
+        backend=holdout_backend,
+    )
+    try:
+        yield extra
+    finally:
+        extra.close()
 
 
 def run_fixed_seed_eval(
@@ -984,6 +1063,7 @@ def main(argv: list[str] | None = None) -> None:
         num_minibatches=args.num_minibatches,
         ent_target=args.ent_target,
         ent_weighting=args.ent_weighting,
+        qty_ent_coef=args.qty_ent_coef,
         ref_kl_coef=args.ref_kl_coef,
         ref_kl_target=args.ref_kl_target,
         ref_kl_hard=args.ref_kl_hard,
@@ -1179,6 +1259,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"ref_kl_target={args.ref_kl_target:g} "
                 f"ent_target={args.ent_target:g} "
                 f"ent_weighting={args.ent_weighting} "
+                f"qty_ent_coef={args.qty_ent_coef:g} "
                 f"eval_every={args.eval_every} "
                 f"max_updates={args.max_updates} "
                 f"additional_steps={args.additional_steps} "
@@ -1206,6 +1287,10 @@ def main(argv: list[str] | None = None) -> None:
             )
         print(worker_res.log_line())
         print(backend_decision.log_line())
+        print(
+            f"[eval] holdout_backend={resolve_holdout_backend(backend_decision.backend, args.eval_backend)} "
+            f"requested={args.eval_backend} train={backend_decision.backend}"
+        )
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1224,6 +1309,13 @@ def main(argv: list[str] | None = None) -> None:
             "[env] rust selected because every remaining stage is "
             "schema-v2 supported; agent.eval stays official-core"
         )
+    holdout_backend = resolve_holdout_backend(
+        backend_decision.backend, args.eval_backend
+    )
+    print(
+        f"[eval] holdout_backend={holdout_backend} "
+        f"requested={args.eval_backend} train={backend_decision.backend}"
+    )
     env = ShardedVecEnv(
         num_servers=args.servers,
         base_port=args.port,
@@ -1413,16 +1505,17 @@ def main(argv: list[str] | None = None) -> None:
         env.set_episode_hooks(None)
         eval_failed = False
         try:
-            baseline, ev, ood_ev, unlock = run_pre_update_baseline(
-                policy=policy,
-                env=env,
-                curriculum=curriculum,
-                trainer=trainer,
-                device=device,
-                n_sampled=holdout_n,
-                n_det=args.eval_det_episodes,
-                n_ood=args.eval_ood_episodes,
-            )
+            with holdout_farm(env, args, backend_decision.backend) as eval_env:
+                baseline, ev, ood_ev, unlock = run_pre_update_baseline(
+                    policy=policy,
+                    env=eval_env,
+                    curriculum=curriculum,
+                    trainer=trainer,
+                    device=device,
+                    n_sampled=holdout_n,
+                    n_det=args.eval_det_episodes,
+                    n_ood=args.eval_ood_episodes,
+                )
         except BaseException:
             eval_failed = True
             raise
@@ -1694,32 +1787,33 @@ def main(argv: list[str] | None = None) -> None:
                 ood_ev = None
                 try:
                     env.set_episode_hooks(None)
-                    ev = run_fixed_seed_eval(
-                        policy,
-                        env,
-                        curriculum,
-                        device,
-                        holdout_n,
-                        n_det=args.eval_det_episodes,
-                        n_sampled=holdout_n,
-                        suite="holdout",
-                    )
-                    det = ev["deterministic"]
-                    samp = ev["sampled"]
-                    judgment = curriculum.judge_eval(ev)
-                    curriculum.note_eval(judgment["passed"])
-                    last_mastery = judgment
-                    if args.eval_ood_episodes > 0 and curriculum.stage.ood_maps:
-                        ood_ev = run_fixed_seed_eval(
+                    with holdout_farm(env, args, backend_decision.backend) as eval_env:
+                        ev = run_fixed_seed_eval(
                             policy,
-                            env,
+                            eval_env,
                             curriculum,
                             device,
-                            args.eval_ood_episodes,
-                            n_det=0,
-                            n_sampled=args.eval_ood_episodes,
-                            suite="ood",
+                            holdout_n,
+                            n_det=args.eval_det_episodes,
+                            n_sampled=holdout_n,
+                            suite="holdout",
                         )
+                        det = ev["deterministic"]
+                        samp = ev["sampled"]
+                        judgment = curriculum.judge_eval(ev)
+                        curriculum.note_eval(judgment["passed"])
+                        last_mastery = judgment
+                        if args.eval_ood_episodes > 0 and curriculum.stage.ood_maps:
+                            ood_ev = run_fixed_seed_eval(
+                                policy,
+                                eval_env,
+                                curriculum,
+                                device,
+                                args.eval_ood_episodes,
+                                n_det=0,
+                                n_sampled=args.eval_ood_episodes,
+                                suite="ood",
+                            )
                     last_eval = ev
                     apply_map_unlock(ev, it=st.iterations)
                     if int((stage_baseline or {}).get("episodes") or 0) < (

@@ -34,6 +34,108 @@ fn apply_ulp_corr(n: u32, bits: u64, minus: &[u32], plus: &[u32]) -> u64 {
     }
 }
 
+/// Node 22 / V8 `Math.exp` (fdlibm `__ieee754_exp`). Host `libm` is 1 ULP
+/// off for some combat-sigmoid inputs, which desyncs attack-troop hashes.
+pub fn js_exp(x: f64) -> f64 {
+    const ONE: f64 = 1.0;
+    const HALF: [f64; 2] = [0.5, -0.5];
+    const O_THRESHOLD: f64 = 7.097_827_128_933_839_730_96e2;
+    const U_THRESHOLD: f64 = -7.451_332_191_019_411_084_20e2;
+    const LN2_HI: [f64; 2] = [
+        6.931_471_803_691_238_164_90e-1,
+        -6.931_471_803_691_238_164_90e-1,
+    ];
+    const LN2_LO: [f64; 2] = [
+        1.908_214_929_270_587_700_02e-10,
+        -1.908_214_929_270_587_700_02e-10,
+    ];
+    const INVLN2: f64 = 1.442_695_040_888_963_387_00;
+    const P1: f64 = 1.666_666_666_666_660_190_37e-1;
+    const P2: f64 = -2.777_777_777_701_559_338_42e-3;
+    const P3: f64 = 6.613_756_321_437_934_361_17e-5;
+    const P4: f64 = -1.653_390_220_546_525_153_90e-6;
+    const P5: f64 = 4.138_136_797_057_238_460_39e-8;
+    const HUGE: f64 = 1.0e300;
+    const TWOM1000: f64 = 9.332_636_185_032_188_789_90e-302;
+
+    let b = x.to_bits();
+    let mut hx = (b >> 32) as u32;
+    let lx = b as u32;
+    let xsb = (hx >> 31) & 1;
+    hx &= 0x7fff_ffff;
+    if hx >= 0x4086_2e42 {
+        if hx >= 0x7ff0_0000 {
+            if ((hx & 0xfffff) | lx) != 0 {
+                return x + x;
+            }
+            return if xsb == 0 { x } else { 0.0 };
+        }
+        if x > O_THRESHOLD {
+            return HUGE * HUGE;
+        }
+        if x < U_THRESHOLD {
+            return TWOM1000 * TWOM1000;
+        }
+    }
+    let mut k = 0i32;
+    let mut hi = 0.0;
+    let mut lo = 0.0;
+    let mut x = x;
+    if hx > 0x3fd6_2e42 {
+        if hx < 0x3ff0_a2b2 {
+            hi = x - LN2_HI[xsb as usize];
+            lo = LN2_LO[xsb as usize];
+            k = 1 - xsb as i32 - xsb as i32;
+        } else {
+            k = (INVLN2 * x + HALF[xsb as usize]) as i32;
+            let t = k as f64;
+            hi = x - t * LN2_HI[0];
+            lo = t * LN2_LO[0];
+        }
+        x = hi - lo;
+    } else if hx < 0x3e30_0000 {
+        if HUGE + x > ONE {
+            return ONE + x;
+        }
+    }
+    let t = x * x;
+    let twopk = if k >= -1021 {
+        f64::from_bits((((0x3ffi32 + k) as u32 as u64) << 20) << 32)
+    } else {
+        f64::from_bits((((0x3ffi32 + k + 1000) as u32 as u64) << 20) << 32)
+    };
+    let c = x - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
+    if k == 0 {
+        return ONE - ((x * c) / (c - 2.0) - x);
+    }
+    let y = ONE - ((lo - (x * c) / (2.0 - c)) - hi);
+    if k >= -1021 {
+        if k == 1024 {
+            return y * 2.0 * f64::from_bits(0x7fe0_0000_0000_0000);
+        }
+        return y * twopk;
+    }
+    y * twopk * TWOM1000
+}
+
+/// Official `Math.sqrt(100_000 / tiles) ** 0.7` (Config.attackLogic).
+///
+/// Same 1-ULP table pattern as integer `js_pow(n, 0.6|0.73)`. The base here
+/// is fractional, so those integer tables do not apply. Tables are sorted
+/// unique tile counts in `100001..=3000000` collected against this host's
+/// Node 22 bits; they do not replace a general V8 `Math.pow`.
+pub fn js_large_attack_bonus(attacker_tiles: u32) -> f64 {
+    let raw = js_pow((100_000.0 / attacker_tiles as f64).sqrt(), 0.7);
+    static M1: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    static P1: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    f64::from_bits(apply_ulp_corr(
+        attacker_tiles,
+        raw.to_bits(),
+        M1.get_or_init(|| load_u32s(include_bytes!("js_pow_data/pow07_tiles_m1.bin"))),
+        P1.get_or_init(|| load_u32s(include_bytes!("js_pow_data/pow07_tiles_p1.bin"))),
+    ))
+}
+
 /// Node 22 / V8 12.4 `Math.pow` for OpenFront troop formulas (`x > 0`).
 ///
 /// The fdlibm port is 1 ULP off for some integer bases. Official `maxTroops`
@@ -227,7 +329,15 @@ fn libm_scalbn(x: f64, n: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::js_pow;
+    use super::{js_exp, js_large_attack_bonus, js_pow};
+
+    #[test]
+    fn matches_v8_exp_for_combat_sigmoid() {
+        // Node Math.exp(-LN2/50000 * (42533 - 150000)) on this host.
+        let decay = std::f64::consts::LN_2 / 50_000.0;
+        let arg = -decay * (42533.0 - 150_000.0);
+        assert_eq!(js_exp(arg).to_bits(), 0x4011_beb7_c7ce_b50e);
+    }
 
     #[test]
     fn matches_v8_pow_for_diplomacy_send() {
@@ -240,5 +350,38 @@ mod tests {
     fn matches_node_pow_for_warships_combat_send() {
         // Node Math.pow(6070, 0.6) — p4 land send at tick 260.
         assert_eq!(js_pow(6070.0, 0.6).to_bits(), 0x4067_457c_fc9c_5aff);
+    }
+
+    #[test]
+    fn matches_node_large_attacker_bonus() {
+        // Node: Math.sqrt(100000/155280) ** 0.7 at the 6752 ULP drift.
+        assert_eq!(
+            js_large_attack_bonus(155_280).to_le_bytes(),
+            [0x3e, 0x76, 0x87, 0x22, 0xa0, 0x6e, 0xeb, 0x3f]
+        );
+        assert_eq!(
+            js_large_attack_bonus(155_312).to_le_bytes(),
+            [0xb6, 0x05, 0x70, 0x7b, 0x1e, 0x6e, 0xeb, 0x3f]
+        );
+    }
+
+    #[test]
+    fn large_attacker_ulp_tables_are_sorted_unique() {
+        fn load(bytes: &[u8]) -> Vec<u32> {
+            bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+        let m1 = load(include_bytes!("js_pow_data/pow07_tiles_m1.bin"));
+        let p1 = load(include_bytes!("js_pow_data/pow07_tiles_p1.bin"));
+        assert!(m1.windows(2).all(|w| w[0] < w[1]));
+        assert!(p1.windows(2).all(|w| w[0] < w[1]));
+        assert!(m1.first().is_some_and(|&n| n > 100_000));
+        assert!(p1.last().is_some_and(|&n| n <= 3_000_000));
+        let set: std::collections::HashSet<u32> = m1.iter().copied().collect();
+        assert!(p1.iter().all(|n| !set.contains(n)));
+        assert!(p1.binary_search(&155_280).is_ok());
+        assert!(m1.binary_search(&155_280).is_err());
     }
 }

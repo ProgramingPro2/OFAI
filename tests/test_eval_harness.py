@@ -38,6 +38,7 @@ from agent.eval import (
     run_eval,
     spawn_eval_server,
     wilson_report,
+    write_actions_out,
 )
 from agent.seeds import holdout_seed, ood_seed
 from tests.test_rl_pipeline import _fake_info, _numpy_obs
@@ -366,6 +367,60 @@ def test_json_report_fields_and_hygiene():
     assert report["config"]["map"] == "World"
     assert samp["wilson_z"] == pytest.approx(WILSON_Z)
     assert report["deterministic"]["episodes"] == 1
+    assert len(samp["episode_records"]) == 4
+    assert {"seed", "won", "cause", "ticks"} <= set(samp["episode_records"][0])
+
+
+def test_holdout_offset_selects_later_frozen_seed():
+    plan = _plan(
+        [
+            "--stage",
+            "nations-easy-small",
+            "--mode",
+            "deterministic",
+            "--det-episodes",
+            "1",
+            "--holdout-offset",
+            "1",
+        ]
+    )
+    assert plan.det_n == 1
+    assert [c["seed"] for c in plan.det_configs] == [
+        holdout_seed("nations-easy-small", 1)
+    ]
+
+
+def test_actions_out_writes_eval_tapes(tmp_path):
+    plan = _plan(
+        [
+            "--stage",
+            "nations-easy-small",
+            "--mode",
+            "deterministic",
+            "--det-episodes",
+            "2",
+            "--scripted",
+            "expander",
+        ]
+    )
+    env = _RecordingEnv()
+    report = run_eval(None, env, plan, torch.device("cpu"), record_actions=True)
+    tapes = report["deterministic"]["episode_tapes"]
+    assert len(tapes) == 2
+    assert tapes[0]["seed"] == holdout_seed("nations-easy-small", 0)
+    assert tapes[0]["actions"]
+    assert len(tapes[0]["actions"][0]) == 5
+    out = tmp_path / "actions.json"
+    write_actions_out(out, plan, report)
+    payload = json.loads(out.read_text())
+    assert payload["stage"] == "nations-easy-small"
+    assert payload["suite"] == "holdout"
+    assert payload["source"] == "eval"
+    assert [e["seed"] for e in payload["episodes"]] == [
+        holdout_seed("nations-easy-small", i) for i in range(2)
+    ]
+    assert payload["episodes"][0]["mode"] == "deterministic"
+    assert payload["episodes"][0]["config"]["seed"] == payload["episodes"][0]["seed"]
 
 
 def test_invalid_flag_combinations():
@@ -379,6 +434,8 @@ def test_invalid_flag_combinations():
         _plan(["--stage", "duel", "--sampled-episodes", "-2"])
     with pytest.raises(ValueError, match="--det-episodes"):
         _plan(["--stage", "duel", "--det-episodes", "-1"])
+    with pytest.raises(ValueError, match="--holdout-offset"):
+        _plan(["--stage", "duel", "--holdout-offset", "-1"])
     with pytest.raises(ValueError, match="sampled cannot be combined"):
         _plan(
             [
@@ -415,6 +472,8 @@ def test_manual_cli_defaults_are_unchanged():
     assert args.bots == 1
     assert args.mode == "both"
     assert args.stage == ""
+    assert args.actions_out == ""
+    assert parse_args(["--actions-out", "tape.json"]).actions_out == "tape.json"
     plan = resolve_eval_plan(args)
     assert plan.suite == "manual"
     assert plan.sampled_n == 20

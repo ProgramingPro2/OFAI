@@ -100,6 +100,10 @@ struct AttackExec {
     remove_troops: bool,
     heap: FlatHeap,
     rng: PseudoRandom,
+    // Official keeps the AttackImpl after `outgoing.delete()` on absorb.
+    // If `retreated` was already set, the leftover AttackExecution still
+    // `retreat(25)` on a later tick. Rust must apply that return here.
+    absorbed_retreat_troops: Option<f64>,
 }
 
 struct RetreatExec {
@@ -227,6 +231,13 @@ pub struct Game {
     pub fallback: Option<String>,
     water_chain: WaterChain,
     boat_cache: Vec<Option<TileRef>>,
+    boat_none: Vec<bool>,
+    boat_query_tick: u32,
+    boat_query_pid: String,
+    boat_query_shores: Vec<TileRef>,
+    boat_query_border: Vec<TileRef>,
+    boat_step_tick: u32,
+    boat_step_pid: String,
     pub(crate) later: LaterState,
     tile_update_pairs: Vec<u32>,
     build_cache_tick: u32,
@@ -292,6 +303,13 @@ impl Game {
             fallback: None,
             water_chain,
             boat_cache: vec![None; crate::spec::NUM_REGIONS],
+            boat_none: vec![false; crate::spec::NUM_REGIONS],
+            boat_query_tick: u32::MAX,
+            boat_query_pid: String::new(),
+            boat_query_shores: Vec::new(),
+            boat_query_border: Vec::new(),
+            boat_step_tick: u32::MAX,
+            boat_step_pid: String::new(),
             later,
             tile_update_pairs: Vec::new(),
             build_cache_tick: u32::MAX,
@@ -327,6 +345,7 @@ impl Game {
     pub fn last_hash(&self) -> Option<f64> {
         self.last_hash
     }
+
     pub fn winner(&self) -> Option<&str> {
         self.winner.as_deref()
     }
@@ -473,6 +492,7 @@ impl Game {
                         remove_troops: *remove_troops,
                         heap: FlatHeap::new(),
                         rng: PseudoRandom::new(123),
+                        absorbed_retreat_troops: None,
                     }));
                 }
                 Intent::Retreat { attack_id } => {
@@ -838,18 +858,25 @@ impl Game {
             return;
         };
         let pid = pe.player_id.clone();
-        let Some(p) = self.players.get(&pid) else {
+        if !self.players.contains_key(&pid) {
             return;
-        };
-        if !p.is_alive() {
-            if let Some(pl) = self.players.get_mut(&pid) {
-                pl.gold = 0;
-            }
+        }
+        // Official PlayerExecution.tick: decay + structures even when dead,
+        // then removeOnDeath (gold, leftover units, alliances).
+        if let Some(pl) = self.players.get_mut(&pid) {
+            pl.decay_relations();
+        }
+        self.capture_or_delete_structures(&pid);
+        if !self.players.get(&pid).is_some_and(|p| p.is_alive()) {
+            self.remove_on_death(&pid);
             if let Exec::Player(pe) = &mut self.execs[idx] {
                 pe.active = false;
             }
             return;
         }
+        let Some(p) = self.players.get(&pid) else {
+            return;
+        };
         let cities = city_levels(&self.units, &pid);
         let inc = troop_increase_rate(
             p.player_type(),
@@ -862,9 +889,7 @@ impl Game {
         if let Some(pl) = self.players.get_mut(&pid) {
             pl.add_troops(inc);
             pl.add_gold(gold);
-            pl.decay_relations();
         }
-        self.capture_or_delete_structures(&pid);
         self.expire_alliances_for(&pid);
         let (last_calc, tiles, last_change) = self
             .players
@@ -1114,17 +1139,24 @@ impl Game {
     }
 
     fn flood_owned_from(&self, start: TileRef, owner: u16) -> Vec<TileRef> {
+        // Official PlayerExecution.floodFillWithGen: mark and append on
+        // discover, then DFS. Pop-then-append would permute conquer order
+        // and neighbor border insertion (sid=6 at PRE8 1199).
         let mut visited = HashSet::new();
         let mut out = Vec::new();
-        let mut stack = vec![start];
+        if self.map.owner_id(start) != owner {
+            return out;
+        }
         visited.insert(start);
+        out.push(start);
+        let mut stack = vec![start];
         let mut nbuf = [0u32; 4];
         while let Some(tile) = stack.pop() {
-            out.push(tile);
             let n = self.map.neighbors4(tile, &mut nbuf);
             for i in 0..n {
                 let nxt = nbuf[i];
                 if self.map.owner_id(nxt) == owner && visited.insert(nxt) {
+                    out.push(nxt);
                     stack.push(nxt);
                 }
             }
@@ -1136,10 +1168,15 @@ impl Game {
         if cluster.is_empty() {
             return;
         }
+        let owner = self.players.get(pid).map(|p| p.small_id).unwrap_or(0);
+        // Official removeCluster aborts if any cluster tile already changed
+        // owner from a prior removal in the same tick.
+        if cluster.iter().any(|&t| self.map.owner_id(t) != owner) {
+            return;
+        }
         let Some(capturing) = self.cluster_capturing_player(pid, cluster) else {
             return;
         };
-        let owner = self.players.get(pid).map(|p| p.small_id).unwrap_or(0);
         let tiles = self.flood_owned_from(cluster[0], owner);
         if self.players.get(pid).map(|p| p.num_tiles() as usize) == Some(tiles.len()) {
             self.conquer_player(&capturing, pid);
@@ -1190,7 +1227,15 @@ impl Game {
         let src = a.source_tile;
         if let Some(tid) = a.target_id.clone() {
             self.reject_incoming_from(&a.owner_id, &tid);
+            // Official embargoes the target before create/cancel so a later
+            // full cancel still leaves the embargo in place.
+            if let Some(def) = self.players.get_mut(&tid) {
+                if owner_type != PlayerType::Bot && def.player_type() != PlayerType::Bot {
+                    def.add_embargo(&a.owner_id, self.ticks, true);
+                }
+            }
         }
+        let mut absorbed_retreated: Vec<(String, f64)> = Vec::new();
         if let Some(owner) = self.players.get_mut(&a.owner_id) {
             if a.remove_troops {
                 owner.remove_troops(troops.floor() as i64);
@@ -1211,15 +1256,38 @@ impl Game {
             a.attack_id = Some(id.clone());
             owner.outgoing.push(atk);
             owner.attacks_sent += 1;
-            // Official AttackExecution: a land attack (sourceTile == null)
-            // absorbs every existing outgoing attack on the same target,
-            // including boat-sourced ones. A new boat attack is not merged.
-            if src.is_none() {
+        }
+        if let (Some(tid), Some(id)) = (a.target_id.as_deref(), a.attack_id.as_deref()) {
+            if let Some(def) = self.players.get_mut(tid) {
+                def.incoming.push(id.to_string());
+            }
+        }
+        // Official AttackExecution.init cancels opposing incoming first,
+        // using only the new send. A larger opposing attack deletes this
+        // attack and returns before same-target outgoing is absorbed.
+        self.cancel_opposing(&a.owner_id, a.target_id.as_deref(), a.attack_id.as_deref());
+        let still_active = a.attack_id.as_ref().is_some_and(|id| {
+            self.players.get(&a.owner_id).is_some_and(|o| {
+                o.outgoing.iter().any(|x| x.id == *id && x.active)
+            })
+        });
+        if !still_active {
+            // Official AttackExecution.init returns before updateRelation when
+            // a larger opposing attack fully deletes this new attack.
+            a.active = false;
+            return;
+        }
+        if src.is_none() {
+            if let Some(owner) = self.players.get_mut(&a.owner_id) {
+                let id = a.attack_id.clone().unwrap_or_default();
                 let mut extra = 0.0;
                 let mut absorbed = false;
                 for other in owner.outgoing.iter_mut() {
                     if other.id != id && other.target_player_id == a.target_id && other.active {
                         extra += other.troops;
+                        if other.retreated {
+                            absorbed_retreated.push((other.id.clone(), other.troops));
+                        }
                         other.active = false;
                         absorbed = true;
                     }
@@ -1229,14 +1297,20 @@ impl Game {
                         merged.troops += extra;
                     }
                 }
-                // Official AttackExecution always `outgoing.delete()`s absorbed
-                // same-target land attacks, including zero-troop leftovers.
                 if absorbed {
                     owner.outgoing.retain(|x| x.active);
                 }
             }
         }
-        self.cancel_opposing(&a.owner_id, a.target_id.as_deref(), a.attack_id.as_deref());
+        for (oid, leftover) in absorbed_retreated {
+            for e in &mut self.execs {
+                if let Exec::Attack(old) = e {
+                    if old.attack_id.as_deref() == Some(oid.as_str()) {
+                        old.absorbed_retreat_troops = Some(leftover);
+                    }
+                }
+            }
+        }
         if let Some(src) = a.source_tile {
             self.add_neighbors(a, src);
         } else {
@@ -1244,11 +1318,17 @@ impl Game {
         }
         if let Some(tid) = a.target_id.clone() {
             if let Some(def) = self.players.get_mut(&tid) {
-                if owner_type != PlayerType::Bot && def.player_type() != PlayerType::Bot {
-                    def.add_embargo(&a.owner_id, self.ticks, true);
-                }
                 def.update_relation(&a.owner_id, attack_relation_delta(self.difficulty));
             }
+        }
+    }
+
+    fn unregister_incoming(&mut self, defender_id: Option<&str>, atk_id: &str) {
+        let Some(did) = defender_id else {
+            return;
+        };
+        if let Some(def) = self.players.get_mut(did) {
+            def.incoming.retain(|x| x != atk_id);
         }
     }
 
@@ -1259,38 +1339,64 @@ impl Game {
         let Some(atk_id) = attack_id else {
             return;
         };
-        let my_troops = self
+        // Official `incomingAttacks()` lives on the new attacker (`owner`) and
+        // matches `incoming.attacker() === this.target` by object identity.
+        // Prefer that id list; fall back to the target's outgoing so attacks
+        // created before incoming was maintained still cancel (small-id or
+        // player-id).
+        let owner_small = self.players.get(owner_id).map(|p| p.small_id);
+        let incoming_ids = self
+            .players
+            .get(owner_id)
+            .map(|p| p.incoming.clone())
+            .unwrap_or_default();
+        let mut my_troops = self
             .players
             .get(owner_id)
             .and_then(|p| p.outgoing.iter().find(|a| a.id == atk_id))
             .map(|a| a.troops)
             .unwrap_or(0.0);
-        let Some(target) = self.players.get_mut(tid) else {
-            return;
-        };
-        let mut opp = None;
-        for (i, at) in target.outgoing.iter().enumerate() {
-            if at.target_player_id.as_deref() == Some(owner_id) && at.active {
-                opp = Some((i, at.troops, at.id.clone()));
+        loop {
+            let opp = self.players.get(tid).and_then(|p| {
+                p.outgoing
+                    .iter()
+                    .find(|a| {
+                        a.active
+                            && (incoming_ids.iter().any(|iid| iid == &a.id)
+                                || a.target_player_id.as_deref() == Some(owner_id)
+                                || owner_small == Some(a.target_small_id))
+                    })
+                    .map(|a| (a.id.clone(), a.troops))
+            });
+            let Some((oid, ot)) = opp else {
                 break;
-            }
-        }
-        if let Some((i, ot, _oid)) = opp {
+            };
             if ot > my_troops {
-                target.outgoing[i].troops -= my_troops;
+                if let Some(p) = self.players.get_mut(tid) {
+                    if let Some(a) = p.outgoing.iter_mut().find(|a| a.id == oid) {
+                        a.troops -= my_troops;
+                    }
+                }
+                self.unregister_incoming(Some(tid), atk_id);
                 if let Some(owner) = self.players.get_mut(owner_id) {
                     if let Some(a) = owner.outgoing.iter_mut().find(|a| a.id == atk_id) {
                         a.active = false;
                     }
                     owner.outgoing.retain(|a| a.active);
                 }
-            } else {
-                target.outgoing[i].active = false;
-                target.outgoing.retain(|a| a.active);
-                if let Some(owner) = self.players.get_mut(owner_id) {
-                    if let Some(a) = owner.outgoing.iter_mut().find(|a| a.id == atk_id) {
-                        a.troops -= ot;
-                    }
+                return;
+            }
+            self.unregister_incoming(Some(owner_id), &oid);
+            if let Some(p) = self.players.get_mut(tid) {
+                if let Some(a) = p.outgoing.iter_mut().find(|a| a.id == oid) {
+                    a.active = false;
+                }
+                p.outgoing.retain(|a| a.active);
+            }
+            if let Some(owner) = self.players.get_mut(owner_id) {
+                if let Some(a) = owner.outgoing.iter_mut().find(|a| a.id == atk_id) {
+                    a.troops = (a.troops - ot).max(0.0);
+                    my_troops = a.troops;
                 }
             }
         }
@@ -1357,6 +1463,26 @@ impl Game {
     }
 
     fn tick_attack(&mut self, idx: usize, _ticks: u32) {
+        if let Exec::Attack(a) = &self.execs[idx] {
+            if a.active && a.inited {
+                if let Some(leftover) = a.absorbed_retreat_troops {
+                    let owner_id = a.owner_id.clone();
+                    let malus = if a.target_is_player {
+                        MALUS_FOR_RETREAT
+                    } else {
+                        0.0
+                    };
+                    if let Some(owner) = self.players.get_mut(&owner_id) {
+                        owner.add_troops(leftover - leftover * (malus / 100.0));
+                    }
+                    if let Exec::Attack(a) = &mut self.execs[idx] {
+                        a.absorbed_retreat_troops = None;
+                        a.active = false;
+                    }
+                    return;
+                }
+            }
+        }
         let (owner_id, atk_id, target_id, target_is_player, owner_small, target_small) = {
             let Exec::Attack(a) = &self.execs[idx] else {
                 return;
@@ -1400,6 +1526,19 @@ impl Game {
                 a.active = false;
             }
             return;
+        }
+        // Official AttackExecution.tick: a new alliance after the attack
+        // started retreats with default malus 0 (not the cancel-25 path).
+        if target_is_player {
+            if let Some(tid) = target_id.as_deref() {
+                if self.is_friendly_ids(&owner_id, tid) {
+                    self.retreat_attack(&owner_id, &atk_id, target_is_player, false);
+                    if let Exec::Attack(a) = &mut self.execs[idx] {
+                        a.active = false;
+                    }
+                    return;
+                }
+            }
         }
         let mut troop_count = atk.troops;
         let border = atk.border_size() as f64;
@@ -1566,12 +1705,19 @@ impl Game {
     }
 
     fn delete_attack(&mut self, owner_id: &str, atk_id: &str) {
+        let def = self.players.get(owner_id).and_then(|p| {
+            p.outgoing
+                .iter()
+                .find(|a| a.id == atk_id)
+                .and_then(|a| a.target_player_id.clone())
+        });
         if let Some(owner) = self.players.get_mut(owner_id) {
             if let Some(atk) = owner.outgoing.iter_mut().find(|a| a.id == atk_id) {
                 atk.active = false;
             }
             owner.outgoing.retain(|a| a.active);
         }
+        self.unregister_incoming(def.as_deref(), atk_id);
     }
 
     fn tick_retreat(&mut self, idx: usize, ticks: u32) {
@@ -1807,6 +1953,7 @@ impl Game {
                 remove_troops: a.remove_troops,
                 heap: std::mem::replace(&mut a.heap, FlatHeap::new()),
                 rng: a.rng.clone(),
+                absorbed_retreat_troops: a.absorbed_retreat_troops,
             },
             _ => AttackExec {
                 active: false,
@@ -1822,6 +1969,7 @@ impl Game {
                 remove_troops: true,
                 heap: FlatHeap::new(),
                 rng: PseudoRandom::new(123),
+                absorbed_retreat_troops: None,
             },
         }
     }
@@ -1831,6 +1979,7 @@ impl Game {
             a.heap = tmp.heap;
             a.rng = tmp.rng;
             a.active = tmp.active;
+            a.absorbed_retreat_troops = tmp.absorbed_retreat_troops;
         }
     }
 
@@ -2262,13 +2411,60 @@ impl Game {
         }
     }
 
+    fn ensure_boat_query(&mut self, player_id: &str) {
+        let tick = self
+            .players
+            .get(player_id)
+            .map(|p| p.last_tile_change)
+            .unwrap_or(0);
+        if self.boat_query_tick == tick && self.boat_query_pid == player_id {
+            return;
+        }
+        let (shores, border) = match self.players.get(player_id) {
+            Some(p) => (
+                p.shore_tiles(&self.map),
+                p.border_tiles.iter().copied().collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.boat_query_tick = tick;
+        self.boat_query_pid = player_id.to_string();
+        self.boat_query_shores = shores;
+        self.boat_query_border = border;
+    }
+
+    fn begin_boat_mask_step(&mut self, player_id: &str) {
+        if self.boat_step_tick == self.ticks && self.boat_step_pid == player_id {
+            return;
+        }
+        self.boat_step_tick = self.ticks;
+        self.boat_step_pid = player_id.to_string();
+        self.boat_cache.fill(None);
+        self.boat_none.fill(false);
+    }
+
+    /// Effective boat dest regions for this decision. Shore lists are reused
+    /// while the agent's tiles are unchanged; per-region negatives are only
+    /// reused inside the same tick so enemy-shore hint changes stay exact.
+    pub fn refresh_boat_regions(&mut self, player_id: &str, dest: &mut [u8]) {
+        self.begin_boat_mask_step(player_id);
+        for r in 0..dest.len() {
+            if dest[r] == 0 {
+                continue;
+            }
+            dest[r] = if self.find_boat_in_region(player_id, r as i32).is_some() {
+                1
+            } else {
+                0
+            };
+        }
+    }
+
     fn can_build_boat(&mut self, player_id: &str, tile: TileRef) -> Option<TileRef> {
         let Some(p) = self.players.get(player_id) else {
             return None;
         };
         let owner_small = p.small_id;
-        let shores = p.shore_tiles(&self.map);
-        let border: Vec<TileRef> = p.border_tiles.iter().copied().collect();
         let boats = self.boat_count(player_id);
         let target_sid = self.map.owner_id(tile);
         let allowed = if target_sid == 0 {
@@ -2278,6 +2474,9 @@ impl Game {
         } else {
             true
         };
+        self.ensure_boat_query(player_id);
+        let shores = self.boat_query_shores.clone();
+        let border = self.boat_query_border.clone();
         can_build_transport_ship(
             &mut self.water_chain,
             &self.map,
@@ -2621,6 +2820,7 @@ impl Game {
                     remove_troops: false,
                     heap: FlatHeap::new(),
                     rng: PseudoRandom::new(123),
+                    absorbed_retreat_troops: None,
                 }));
                 self.delete_unit(uid);
                 if let Exec::Boat(b) = &mut self.execs[idx] {
@@ -2791,6 +2991,19 @@ impl Game {
             }
             if let Some(p) = self.players.get_mut(recipient) {
                 p.update_relation(requestor, 100.0);
+            }
+            // Official AllianceRequestExecution.init only ends temporary
+            // embargoes on this mutual-request shortcut. Nation/tribe
+            // `accept()` → `acceptAllianceRequest` does not.
+            if let Some(p) = self.players.get_mut(requestor) {
+                if p.has_embargo_against(recipient) {
+                    p.end_temporary_embargo(recipient);
+                }
+            }
+            if let Some(p) = self.players.get_mut(recipient) {
+                if p.has_embargo_against(requestor) {
+                    p.end_temporary_embargo(requestor);
+                }
             }
             self.accept_alliance(recipient, requestor, ticks);
             return false;
@@ -2970,12 +3183,6 @@ impl Game {
                 });
             }
         }
-        if let Some(p) = self.players.get_mut(a) {
-            p.end_temporary_embargo(b);
-        }
-        if let Some(p) = self.players.get_mut(b) {
-            p.end_temporary_embargo(a);
-        }
         self.alliances.push(Alliance {
             id: self.next_alliance_id,
             requestor: a.to_string(),
@@ -3021,16 +3228,47 @@ impl Game {
                     p.marked_traitor_tick = -1;
                 }
             }
+            // Official PlayerExecution: expire only when
+            // `ticks - createdAt > temporaryEmbargoDuration()` (strict `>`).
             p.embargoes.retain(|_, e| {
                 !e.temporary
-                    || ticks.saturating_sub(e.created_at) < crate::units::TEMPORARY_EMBARGO_DURATION
+                    || ticks.saturating_sub(e.created_at)
+                        <= crate::units::TEMPORARY_EMBARGO_DURATION
             });
         }
+    }
+
+    fn remove_on_death(&mut self, pid: &str) {
+        if let Some(pl) = self.players.get_mut(pid) {
+            pl.gold = 0;
+        }
+        let unit_ids: Vec<u32> = self
+            .units
+            .iter()
+            .filter(|u| u.active && u.owner_id == pid)
+            .filter(|u| {
+                !matches!(
+                    u.ty,
+                    UnitType::AtomBomb
+                        | UnitType::HydrogenBomb
+                        | UnitType::Mirv
+                        | UnitType::MirvWarhead
+                )
+            })
+            .map(|u| u.id)
+            .collect();
+        for id in unit_ids {
+            self.delete_unit(id);
+        }
+        self.alliances
+            .retain(|a| a.requestor != pid && a.recipient != pid);
     }
 
     fn capture_or_delete_structures(&mut self, pid: &str) {
         let sid = self.players.get(pid).map(|p| p.small_id).unwrap_or(0);
         let mut dead = Vec::new();
+        let mut captured_dp: Vec<(u32, Option<String>)> = Vec::new();
+        let mut captured: Vec<(u32, String, String)> = Vec::new();
         for u in &mut self.units {
             if !u.active || u.owner_id != pid || !u.ty.is_structure() {
                 continue;
@@ -3040,13 +3278,33 @@ impl Game {
                 u.active = false;
                 dead.push(u.id);
             } else if owner != sid {
-                if let Some(new_id) = self.by_small.get(&owner).cloned() {
-                    u.owner_id = new_id;
+                // Official PlayerExecution: Defense Posts are deleted, not
+                // captured, when the tile changes owner.
+                if u.ty == UnitType::DefensePost {
+                    captured_dp.push((u.id, self.by_small.get(&owner).cloned()));
+                } else if let Some(new_id) = self.by_small.get(&owner).cloned() {
+                    let old_id = std::mem::replace(&mut u.owner_id, new_id.clone());
                     u.owner_small = owner;
+                    captured.push((u.id, old_id, new_id));
                 }
             }
         }
         let _ = dead;
+        for (id, captor) in captured_dp {
+            self.delete_unit_by(id, captor.as_deref());
+        }
+        // Official capture updates Player._units so later p.units(Port)
+        // sees the new owner. owner_id alone is not enough.
+        for (id, old_id, new_id) in captured {
+            if let Some(op) = self.players.get_mut(&old_id) {
+                op.units.retain(|&x| x != id);
+            }
+            if let Some(np) = self.players.get_mut(&new_id) {
+                if !np.units.contains(&id) {
+                    np.units.push(id);
+                }
+            }
+        }
     }
 
     /// Official `Player.nearby()`: land-border owners plus shore-reachable
@@ -3626,7 +3884,9 @@ impl Game {
             .into_iter()
             .flatten()
             .filter(|id| {
-                !self.is_allied(pid, id)
+                // Official AiAttackBehavior.attackBots uses isFriendly, not
+                // isAlliedWith — disconnected / same-team must match.
+                !self.is_friendly_ids(pid, id)
                     && self
                         .players
                         .get(id)
@@ -3635,8 +3895,10 @@ impl Game {
             })
             .collect();
         if bots.is_empty() {
+            // Official returns before zeroing `botAttackTroopsSent`.
             return false;
         }
+        self.nation_later_mut(pid).bot_attack_troops_sent = 0.0;
         bots.sort_by(|a, b| {
             let a_st = self
                 .units
@@ -3685,6 +3947,7 @@ impl Game {
                 &mut bot_sent,
             );
         }
+        self.nation_later_mut(pid).bot_attack_troops_sent = bot_sent;
         bot_sent > 0.0
     }
 
@@ -4032,8 +4295,27 @@ impl Game {
         rng: &mut PseudoRandom,
         force: bool,
     ) -> bool {
-        let mut bot_sent = 0.0;
-        self.ai_send_attack_official_budget(pid, target, expand, reserve, rng, force, &mut bot_sent)
+        let is_nation = self
+            .players
+            .get(pid)
+            .map(|p| p.player_type() == PlayerType::Nation)
+            .unwrap_or(false);
+        let mut bot_sent = if is_nation {
+            self.later
+                .nations
+                .get(pid)
+                .map(|s| s.bot_attack_troops_sent)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let sent = self.ai_send_attack_official_budget(
+            pid, target, expand, reserve, rng, force, &mut bot_sent,
+        );
+        if is_nation {
+            self.nation_later_mut(pid).bot_attack_troops_sent = bot_sent;
+        }
+        sent
     }
 
     fn ai_send_attack_official_budget(
@@ -4149,8 +4431,12 @@ impl Game {
     }
 
     /// Official `NationEmojiBehavior.maybeSendAttackEmoji` after a valid
-    /// `calculateAttackTroops` against a player.
+    /// `calculateAttackTroops` against a player. Bots never send attack
+    /// emoji; consuming RNG here desynced tribe `chance(3)` traitor attacks.
     fn maybe_send_attack_emoji(&mut self, pid: &str, target: &str, rng: &mut PseudoRandom) {
+        if self.players.get(pid).map(|p| p.player_type()) != Some(PlayerType::Nation) {
+            return;
+        }
         let Some(other) = self.players.get(target) else {
             return;
         };
@@ -4450,6 +4736,7 @@ impl Game {
             remove_troops: true,
             heap: FlatHeap::new(),
             rng: PseudoRandom::new(123),
+            absorbed_retreat_troops: None,
         }));
         if let Some(a) = self.uninit.last_mut() {
             if let Exec::Attack(atk) = a {
@@ -4659,11 +4946,12 @@ impl Game {
 
     /// Official `NationExecution.updateRelationsFromEmbargos`.
     fn nation_update_relations_from_embargos(&mut self, pid: &str) {
+        // Official `mg.players()` is alive-only.
         let others: Vec<String> = self
             .players
-            .keys()
-            .filter(|id| *id != pid)
-            .cloned()
+            .values()
+            .filter(|p| p.id() != pid && p.is_alive())
+            .map(|p| p.id().to_string())
             .collect();
         let mut applied = self
             .later
@@ -5215,11 +5503,13 @@ impl Game {
     }
 
     fn nation_handle_embargoes(&mut self, pid: &str) {
+        // Official `mg.players()` is alive-only, so a dead target never
+        // triggers stopEmbargo / addEmbargo here.
         let others: Vec<String> = self
             .players
-            .keys()
-            .filter(|id| *id != pid)
-            .cloned()
+            .values()
+            .filter(|p| p.id() != pid && p.is_alive())
+            .map(|p| p.id().to_string())
             .collect();
         let higher = matches!(self.difficulty, Difficulty::Hard | Difficulty::Impossible);
         let team = self.cfg_team_mode();
@@ -5599,6 +5889,9 @@ impl Game {
 
     pub fn find_boat_in_region(&mut self, player_id: &str, region: i32) -> Option<TileRef> {
         let ri = region as usize;
+        if ri < self.boat_none.len() && self.boat_none[ri] {
+            return None;
+        }
         if ri < self.boat_cache.len() {
             if let Some(cached) = self.boat_cache[ri] {
                 if self.can_build_boat(player_id, cached).is_some() {
@@ -5630,6 +5923,9 @@ impl Game {
                 x += 2;
             }
             y += 2;
+        }
+        if ri < self.boat_none.len() {
+            self.boat_none[ri] = true;
         }
         None
     }

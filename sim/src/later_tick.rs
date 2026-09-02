@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::*;
 use crate::game::Game;
+use crate::js_math::js_exp;
 use crate::later::{has_factory_nearby, LaterExec};
 use crate::map::TileRef;
 use crate::parabola::ParabolaPath;
@@ -92,6 +93,7 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                                     last_move: ticks,
                                     stepper: PathStepper::new(),
                                     inited: false,
+                                    was_captured: false,
                                 });
                             }
                         }
@@ -270,12 +272,13 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
             mut active,
             owner,
             src_port,
-            dst_port,
+            mut dst_port,
             mut unit_id,
             mut tiles_traveled,
             last_move,
             mut stepper,
             mut inited,
+            mut was_captured,
         } => {
             if !inited {
                 inited = true;
@@ -299,21 +302,14 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                 if !game.units().iter().any(|u| u.id == id && u.active) {
                     active = false;
                 } else {
-                    let Some(dst_tile) = game.units().iter().find(|u| u.id == dst_port && u.active).map(|u| u.tile) else {
-                        game.delete_unit(id);
-                        active = false;
-                        return LaterExec::TradeShip {
-                            active,
-                            owner,
-                            src_port,
-                            dst_port,
-                            unit_id,
-                            tiles_traveled,
-                            last_move,
-                            stepper,
-                            inited,
-                        };
-                    };
+                    let ship_owner = game
+                        .units()
+                        .iter()
+                        .find(|u| u.id == id)
+                        .map(|u| u.owner_id.clone());
+                    if !was_captured && ship_owner.as_ref() != Some(&owner) {
+                        was_captured = true;
+                    }
                     let cur = game.units().iter().find(|u| u.id == id).map(|u| u.tile).unwrap();
                     let src_owner = game
                         .units()
@@ -325,40 +321,106 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                         .iter()
                         .find(|u| u.id == dst_port)
                         .map(|u| u.owner_id.clone());
-                    if src_owner.as_deref() == dst_owner.as_deref()
-                        || src_owner.as_ref().zip(dst_owner.as_ref()).is_some_and(|(so, dso)| {
-                            !game.can_trade(so, dso)
-                        })
+                    let dst_active = game
+                        .units()
+                        .iter()
+                        .any(|u| u.id == dst_port && u.active);
+                    let same_port_owner = src_owner.is_some() && src_owner == dst_owner;
+                    let ship_cannot_trade = !was_captured
+                        && ship_owner.as_ref().zip(dst_owner.as_ref()).is_some_and(
+                            |(so, dso)| so == dso || !game.can_trade(so, dso),
+                        );
+                    if same_port_owner
+                        || (!was_captured && (!dst_active || ship_cannot_trade))
                     {
                         game.delete_unit(id);
                         active = false;
                     } else {
-                        let (st, node) = game.water_step_with(&mut stepper, cur, dst_tile);
-                        match st {
-                            PathStatus::Complete => {
-                                if let (Some(so), Some(dso)) = (src_owner, dst_owner) {
-                                    let gold = trade_ship_gold(tiles_traveled);
-                                    game.add_gold(&so, gold);
-                                    game.add_gold(&dso, gold);
-                                }
-                                game.delete_unit(id);
-                                active = false;
-                            }
-                            PathStatus::Next => {
-                                if let Some(n) = node {
-                                    if game.map.is_water(n) && game.map.is_shoreline(n) {
-                                        if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id)
-                                        {
-                                            u.last_safe_pirates = ticks;
-                                        }
+                        if was_captured
+                            && (!dst_active
+                                || ship_owner.as_ref() != dst_owner.as_ref())
+                        {
+                            match nearest_captured_trade_port(game, ship_owner.as_deref(), cur)
+                            {
+                                Some(new_dst) => {
+                                    dst_port = new_dst;
+                                    if let Some(u) =
+                                        game.units_mut().iter_mut().find(|u| u.id == id)
+                                    {
+                                        u.target_unit = Some(new_dst);
                                     }
-                                    game.move_unit(id, n);
-                                    tiles_traveled += 1;
+                                }
+                                None => {
+                                    game.delete_unit(id);
+                                    active = false;
                                 }
                             }
-                            PathStatus::NotFound => {
+                        }
+                        if active {
+                            let Some(dst_tile) = game
+                                .units()
+                                .iter()
+                                .find(|u| u.id == dst_port && u.active)
+                                .map(|u| u.tile)
+                            else {
                                 game.delete_unit(id);
                                 active = false;
+                                return LaterExec::TradeShip {
+                                    active,
+                                    owner,
+                                    src_port,
+                                    dst_port,
+                                    unit_id,
+                                    tiles_traveled,
+                                    last_move,
+                                    stepper,
+                                    inited,
+                                    was_captured,
+                                };
+                            };
+                            let src_owner = game
+                                .units()
+                                .iter()
+                                .find(|u| u.id == src_port)
+                                .map(|u| u.owner_id.clone());
+                            let dst_owner = game
+                                .units()
+                                .iter()
+                                .find(|u| u.id == dst_port && u.active)
+                                .map(|u| u.owner_id.clone());
+                            let (st, node) = game.water_step_with(&mut stepper, cur, dst_tile);
+                            match st {
+                                PathStatus::Complete => {
+                                    let gold = trade_ship_gold(tiles_traveled);
+                                    if was_captured {
+                                        if let Some(so) = ship_owner.as_deref() {
+                                            game.add_gold(so, gold);
+                                        }
+                                    } else if let (Some(so), Some(dso)) = (src_owner, dst_owner)
+                                    {
+                                        game.add_gold(&so, gold);
+                                        game.add_gold(&dso, gold);
+                                    }
+                                    game.delete_unit(id);
+                                    active = false;
+                                }
+                                PathStatus::Next => {
+                                    if let Some(n) = node {
+                                        if game.map.is_water(n) && game.map.is_shoreline(n) {
+                                            if let Some(u) =
+                                                game.units_mut().iter_mut().find(|u| u.id == id)
+                                            {
+                                                u.last_safe_pirates = ticks;
+                                            }
+                                        }
+                                        game.move_unit(id, n);
+                                        tiles_traveled += 1;
+                                    }
+                                }
+                                PathStatus::NotFound => {
+                                    game.delete_unit(id);
+                                    active = false;
+                                }
                             }
                         }
                     }
@@ -374,6 +436,7 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                 last_move,
                 stepper,
                 inited,
+                was_captured,
             }
         }
         LaterExec::Warship {
@@ -387,6 +450,8 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
             mut stepper,
             mut already_sent,
             mut inited,
+            mut heal_rem,
+            last_manual,
         } => {
             if rng.is_none() {
                 rng = Some(PseudoRandom::new(ticks as i32));
@@ -421,57 +486,102 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                         stepper,
                         already_sent,
                         inited,
+                        heal_rem,
+                        last_manual,
                     };
                 };
                 if ship.health <= 0 || !ship.active {
                     game.delete_unit(id);
                     active = false;
                 } else {
+                    let health_before = ship.health;
                     heal_warship(game, id);
-                    let tgt = find_best_warship_target(game, &ship, &already_sent, true);
-                    if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
-                        u.target_unit = tgt;
+                    let doomed = game.player(&owner).map(|p| p.in_doomsday).unwrap_or(false);
+                    if doomed {
+                        if let Some(u) = game.units().iter().find(|x| x.id == id) {
+                            if u.warship_state != WarshipMode::Patrolling {
+                                cancel_repair_retreat(game, id, &mut heal_rem, true);
+                            }
+                        }
                     }
-                    let tgt_ty = tgt.and_then(|tid| {
-                        game.units().iter().find(|u| u.id == tid).map(|u| u.ty)
-                    });
-                    match tgt_ty {
-                        Some(UnitType::TransportShip) => {
-                            shoot_warship_target(
+                    let docked = game
+                        .units()
+                        .iter()
+                        .find(|u| u.id == id)
+                        .map(|u| u.warship_state == WarshipMode::Docked)
+                        .unwrap_or(false);
+                    // Official `healWarship` applies docked active healing before
+                    // `isFullyHealed` / `cancelRepairRetreat`. Applying it after
+                    // that check keeps the ship docked one extra tick after it
+                    // reaches max health (warship 219 at t=7525).
+                    if docked && !doomed {
+                        apply_docked_healing(game, id, &mut heal_rem);
+                    }
+                    if docked {
+                        let port_gone = current_retreat_port(game, id).is_none();
+                        let full = game
+                            .units()
+                            .iter()
+                            .find(|u| u.id == id)
+                            .map(|u| u.health >= u.max_health)
+                            .unwrap_or(true);
+                        if port_gone || full {
+                            cancel_repair_retreat(game, id, &mut heal_rem, true);
+                        }
+                        if !game
+                            .units()
+                            .iter()
+                            .find(|u| u.id == id)
+                            .map(|u| u.warship_state == WarshipMode::Docked)
+                            .unwrap_or(false)
+                        {
+                            tick_warship_combat_or_patrol(
                                 game,
                                 &owner,
                                 id,
-                                tgt.unwrap(),
+                                patrol,
                                 ticks,
                                 &mut last_shell,
                                 &mut already_sent,
+                                rng.as_mut(),
+                                &mut stepper,
                             );
-                            if let Some(r) = rng.as_mut() {
-                                patrol_warship(game, id, patrol, r, &mut stepper);
-                            }
                         }
-                        Some(UnitType::Warship) => {
-                            shoot_warship_target(
-                                game,
-                                &owner,
-                                id,
-                                tgt.unwrap(),
-                                ticks,
-                                &mut last_shell,
-                                &mut already_sent,
-                            );
-                            if let Some(r) = rng.as_mut() {
-                                patrol_warship(game, id, patrol, r, &mut stepper);
-                            }
-                        }
-                        Some(UnitType::TradeShip) => {
-                            hunt_trade_ship(game, id, tgt.unwrap(), &mut stepper);
-                        }
-                        _ => {
-                            if let Some(r) = rng.as_mut() {
-                                patrol_warship(game, id, patrol, r, &mut stepper);
-                            }
-                        }
+                    } else if handle_repair_retreat(
+                        game,
+                        &owner,
+                        id,
+                        ticks,
+                        &mut last_shell,
+                        &mut already_sent,
+                        &mut heal_rem,
+                        &mut stepper,
+                    ) {
+                    } else if should_start_repair_retreat(game, id, health_before, ticks, last_manual)
+                    {
+                        start_repair_retreat(game, id, &mut heal_rem);
+                        let _ = handle_repair_retreat(
+                            game,
+                            &owner,
+                            id,
+                            ticks,
+                            &mut last_shell,
+                            &mut already_sent,
+                            &mut heal_rem,
+                            &mut stepper,
+                        );
+                    } else {
+                        tick_warship_combat_or_patrol(
+                            game,
+                            &owner,
+                            id,
+                            patrol,
+                            ticks,
+                            &mut last_shell,
+                            &mut already_sent,
+                            rng.as_mut(),
+                            &mut stepper,
+                        );
                     }
                 }
             }
@@ -486,6 +596,8 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                 stepper,
                 already_sent,
                 inited,
+                heal_rem,
+                last_manual,
             }
         }
         LaterExec::Nuke {
@@ -1010,7 +1122,7 @@ pub(crate) fn tick_one(game: &mut Game, exec: LaterExec, ticks: u32) -> LaterExe
                     );
                     match st {
                         PathStatus::Complete => {
-                            apply_shell_damage(game, target, air_seed, &owner);
+                            apply_shell_damage(game, target, air_seed, &owner, shooter);
                             game.delete_unit(id);
                             active = false;
                             break;
@@ -1273,6 +1385,32 @@ fn create_factory_stations(game: &mut Game, factory_id: u32) {
     }
 }
 
+/// Official captured TradeShipExecution retarget: closest own port on
+/// the same water component, skipping marked/under-construction.
+fn nearest_captured_trade_port(game: &Game, ship_owner: Option<&str>, cur: TileRef) -> Option<u32> {
+    let owner = ship_owner?;
+    let component = game.get_water_component(cur)?;
+    let mut best: Option<(u32, u32)> = None;
+    for u in game.units() {
+        if !u.active
+            || u.ty != UnitType::Port
+            || u.owner_id != owner
+            || u.marked_for_deletion
+            || u.under_construction
+        {
+            continue;
+        }
+        if !game.has_water_component(u.tile, component) {
+            continue;
+        }
+        let d = game.map.manhattan(u.tile, cur);
+        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, u.id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 fn pick_trade_port(game: &Game, rng: &mut PseudoRandom, src: &crate::units::Unit) -> Option<u32> {
     let mut source_comps = HashSet::new();
     let mut nbuf = [0u32; 4];
@@ -1285,21 +1423,24 @@ fn pick_trade_port(game: &Game, rng: &mut PseudoRandom, src: &crate::units::Unit
         }
     }
     let mut ports: Vec<(u32, u32)> = Vec::new();
-    for p in game.all_players() {
-        if p.id() == src.owner_id || !game.can_trade(&src.owner_id, p.id()) {
+    // Official PortExecution.tradingPorts: alive players' current Port
+    // units. Walk game.units by owner_id so tile-captured ports are
+    // visible even if Player.units was stale.
+    for u in game.units() {
+        if !u.active || u.ty != UnitType::Port || u.owner_id == src.owner_id {
             continue;
         }
-        for uid in &p.units {
-            let Some(u) = game
-                .units()
-                .iter()
-                .find(|x| x.id == *uid && x.active && x.ty == UnitType::Port)
-            else {
-                continue;
-            };
-            if source_comps.iter().any(|c| game.has_water_component(u.tile, *c)) {
-                ports.push((game.map.manhattan(src.tile, u.tile), u.id));
-            }
+        let Some(owner) = game.player(&u.owner_id) else {
+            continue;
+        };
+        if !owner.is_alive() || !game.can_trade(&src.owner_id, &u.owner_id) {
+            continue;
+        }
+        if source_comps
+            .iter()
+            .any(|c| game.has_water_component(u.tile, *c))
+        {
+            ports.push((game.map.manhattan(src.tile, u.tile), u.id));
         }
     }
     ports.sort_by_key(|(d, _)| *d);
@@ -1555,22 +1696,380 @@ fn heal_warship(game: &mut Game, id: u32) {
     let Some(ship) = game.units().iter().find(|u| u.id == id).cloned() else {
         return;
     };
+    if game
+        .player(&ship.owner_id)
+        .map(|p| p.in_doomsday)
+        .unwrap_or(false)
+    {
+        return;
+    }
     let r2 = (WARSHIP_PASSIVE_HEALING_RANGE as i64) * (WARSHIP_PASSIVE_HEALING_RANGE as i64);
-    let near_port = game.units().iter().any(|u| {
-        u.active
-            && u.ty == UnitType::Port
-            && u.owner_id == ship.owner_id
-            && {
-                let dx = game.map.x(u.tile) as i64 - game.map.x(ship.tile) as i64;
-                let dy = game.map.y(u.tile) as i64 - game.map.y(ship.tile) as i64;
-                dx * dx + dy * dy <= r2
-            }
+    // Official `owner.units(Port)` walks Player._units insertion order.
+    let near_port = owner_port_tiles(game, &ship.owner_id).iter().any(|&tile| {
+        let dx = game.map.x(tile) as i64 - game.map.x(ship.tile) as i64;
+        let dy = game.map.y(tile) as i64 - game.map.y(ship.tile) as i64;
+        dx * dx + dy * dy <= r2
     });
     if near_port {
         if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
             u.health = (u.health + WARSHIP_PASSIVE_HEALING).min(u.max_health);
         }
     }
+}
+
+fn tick_warship_combat_or_patrol(
+    game: &mut Game,
+    owner: &str,
+    id: u32,
+    patrol: TileRef,
+    ticks: u32,
+    last_shell: &mut u32,
+    already_sent: &mut Vec<u32>,
+    rng: Option<&mut PseudoRandom>,
+    stepper: &mut PathStepper,
+) {
+    let Some(ship) = game.units().iter().find(|u| u.id == id).cloned() else {
+        return;
+    };
+    let tgt = find_best_warship_target(game, &ship, already_sent, true);
+    if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+        u.target_unit = tgt;
+    }
+    let tgt_ty = tgt.and_then(|tid| game.units().iter().find(|u| u.id == tid).map(|u| u.ty));
+    match tgt_ty {
+        Some(UnitType::TransportShip) | Some(UnitType::Warship) => {
+            shoot_warship_target(game, owner, id, tgt.unwrap(), ticks, last_shell, already_sent);
+            if let Some(r) = rng {
+                patrol_warship(game, id, patrol, r, stepper);
+            }
+        }
+        Some(UnitType::TradeShip) => {
+            hunt_trade_ship(game, id, tgt.unwrap(), stepper);
+        }
+        _ => {
+            if let Some(r) = rng {
+                patrol_warship(game, id, patrol, r, stepper);
+            }
+        }
+    }
+}
+
+fn owner_port_tiles(game: &Game, owner: &str) -> Vec<TileRef> {
+    let ids = game.player(owner).map(|p| p.units.clone()).unwrap_or_default();
+    ids.iter()
+        .filter_map(|&id| {
+            game.units()
+                .iter()
+                .find(|u| u.id == id && u.ty == UnitType::Port)
+                .map(|u| u.tile)
+        })
+        .collect()
+}
+
+fn euclid2(game: &Game, a: TileRef, b: TileRef) -> i64 {
+    let dx = game.map.x(a) as i64 - game.map.x(b) as i64;
+    let dy = game.map.y(a) as i64 - game.map.y(b) as i64;
+    dx * dx + dy * dy
+}
+
+fn find_nearest_port(game: &Game, ship_id: u32) -> Option<TileRef> {
+    let ship = game.units().iter().find(|u| u.id == ship_id)?;
+    let wc = game.get_water_component(ship.tile)?;
+    let mut best = None;
+    let mut best_d = i64::MAX;
+    for tile in owner_port_tiles(game, &ship.owner_id) {
+        if !game.has_water_component(tile, wc) {
+            continue;
+        }
+        let d = euclid2(game, ship.tile, tile);
+        if d < best_d {
+            best_d = d;
+            best = Some(tile);
+        }
+    }
+    best
+}
+
+fn should_start_repair_retreat(
+    game: &Game,
+    id: u32,
+    health_before: i32,
+    ticks: u32,
+    last_manual: u32,
+) -> bool {
+    let Some(ship) = game.units().iter().find(|u| u.id == id) else {
+        return false;
+    };
+    if ship.warship_state != WarshipMode::Patrolling {
+        return false;
+    }
+    if game
+        .player(&ship.owner_id)
+        .map(|p| p.in_doomsday)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if ticks.saturating_sub(last_manual) < 50 {
+        return false;
+    }
+    let thresh = ship.max_health * WARSHIP_RETREAT_HEALTH_PERCENT / 100;
+    if health_before >= thresh {
+        return false;
+    }
+    !owner_port_tiles(game, &ship.owner_id).is_empty()
+}
+
+fn start_repair_retreat(game: &mut Game, id: u32, heal_rem: &mut f64) {
+    let Some(port) = find_nearest_port(game, id) else {
+        return;
+    };
+    *heal_rem = 0.0;
+    if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+        u.retreat_port = Some(port);
+        u.warship_state = WarshipMode::Retreating;
+        u.target_unit = None;
+    }
+}
+
+fn cancel_repair_retreat(game: &mut Game, id: u32, heal_rem: &mut f64, clear_target: bool) {
+    *heal_rem = 0.0;
+    if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+        u.warship_state = WarshipMode::Patrolling;
+        u.retreat_port = None;
+        if clear_target {
+            u.target_tile = None;
+        }
+    }
+}
+
+fn current_retreat_port(game: &Game, id: u32) -> Option<TileRef> {
+    let ship = game.units().iter().find(|u| u.id == id)?;
+    let port = ship.retreat_port?;
+    owner_port_tiles(game, &ship.owner_id)
+        .into_iter()
+        .find(|t| *t == port)
+}
+
+fn docked_ships_at_port(game: &Game, owner: &str, port: TileRef, exclude: Option<u32>) -> Vec<u32> {
+    game.later_grid_nearby(port, WARSHIP_DOCKING_RANGE, &[UnitType::Warship])
+        .into_iter()
+        .filter_map(|(sid, _)| {
+            let u = game.units().iter().find(|x| x.id == sid)?;
+            if exclude == Some(sid) {
+                return None;
+            }
+            if u.owner_id != owner {
+                return None;
+            }
+            if u.warship_state == WarshipMode::Patrolling {
+                return None;
+            }
+            if u.target_tile.is_some() {
+                return None;
+            }
+            Some(sid)
+        })
+        .collect()
+}
+
+fn is_port_full(game: &Game, owner: &str, port: TileRef, exclude: Option<u32>) -> bool {
+    let level = game
+        .units()
+        .iter()
+        .find(|u| u.ty == UnitType::Port && u.tile == port && u.owner_id == owner)
+        .map(|u| u.level)
+        .unwrap_or(1);
+    docked_ships_at_port(game, owner, port, exclude).len() >= level as usize
+}
+
+fn nearest_available_port(game: &Game, ship_id: u32, exclude_self: bool) -> Option<(TileRef, i64)> {
+    let ship = game.units().iter().find(|u| u.id == ship_id)?;
+    let wc = game.get_water_component(ship.tile)?;
+    let exclude = if exclude_self { Some(ship_id) } else { None };
+    let mut best = None;
+    let mut best_d = i64::MAX;
+    for tile in owner_port_tiles(game, &ship.owner_id) {
+        if is_port_full(game, &ship.owner_id, tile, exclude) {
+            continue;
+        }
+        if !game.has_water_component(tile, wc) {
+            continue;
+        }
+        let d = euclid2(game, ship.tile, tile);
+        if d < best_d {
+            best_d = d;
+            best = Some(tile);
+        }
+    }
+    best.map(|t| (t, best_d))
+}
+
+fn refresh_retreat_port(game: &mut Game, id: u32) -> bool {
+    let Some(ship) = game.units().iter().find(|u| u.id == id).cloned() else {
+        return false;
+    };
+    let ports = owner_port_tiles(game, &ship.owner_id);
+    if ports.is_empty() {
+        return false;
+    }
+    let current_ok = ship
+        .retreat_port
+        .is_some_and(|p| ports.iter().any(|t| *t == p));
+    if !current_ok {
+        let new_port = nearest_available_port(game, id, true).map(|(t, _)| t);
+        if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+            u.retreat_port = new_port;
+        }
+        return new_port.is_some();
+    }
+    if let Some(cur) = ship.retreat_port {
+        if is_port_full(game, &ship.owner_id, cur, None) {
+            if let Some((alt, _)) = nearest_available_port(game, id, false) {
+                if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+                    u.retreat_port = Some(alt);
+                }
+            }
+            return game
+                .units()
+                .iter()
+                .find(|u| u.id == id)
+                .and_then(|u| u.retreat_port)
+                .is_some();
+        }
+        if let Some((closer, d2)) = nearest_available_port(game, id, false) {
+            let cur_d = euclid2(game, ship.tile, cur) as f64;
+            if (d2 as f64) < cur_d * WARSHIP_PORT_SWITCH && closer != cur {
+                if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+                    u.retreat_port = Some(closer);
+                }
+            }
+        }
+    }
+    true
+}
+
+fn apply_docked_healing(game: &mut Game, id: u32, heal_rem: &mut f64) {
+    let Some(port) = current_retreat_port(game, id) else {
+        return;
+    };
+    let Some(ship) = game.units().iter().find(|u| u.id == id).cloned() else {
+        return;
+    };
+    let docked = docked_ships_at_port(game, &ship.owner_id, port, None);
+    if !docked.contains(&id) {
+        return;
+    }
+    let level = game
+        .units()
+        .iter()
+        .find(|u| u.ty == UnitType::Port && u.tile == port && u.owner_id == ship.owner_id)
+        .map(|u| u.level)
+        .unwrap_or(1);
+    if docked.is_empty() {
+        return;
+    }
+    let pool = level as f64 * WARSHIP_PORT_HEALING_BONUS as f64;
+    *heal_rem += pool / docked.len() as f64;
+    let add = heal_rem.floor() as i32;
+    if add <= 0 {
+        return;
+    }
+    *heal_rem -= add as f64;
+    if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+        u.health = (u.health + add).min(u.max_health);
+    }
+}
+
+fn handle_repair_retreat(
+    game: &mut Game,
+    owner: &str,
+    id: u32,
+    ticks: u32,
+    last_shell: &mut u32,
+    already_sent: &mut Vec<u32>,
+    heal_rem: &mut f64,
+    stepper: &mut PathStepper,
+) -> bool {
+    let Some(ship) = game.units().iter().find(|u| u.id == id).cloned() else {
+        return false;
+    };
+    if ship.warship_state == WarshipMode::Patrolling {
+        return false;
+    }
+    let aggro = find_best_warship_target(game, &ship, already_sent, false);
+    if let Some(tid) = aggro {
+        if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+            u.target_unit = Some(tid);
+        }
+        shoot_warship_target(game, owner, id, tid, ticks, last_shell, already_sent);
+    }
+    if !refresh_retreat_port(game, id) {
+        cancel_repair_retreat(game, id, heal_rem, true);
+        return false;
+    }
+    if aggro.is_none() {
+        if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+            u.target_unit = None;
+        }
+    }
+    let Some(port) = game
+        .units()
+        .iter()
+        .find(|u| u.id == id)
+        .and_then(|u| u.retreat_port)
+    else {
+        return false;
+    };
+    let dock_r2 = (WARSHIP_DOCKING_RANGE as i64) * (WARSHIP_DOCKING_RANGE as i64);
+    let Some(ship) = game.units().iter().find(|u| u.id == id).cloned() else {
+        return false;
+    };
+    if euclid2(game, ship.tile, port) <= dock_r2 {
+        if !is_port_full(game, &ship.owner_id, port, Some(id)) {
+            if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+                u.target_tile = None;
+                u.warship_state = WarshipMode::Docked;
+            }
+            return true;
+        }
+        if ship.health >= ship.max_health {
+            cancel_repair_retreat(game, id, heal_rem, true);
+            return false;
+        }
+        return true;
+    }
+    if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+        u.target_tile = Some(port);
+    }
+    let (st, node) = game.water_step_with(stepper, ship.tile, port);
+    match st {
+        PathStatus::Complete => {
+            if let Some(n) = node {
+                game.move_unit(id, n);
+            }
+            if node == Some(port) {
+                if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+                    u.target_tile = None;
+                }
+            }
+        }
+        PathStatus::Next => {
+            if let Some(n) = node {
+                game.move_unit(id, n);
+            }
+        }
+        PathStatus::NotFound => {
+            let new_port = nearest_available_port(game, id, true).map(|(t, _)| t);
+            if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == id) {
+                u.retreat_port = new_port;
+            }
+            if new_port.is_none() {
+                cancel_repair_retreat(game, id, heal_rem, true);
+            }
+        }
+    }
+    true
 }
 
 fn unit_has_health(ty: UnitType) -> bool {
@@ -1747,6 +2246,7 @@ fn hunt_trade_ship(game: &mut Game, ship_id: u32, target: u32, stepper: &mut Pat
         if dist <= 5 {
             game.capture_unit(&ship.owner_id, target);
             if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == ship_id) {
+                u.record_trade_capture();
                 u.target_unit = None;
             }
             return;
@@ -1762,6 +2262,7 @@ fn hunt_trade_ship(game: &mut Game, ship_id: u32, target: u32, stepper: &mut Pat
             PathStatus::Complete => {
                 game.capture_unit(&ship.owner_id, target);
                 if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == ship_id) {
+                    u.record_trade_capture();
                     u.target_unit = None;
                 }
                 return;
@@ -1875,25 +2376,59 @@ fn air_compute_next(game: &Game, from: TileRef, to: TileRef, rng: &mut PseudoRan
         .unwrap_or(from)
 }
 
-fn apply_shell_damage(game: &mut Game, target: u32, seed: i32, shooter_owner: &str) {
+fn apply_shell_damage(
+    game: &mut Game,
+    target: u32,
+    seed: i32,
+    shooter_owner: &str,
+    shooter: u32,
+) {
     let Some(t) = game.units().iter().find(|u| u.id == target).cloned() else {
         return;
     };
     if !t.active {
         return;
     }
+    let shooter_vet = game
+        .units()
+        .iter()
+        .find(|u| u.id == shooter && u.active && u.ty == UnitType::Warship)
+        .map(|u| u.veterancy)
+        .unwrap_or(0);
     let mut rng = PseudoRandom::new(seed);
     let roll = rng.next_int(1.0, 6.0);
-    let damage = (roll - 1) * 25 + 200;
+    let mut damage = (roll - 1) * 25 + 200;
+    if shooter_vet > 0 {
+        damage = (damage * (100 + shooter_vet as i32 * WARSHIP_VETERANCY_SHELL_DAMAGE_BONUS)) / 100;
+    }
+    let target_ty = t.ty;
     if unit_has_health(t.ty) {
+        let mut killed = false;
         if let Some(u) = game.units_mut().iter_mut().find(|u| u.id == target) {
             u.health -= damage;
             if u.health <= 0 {
-                game.delete_unit_by(target, Some(shooter_owner));
+                killed = true;
+            }
+        }
+        if killed {
+            game.delete_unit_by(target, Some(shooter_owner));
+            if let Some(s) = game
+                .units_mut()
+                .iter_mut()
+                .find(|u| u.id == shooter && u.active && u.ty == UnitType::Warship)
+            {
+                s.record_kill(target_ty);
             }
         }
     } else {
         game.delete_unit_by(target, Some(shooter_owner));
+        if let Some(s) = game
+            .units_mut()
+            .iter_mut()
+            .find(|u| u.id == shooter && u.active && u.ty == UnitType::Warship)
+        {
+            s.record_kill(target_ty);
+        }
     }
 }
 
@@ -2017,7 +2552,7 @@ fn nuke_death_factor(ty: UnitType, humans: f64, tiles_owned: u32, max_troops: f6
     } else {
         0.0
     };
-    500.0 * (1.0 - (-2.0 * normalized).exp())
+    500.0 * (1.0 - js_exp(-2.0 * normalized))
 }
 
 fn nuke_tiles_to_destroy(game: &mut Game, dst: TileRef, ty: UnitType) -> Vec<TileRef> {

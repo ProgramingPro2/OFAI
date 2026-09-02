@@ -1,6 +1,6 @@
 //! Economy and combat formulas from OpenFront Config.ts.
 
-use crate::js_math::js_pow;
+use crate::js_math::{js_exp, js_large_attack_bonus, js_pow};
 use crate::spec::{Difficulty, PlayerType, TerrainKind};
 
 const DEFENSE_DEBUFF_MIDPOINT: f64 = 150_000.0;
@@ -14,7 +14,7 @@ pub fn within(value: f64, min: f64, max: f64) -> f64 {
 }
 
 pub fn sigmoid(value: f64, decay_rate: f64, midpoint: f64) -> f64 {
-    1.0 / (1.0 + (-decay_rate * (value - midpoint)).exp())
+    1.0 / (1.0 + js_exp(-decay_rate * (value - midpoint)))
 }
 
 pub fn start_manpower(player_type: PlayerType, difficulty: Difficulty) -> f64 {
@@ -136,12 +136,12 @@ pub fn attack_logic(
     let large_def_speed = 0.7 + 0.3 * defense_sig;
     let large_def_atk = 0.7 + 0.3 * defense_sig;
     let large_attack_bonus = if attacker_tiles > 100_000 {
-        (100_000.0 / attacker_tiles as f64).sqrt().powf(0.7)
+        js_large_attack_bonus(attacker_tiles)
     } else {
         1.0
     };
     let large_atk_speed = if attacker_tiles > 100_000 {
-        (100_000.0 / attacker_tiles as f64).powf(0.6)
+        js_pow(100_000.0 / attacker_tiles as f64, 0.6)
     } else {
         1.0
     };
@@ -210,12 +210,17 @@ pub const WARSHIP_PATROL_RANGE: u32 = 100;
 pub const SHELL_LIFETIME: u32 = 50;
 pub const SAFE_FROM_PIRATES_COOLDOWN: u32 = 20;
 pub const WARSHIP_MAX_HEALTH: i32 = 1000;
-pub const WARSHIP_RETREAT_HEALTH_PERCENT: i32 = 40;
+pub const WARSHIP_RETREAT_HEALTH_PERCENT: i32 = 75;
 pub const WARSHIP_PASSIVE_HEALING: i32 = 1;
-pub const WARSHIP_PASSIVE_HEALING_RANGE: u32 = 20;
-pub const WARSHIP_DOCKING_RANGE: u32 = 3;
+pub const WARSHIP_PASSIVE_HEALING_RANGE: u32 = 150;
+pub const WARSHIP_DOCKING_RANGE: u32 = 5;
 pub const WARSHIP_PORT_HEALING_BONUS: i32 = 5;
-pub const WARSHIP_PORT_SWITCH: f64 = 0.7;
+pub const WARSHIP_PORT_SWITCH: f64 = 0.75;
+pub const WARSHIP_MAX_VETERANCY: u32 = 3;
+pub const WARSHIP_VETERANCY_HEALTH_BONUS: i32 = 20;
+pub const WARSHIP_VETERANCY_SHELL_DAMAGE_BONUS: i32 = 20;
+pub const WARSHIP_VETERANCY_TRANSPORT_KILLS: u32 = 10;
+pub const WARSHIP_VETERANCY_TRADE_CAPTURES: u32 = 25;
 pub const MIRV_COOLDOWN_TICKS: u32 = 300;
 
 pub fn train_spawn_rate(num_factories: u32) -> i32 {
@@ -236,7 +241,7 @@ pub fn trade_ship_gold(dist: u32) -> i64 {
     // Official Config.tradeShipShortRangeDebuff() is 300, distinct from the
     // 200-tile spawn proximity check (TRADE_SHIP_SHORT_RANGE).
     let debuff = 300.0;
-    let base = 75_000.0 / (1.0 + (-0.03 * (dist as f64 - debuff)).exp()) + 50.0 * dist as f64;
+    let base = 75_000.0 / (1.0 + js_exp(-0.03 * (dist as f64 - debuff))) + 50.0 * dist as f64;
     base.floor() as i64
 }
 

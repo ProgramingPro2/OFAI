@@ -4,6 +4,10 @@
 evaluator. It does not start training, does not talk to public
 multiplayer, and does not use the Rust mirror.
 
+When `agent.train` collects on Rust, periodic holdout/mastery still
+defaults to this official core (`--eval-backend auto`). Use
+`--eval-backend train` only to score the collect farm on purpose.
+
 Sampled PPO is the deployed policy. Deterministic argmax is a greedy
 diagnostic only. `win_rate` is the core 80% FFA win; it is reported
 with a Wilson 95% interval.
@@ -36,7 +40,11 @@ identities or win rate. `--workers` is passed to `EnvServerProcess`.
 
 `--json-out PATH` writes a machine-readable report (`stage`, `suite`,
 `workers`, `config`, `sampled`, `deterministic`, Wilson bounds,
-`hygiene`, `seeds`).
+`hygiene`, `seeds`, `episode_records`). `--actions-out PATH` writes
+per-episode 5-int action tapes (seed, config, terminal) for
+`NATION_EP_ACTIONS` replay in `sim/tests/nation_episodes.rs`.
+`--holdout-offset N` skips the first N frozen holdout/OOD seeds so
+`--det-episodes 1 --holdout-offset 1` records only holdout[1].
 
 ```bash
 # Goal holdout: 64 sampled + 8 det on World Normal Impossible

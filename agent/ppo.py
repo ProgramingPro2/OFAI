@@ -83,6 +83,8 @@ class PPOConfig:
     # "effective" = renormalized onto explore-worthy types so always-legal
     # boat/build/diplomacy/NOOP are not rewarded for being diverse.
     ent_weighting: str = "uniform"
+    # Mask-normalized quantity-head bonus on ATTACK/BOAT only (0=off).
+    qty_ent_coef: float = 0.0
     ent_coef_min: float = 0.01
     ent_coef_max: float = 0.5
     ent_kp: float = 0.05
@@ -696,6 +698,7 @@ class PPOTrainer:
         running_kl_count = 0
         pg_loss = ent = v_loss = None
         action_ent = cond_ent = action_ent_max = measured_norm = None
+        qty_measured = None
         ref_kl_mean = None
         ref_kl_parts: dict[str, float] = {}
         n_updates = 0
@@ -798,6 +801,13 @@ class PPOTrainer:
                 # Bonus the multi-sample normalized action-type head only.
                 # Raw nats and 1024-way region entropy must not drive this.
                 loss = pg_loss - self.ent_coef * measured_norm + cfg.vf_coef * v_loss
+                if float(cfg.qty_ent_coef) > 0.0:
+                    qty_multi = extras["quantity_entropy_multi"]
+                    if bool(qty_multi.any()):
+                        qty_measured = extras["quantity_entropy_norm"][qty_multi].mean()
+                    else:
+                        qty_measured = extras["quantity_entropy_norm"].new_tensor(0.0)
+                    loss = loss - float(cfg.qty_ent_coef) * qty_measured
                 if self.reference is not None and float(cfg.ref_kl_coef) > 0.0:
                     ref_kl_b, ref_ex = self.policy.joint_policy_kl(
                         mb_obs, self.reference
@@ -872,6 +882,10 @@ class PPOTrainer:
             "ref_kl_reverted": bool(ref_kl_reverted),
             "ref_kl_coef": float(cfg.ref_kl_coef),
             "ent_weighting": cfg.ent_weighting,
+            "qty_ent_coef": float(cfg.qty_ent_coef),
+            "quantity_entropy_norm": (
+                float(qty_measured.item()) if qty_measured is not None else 0.0
+            ),
             **{k: round(v, 6) for k, v in ref_kl_parts.items() if k != "ref_kl"},
         }
 
@@ -906,6 +920,7 @@ class PPOTrainer:
                 "target_kl": self.cfg.target_kl,
                 "ent_target": self.cfg.ent_target,
                 "ent_weighting": self.cfg.ent_weighting,
+                "qty_ent_coef": self.cfg.qty_ent_coef,
                 "ref_kl_coef": self.cfg.ref_kl_coef,
                 "ref_kl_target": self.cfg.ref_kl_target,
                 "ref_kl_hard": self.cfg.ref_kl_hard,

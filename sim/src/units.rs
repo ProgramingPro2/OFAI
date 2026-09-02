@@ -1,5 +1,9 @@
 //! Official unit types, costs, and construction durations.
 
+use crate::config::{
+    WARSHIP_MAX_HEALTH, WARSHIP_MAX_VETERANCY, WARSHIP_VETERANCY_HEALTH_BONUS,
+    WARSHIP_VETERANCY_TRADE_CAPTURES, WARSHIP_VETERANCY_TRANSPORT_KILLS,
+};
 use crate::map::TileRef;
 use crate::spec::PlayerType;
 
@@ -179,6 +183,10 @@ pub struct Unit {
     pub last_safe_pirates: u32,
     /// Official `Unit.destroyer()` after `delete(true, attacker)`.
     pub destroyer_id: Option<String>,
+    /// Official `warshipState.veterancy` (0 for non-warships).
+    pub veterancy: u32,
+    /// Shared transport-kill / trade-capture progress toward the next level.
+    pub veterancy_progress: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +239,53 @@ impl Unit {
             retreat_port: None,
             last_safe_pirates: 0,
             destroyer_id: None,
+            veterancy: 0,
+            veterancy_progress: 0,
+        }
+    }
+
+    pub fn increase_veterancy(&mut self) {
+        if self.ty != UnitType::Warship || self.veterancy >= WARSHIP_MAX_VETERANCY {
+            return;
+        }
+        self.veterancy += 1;
+        self.max_health = warship_max_health_with_veterancy(self.veterancy);
+    }
+
+    pub fn record_kill(&mut self, target_ty: UnitType) {
+        if self.ty != UnitType::Warship {
+            return;
+        }
+        if target_ty == UnitType::Warship {
+            self.veterancy_progress = 0;
+            self.increase_veterancy();
+        } else if target_ty == UnitType::TransportShip {
+            self.add_veterancy_progress(UnitType::TransportShip);
+        }
+    }
+
+    pub fn record_trade_capture(&mut self) {
+        self.add_veterancy_progress(UnitType::TradeShip);
+    }
+
+    fn add_veterancy_progress(&mut self, source: UnitType) {
+        if self.ty != UnitType::Warship || self.veterancy >= WARSHIP_MAX_VETERANCY {
+            return;
+        }
+        let points_per_level = WARSHIP_VETERANCY_TRANSPORT_KILLS * WARSHIP_VETERANCY_TRADE_CAPTURES;
+        self.veterancy_progress += if source == UnitType::TransportShip {
+            WARSHIP_VETERANCY_TRADE_CAPTURES
+        } else {
+            WARSHIP_VETERANCY_TRANSPORT_KILLS
+        };
+        while self.veterancy_progress >= points_per_level
+            && self.veterancy < WARSHIP_MAX_VETERANCY
+        {
+            self.veterancy_progress -= points_per_level;
+            self.increase_veterancy();
+        }
+        if self.veterancy >= WARSHIP_MAX_VETERANCY {
+            self.veterancy_progress = 0;
         }
     }
 
@@ -244,6 +299,15 @@ impl Unit {
         self.tile as f64
             + crate::rng::simple_hash_abs_f64(self.ty.official_name()) * self.id as f64
     }
+}
+
+/// Official `maxHealthWithVeterancy` for warships.
+pub fn warship_max_health_with_veterancy(veterancy: u32) -> i32 {
+    if veterancy == 0 {
+        return WARSHIP_MAX_HEALTH;
+    }
+    WARSHIP_MAX_HEALTH
+        + (WARSHIP_MAX_HEALTH * veterancy as i32 * WARSHIP_VETERANCY_HEALTH_BONUS) / 100
 }
 
 pub fn city_levels(units: &[Unit], player_id: &str) -> f64 {
@@ -278,4 +342,33 @@ pub fn cheapest_buildable_cost(player_type: PlayerType, gold: i64, constructed: 
     let _ = gold;
     let _ = constructed;
     unit_cost(UnitType::DefensePost, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warship_max_health_with_veterancy;
+    use crate::config::WARSHIP_RETREAT_HEALTH_PERCENT;
+
+    #[test]
+    fn veteran_max_health_and_retreat_threshold_match_official() {
+        assert_eq!(warship_max_health_with_veterancy(0), 1000);
+        assert_eq!(warship_max_health_with_veterancy(1), 1200);
+        assert_eq!(warship_max_health_with_veterancy(2), 1400);
+        assert_eq!(warship_max_health_with_veterancy(3), 1600);
+        assert_eq!(WARSHIP_RETREAT_HEALTH_PERCENT, 75);
+        assert_eq!(1400 * WARSHIP_RETREAT_HEALTH_PERCENT / 100, 1050);
+        assert_eq!(crate::config::WARSHIP_PASSIVE_HEALING, 1);
+        assert_eq!(crate::config::WARSHIP_PORT_HEALING_BONUS, 5);
+    }
+
+    #[test]
+    fn temporary_embargo_expires_after_duration_not_at() {
+        // Official: `ticks - createdAt > temporaryEmbargoDuration()`.
+        let created = 6114u32;
+        let dur = super::TEMPORARY_EMBARGO_DURATION;
+        assert_eq!(dur, 3000);
+        let keep = |ticks: u32| ticks.saturating_sub(created) <= dur;
+        assert!(keep(9114));
+        assert!(!keep(9115));
+    }
 }

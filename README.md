@@ -155,7 +155,8 @@ core; `rust` is the same fail-closed check as auto), `--total-steps`, `--additio
 at `--lr`), `--allow-collapsed-resume`, `--dry-run`,
 `--eval-every`, `--eval-episodes`
 (default 32 frozen holdout; values below the stage minimum are raised),
-`--eval-det-episodes` (diagnostic),
+`--eval-backend` (`auto` default: official-core holdout when collect is
+rust; `train` reuses the collect farm), `--eval-det-episodes` (diagnostic),
 `--eval-ood-episodes` (logged only), `--target-kl`
 (default 0.03 active-joint), `--ent-target` (default 0.6 mask-normalized
 action-type entropy in [0, 1]; transfer should pass `0.3`),
@@ -265,7 +266,8 @@ Training `--backend auto` (default) selects the schema-v2 Rust mirror
 capability document (`cargo run --manifest-path sim/Cargo.toml -- --capabilities`).
 `--backend official` always spawns `OpenFrontIO/ofai/env/EnvServer.ts`.
 Standalone `python -m agent.eval` is official-core only and is the
-checkpoint-quality authority for Impossible wins. Unsupported or unknown
+checkpoint-quality authority for Impossible wins. Train-time holdout
+uses that same official core by default when collect is Rust. Unsupported or unknown
 capabilities select official **before episode creation**. Mid-episode
 switching and approximation are refused.
 

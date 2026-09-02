@@ -771,17 +771,8 @@ pub fn fill_masks(
         obs.action_mask[ACTION_BUILD as usize] = 1;
     }
 
-    let mut any_boat = false;
-    for r in 0..NUM_REGIONS {
-        if obs.boat_regions[r] == 0 {
-            continue;
-        }
-        let ok = game.find_boat_in_region(me_id, r as i32).is_some();
-        obs.boat_regions[r] = if ok { 1 } else { 0 };
-        if ok {
-            any_boat = true;
-        }
-    }
+    game.refresh_boat_regions(me_id, &mut obs.boat_regions);
+    let any_boat = obs.boat_regions.iter().any(|&b| b != 0);
     obs.action_mask[ACTION_BOAT as usize] = if any_boat && any_q { 1 } else { 0 };
 
     let ally_row = (ACTION_ALLY as usize) * NUM_PLAYER_SLOTS;

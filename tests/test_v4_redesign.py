@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -32,8 +33,9 @@ from agent.model import (
     explore_action_mask,
     make_dummy_obs,
     masked_categorical_kl,
+    normalized_action_entropy,
 )
-from agent.ppo import PPOConfig, PPOTrainer
+from agent.ppo import PPOConfig, PPOTrainer, RolloutBuffer
 from agent import spaces
 from agent.train import (
     apply_v4_ablation_defaults,
@@ -263,6 +265,8 @@ def test_v4_ablation_cli_is_short_and_locked():
     assert fresh.ent_target == pytest.approx(0.6)
     assert fresh.ent_weighting == "uniform"
     assert fresh.ref_kl_coef == pytest.approx(0.0)
+    assert fresh.qty_ent_coef == pytest.approx(0.0)
+    assert args.qty_ent_coef == pytest.approx(0.03)
     assert fresh.eval_every == 0
     assert fresh.max_updates == 0
 
@@ -533,3 +537,94 @@ def test_force_stage_it800_without_complete_baseline_still_evals():
     )
     assert plan.need_baseline_eval
     assert plan.stage_baseline == {}
+
+
+def test_quantity_entropy_active_only_on_attack_boat():
+    policy = Policy()
+    obs = make_dummy_obs(4, "cpu")
+    actions = torch.tensor(
+        [
+            [spaces.ACTION_NOOP, 0, 0, 0, 0],
+            [spaces.ACTION_ATTACK, 0, 0, 0, 0],
+            [spaces.ACTION_BOAT, 0, 0, 0, 0],
+            [spaces.ACTION_BUILD, 0, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    with torch.no_grad():
+        _, _, _, extras = policy.evaluate(obs, actions)
+    active = extras["quantity_entropy_active"]
+    assert not bool(active[0])
+    assert bool(active[1])
+    assert bool(active[2])
+    assert not bool(active[3])
+    assert extras["quantity_entropy_norm"].min() >= 0.0
+    assert extras["quantity_entropy_norm"].max() <= 1.0
+
+
+def test_qty_ent_coef_off_by_default_and_checkpoint_compatible(tmp_path):
+    cfg = PPOConfig(device="cpu", qty_ent_coef=0.0)
+    trainer = PPOTrainer(Policy(), cfg)
+    path = tmp_path / "qty-off.pt"
+    trainer.save(str(path))
+    ckpt = trainer.load(str(path))
+    assert ckpt["hyperparameters"]["qty_ent_coef"] == pytest.approx(0.0)
+    assert "qty_ent_coef" not in ckpt["model"]
+
+
+def test_ppo_qty_ent_bonus_only_when_coef_positive():
+    """qty_ent_coef>0 subtracts normalized quantity entropy from the loss."""
+    torch.manual_seed(7)
+    policy = Policy()
+    obs = make_dummy_obs(8, "cpu")
+    actions = torch.zeros(8, 5, dtype=torch.long)
+    actions[:, 0] = spaces.ACTION_ATTACK
+    with torch.no_grad():
+        _, _, _, extras = policy.evaluate(obs, actions)
+    qty_multi = extras["quantity_entropy_multi"]
+    assert bool(qty_multi.any())
+    qty_norm = float(extras["quantity_entropy_norm"][qty_multi].mean())
+
+    cfg_off = PPOConfig(
+        rollout_len=4,
+        device="cpu",
+        num_minibatches=1,
+        update_epochs=1,
+        target_kl=100.0,
+        qty_ent_coef=0.0,
+    )
+    cfg_on = PPOConfig(
+        rollout_len=4,
+        device="cpu",
+        num_minibatches=1,
+        update_epochs=1,
+        target_kl=100.0,
+        qty_ent_coef=0.05,
+    )
+    buf = RolloutBuffer(4, 2)
+    buf.actions[:, :, 0] = spaces.ACTION_ATTACK
+    buf.logprobs[:] = 0.0
+    buf.values[:] = 0.0
+    for key in buf.obs:
+        if key == "spatial":
+            buf.obs[key][:] = 0
+        else:
+            buf.obs[key][:] = 1
+    last_obs = {
+        key: (
+            np.zeros(buf.obs[key].shape[1:], dtype=np.float32)
+            if key == "spatial"
+            else np.ones(buf.obs[key].shape[1:], dtype=np.float32)
+        )
+        for key in buf.obs
+    }
+
+    off = PPOTrainer(Policy(), cfg_off)
+    on = PPOTrainer(Policy(), cfg_on)
+    off.policy.load_state_dict(policy.state_dict())
+    on.policy.load_state_dict(policy.state_dict())
+    m_off = off.update(buf, last_obs)
+    m_on = on.update(buf, last_obs)
+    assert m_off["quantity_entropy_norm"] == pytest.approx(0.0)
+    assert m_on["quantity_entropy_norm"] == pytest.approx(qty_norm, abs=0.05)
+    assert m_on["quantity_entropy_norm"] > 0.0

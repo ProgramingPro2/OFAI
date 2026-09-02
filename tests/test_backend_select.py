@@ -19,8 +19,10 @@ from agent.backend import (
     BACKEND_RUST,
     config_allowed_on_backend,
     parse_backend_arg,
+    parse_eval_backend_arg,
     refuse_mid_episode_switch,
     required_capabilities,
+    resolve_holdout_backend,
     rust_blocked_capabilities,
     rust_sim_cmd,
     select_sim_backend,
@@ -256,6 +258,19 @@ def test_env_server_cmd_official_unchanged_and_rust_uses_sim():
     assert rust[rust.index("--workers") + 1] == "4"
 
 
+def test_resolve_holdout_backend_official_when_collect_is_rust():
+    assert resolve_holdout_backend("rust", "auto") == BACKEND_OFFICIAL
+    assert resolve_holdout_backend("rust", "official") == BACKEND_OFFICIAL
+    assert resolve_holdout_backend("rust", "train") == BACKEND_RUST
+    assert resolve_holdout_backend("official", "auto") == BACKEND_OFFICIAL
+    assert resolve_holdout_backend("official", "train") == BACKEND_OFFICIAL
+    assert parse_eval_backend_arg("AUTO") == "auto"
+    with pytest.raises(ValueError, match="eval backend"):
+        parse_eval_backend_arg("mixed")
+    with pytest.raises(ValueError, match="resolved backend"):
+        resolve_holdout_backend("auto", "train")
+
+
 def test_dry_run_reports_rust_when_nations_are_supported(capsys):
     from agent import train as train_mod
 
@@ -274,3 +289,5 @@ def test_dry_run_reports_rust_when_nations_are_supported(capsys):
     assert "sim_backend=rust" in out
     assert "requested=auto" in out
     assert "fallback=false" in out
+    assert "holdout_backend=official" in out
+    assert "train=rust" in out

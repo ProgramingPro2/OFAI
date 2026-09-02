@@ -3,9 +3,7 @@
 use crate::actions::{translate, ActionVec};
 use crate::ai::{create_nations, tribe_name};
 use crate::capabilities::UnsupportedConfig;
-use crate::digest::{
-    compute_decision_boundary, DecisionBoundary, StepDigestInput,
-};
+use crate::digest::{compute_decision_boundary, DecisionBoundary, StepDigestInput};
 use crate::game::Game;
 use crate::obs::{fill_masks, ObsBuffers, ObsExtractor, SlotInfo};
 use crate::player::PlayerInfo;
@@ -125,6 +123,10 @@ impl AgentEnv {
 
     pub fn peek_obs(&self) -> &ObsBuffers {
         &self.obs
+    }
+
+    pub fn slots(&self) -> &[crate::obs::SlotInfo] {
+        &self.slots
     }
 
     pub fn game(&self) -> &Game {

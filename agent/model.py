@@ -361,6 +361,7 @@ class Policy(nn.Module):
         action_ent = dist_a.entropy()
         total_ent = action_ent.clone()
         cond_ent = torch.zeros_like(action_ent)
+        qty_ent = torch.zeros_like(action_ent)
 
         for i, name in enumerate(("target", "region", "quantity", "unit"), start=1):
             dist = torch.distributions.Categorical(logits=logits[name])
@@ -370,6 +371,8 @@ class Policy(nn.Module):
             total_logp = total_logp + torch.where(m, lp, torch.zeros_like(lp))
             total_ent = total_ent + torch.where(m, ent, torch.zeros_like(ent))
             cond_ent = cond_ent + torch.where(m, ent, torch.zeros_like(ent))
+            if name == "quantity":
+                qty_ent = torch.where(m, ent, torch.zeros_like(ent))
 
         norm, max_ent, multi = normalized_action_entropy(
             action_ent, obs["action_mask"]
@@ -377,6 +380,10 @@ class Policy(nn.Module):
         eff_ent, eff_norm, eff_max, eff_multi = effective_action_entropy(
             logits["action"], obs["action_mask"]
         )
+        qty_norm, qty_max, qty_multi = normalized_action_entropy(
+            qty_ent, obs["quantity_mask"]
+        )
+        qty_active = active["quantity"]
         extras = {
             "action_entropy": action_ent,
             "cond_entropy": cond_ent,
@@ -387,6 +394,11 @@ class Policy(nn.Module):
             "action_entropy_eff_norm": eff_norm,
             "action_entropy_eff_max": eff_max,
             "action_entropy_eff_multi": eff_multi,
+            "quantity_entropy": qty_ent,
+            "quantity_entropy_norm": qty_norm,
+            "quantity_entropy_max": qty_max,
+            "quantity_entropy_multi": qty_multi & qty_active,
+            "quantity_entropy_active": qty_active,
         }
         return total_logp, total_ent, logits["value"], extras
 

@@ -50,6 +50,10 @@ pub struct NationLater {
     pub emoji_game_over: bool,
     /// Official `Player.outgoingEmojis_` last-send tick per recipient id (`*` = all).
     pub outgoing_emoji_at: HashMap<String, u32>,
+    /// Official `AiAttackBehavior.botAttackTroopsSent`. Reset only when
+    /// `attackBots` finds at least one nearby unfriendly bot; leftover budget
+    /// applies to later bot-target sends (weakest/hated/assist) on later ticks.
+    pub bot_attack_troops_sent: f64,
 }
 
 impl Game {
@@ -490,7 +494,12 @@ fn perceived_cost(game: &Game, pid: &str, ty: UnitType) -> i64 {
         return real;
     }
     let owned = owned_count(game, pid, ty) as f64;
-    let inc = if ty == UnitType::City { 1.0 } else { 1.0 };
+    // Official NationStructureBehavior.getStructureRatios / CITY_PERCEIVED.
+    let inc = match ty {
+        UnitType::SamLauncher => 0.3,
+        UnitType::City | UnitType::Port | UnitType::Factory | UnitType::MissileSilo => 1.0,
+        _ => 0.1,
+    };
     (real as f64 * (1.0 + inc * owned)).ceil() as i64
 }
 
@@ -1195,16 +1204,26 @@ pub fn maybe_spawn_warship(game: &mut Game, pid: &str, idx: usize) {
     if !chance {
         return;
     }
-    let ports: Vec<TileRef> = game
-        .units()
+    // Official `player.units(Port)` walks Player._units insertion order,
+    // including captured ports appended on tile conquest. Global `game.units()`
+    // is id order and picks the wrong port for randElement.
+    let owned: Vec<u32> = game.player(pid).map(|p| p.units.clone()).unwrap_or_default();
+    let ports: Vec<TileRef> = owned
         .iter()
-        .filter(|u| u.active && u.ty == UnitType::Port && u.owner_id == pid)
-        .map(|u| u.tile)
+        .filter_map(|&id| {
+            game.units()
+                .iter()
+                .find(|u| u.id == id && u.ty == UnitType::Port)
+                .map(|u| u.tile)
+        })
         .collect();
-    let ships = game
-        .units()
+    let ships = owned
         .iter()
-        .filter(|u| u.active && u.ty == UnitType::Warship && u.owner_id == pid)
+        .filter(|&&id| {
+            game.units()
+                .iter()
+                .any(|u| u.id == id && u.ty == UnitType::Warship)
+        })
         .count();
     let gold = game.player(pid).map(|p| p.gold).unwrap_or(0);
     let cost = game.structure_cost(pid, UnitType::Warship);
@@ -1759,12 +1778,24 @@ pub fn maybe_send_nuke(game: &mut Game, pid: &str, idx: usize) {
         return;
     };
     let range = nuke_magnitudes(nuke_type).1;
+    // Official `nukeTarget.units(Structures.types)` follows Player._units
+    // insertion/capture order, not global unit-id order. Equal nukeTileScore
+    // ties keep the first candidate, so walking game.units() by id picks a
+    // different dest (city 9 vs city 48 on greedy holdout[0] step 679).
     let structure_tiles: Vec<TileRef> = game
-        .units()
-        .iter()
-        .filter(|u| u.active && u.owner_id == target && u.ty.is_structure())
-        .map(|u| u.tile)
-        .collect();
+        .player(&target)
+        .map(|p| {
+            p.units
+                .iter()
+                .filter_map(|&id| {
+                    game.units().iter().find(|u| {
+                        u.id == id && u.active && u.owner_id == target && u.ty.is_structure()
+                    })
+                })
+                .map(|u| u.tile)
+                .collect()
+        })
+        .unwrap_or_default();
     let n_rand = if game.difficulty == Difficulty::Impossible {
         30
     } else {
@@ -1772,8 +1803,8 @@ pub fn maybe_send_nuke(game: &mut Game, pid: &str, idx: usize) {
     };
     let random_tiles = rand_territory_tiles(game, &target, idx, n_rand);
     let mut all_tiles = IndexSet::new();
-    for t in random_tiles {
-        all_tiles.insert(t);
+    for t in &random_tiles {
+        all_tiles.insert(*t);
     }
     for t in structure_tiles {
         all_tiles.insert(t);
@@ -1786,11 +1817,19 @@ pub fn maybe_send_nuke(game: &mut Game, pid: &str, idx: usize) {
         .map(|u| u.tile)
         .collect();
     let structures: Vec<(UnitType, u32, TileRef)> = game
-        .units()
-        .iter()
-        .filter(|u| u.active && u.owner_id == target && u.ty.is_structure())
-        .map(|u| (u.ty, u.level, u.tile))
-        .collect();
+        .player(&target)
+        .map(|p| {
+            p.units
+                .iter()
+                .filter_map(|&id| {
+                    game.units().iter().find(|u| {
+                        u.id == id && u.active && u.owner_id == target && u.ty.is_structure()
+                    })
+                })
+                .map(|u| (u.ty, u.level, u.tile))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut best_tile: Option<TileRef> = None;
     let mut best_value: f64 = -1.0;
     let tiles: Vec<TileRef> = all_tiles.into_iter().collect();

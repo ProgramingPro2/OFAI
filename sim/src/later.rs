@@ -113,6 +113,7 @@ pub enum LaterExec {
         last_move: u32,
         stepper: PathStepper,
         inited: bool,
+        was_captured: bool,
     },
     Warship {
         active: bool,
@@ -125,6 +126,8 @@ pub enum LaterExec {
         stepper: PathStepper,
         already_sent: Vec<u32>,
         inited: bool,
+        heal_rem: f64,
+        last_manual: u32,
     },
     Nuke {
         active: bool,
@@ -300,6 +303,8 @@ impl Game {
             stepper: PathStepper::new(),
             already_sent: Vec::new(),
             inited: false,
+            heal_rem: 0.0,
+            last_manual: 0,
         });
     }
 

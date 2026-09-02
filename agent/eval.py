@@ -157,6 +157,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="write machine-readable JSON report to this path",
     )
     p.add_argument(
+        "--actions-out",
+        type=str,
+        default="",
+        help="write per-episode greedy/sampled action tapes (seed, config, "
+        "5-int actions, terminal) for nation_episodes replay",
+    )
+    p.add_argument(
+        "--holdout-offset",
+        type=int,
+        default=0,
+        help="skip the first N frozen holdout/OOD seeds (stage mode only)",
+    )
+    p.add_argument(
         "--win-tiles-frac",
         type=float,
         default=0.0,
@@ -269,6 +282,8 @@ def resolve_eval_plan(args: argparse.Namespace) -> EvalPlan:
         raise ValueError("--sampled-episodes must be >= 0")
     if args.det_episodes is not None and int(args.det_episodes) < 0:
         raise ValueError("--det-episodes must be >= 0")
+    if int(args.holdout_offset) < 0:
+        raise ValueError("--holdout-offset must be >= 0")
     if int(args.episodes) < 0:
         raise ValueError("--episodes must be >= 0")
 
@@ -300,13 +315,14 @@ def resolve_eval_plan(args: argparse.Namespace) -> EvalPlan:
         else:
             allowed = list(stage.allowed_actions)
 
-        n_hold = max(sampled_n, det_n)
+        offset = int(args.holdout_offset)
+        n_hold = offset + max(sampled_n, det_n)
         if suite == "ood":
             all_cfgs = cur.ood_configs(n_hold)
         else:
             all_cfgs = cur.holdout_configs(n_hold)
-        sampled_cfgs = [dict(c) for c in all_cfgs[:sampled_n]]
-        det_cfgs = [dict(c) for c in all_cfgs[:det_n]]
+        sampled_cfgs = [dict(c) for c in all_cfgs[offset : offset + sampled_n]]
+        det_cfgs = [dict(c) for c in all_cfgs[offset : offset + det_n]]
         if allowed_explicit:
             encoded = spaces.encode_allowed_actions(allowed)
             for cfg in sampled_cfgs + det_cfgs:
@@ -619,6 +635,17 @@ def _summarize(
         "hygiene": _hygiene(hist, causes, total_a),
         "seeds": list(planned_seeds),
         "maps": list(maps),
+        "episode_records": [
+            {
+                **records[s],
+                "ticks": ticks_survived.get(s),
+                "return": returns.get(s),
+                "peak_tiles": peaks.get(s),
+                "final_tiles": finals.get(s),
+            }
+            for s in planned_seeds
+            if s in records
+        ],
     }
 
 
@@ -668,6 +695,7 @@ def _empty_mode() -> dict:
         "hygiene": _hygiene(Counter(), Counter(), 0),
         "seeds": [],
         "maps": [],
+        "episode_records": [],
     }
 
 
@@ -681,6 +709,7 @@ def _run_configs(
     deterministic: bool,
     scripted: str = "",
     stage_tiles_frac: float = 0.0,
+    record_actions: bool = False,
 ) -> dict:
     if not configs:
         return _empty_mode()
@@ -711,6 +740,7 @@ def _run_configs(
     shrank: Counter[str] = Counter()
     unchanged: Counter[str] = Counter()
 
+    tapes: list[dict] = []
     idx = 0
     while idx < len(configs):
         batch = configs[idx : idx + max(1, int(envs))]
@@ -719,6 +749,7 @@ def _run_configs(
         active = np.ones(batch_n, dtype=bool)
         ep_ret = np.zeros(batch_n, np.float32)
         pending: list[list[tuple[str, int, float]]] = [[] for _ in range(batch_n)]
+        ep_acts: list[list[list[int]]] = [[] for _ in range(batch_n)]
         while active.any():
             if scripted == "expander":
                 actions = np.stack(
@@ -736,6 +767,8 @@ def _run_configs(
                     continue
                 legal_counts += mask[i]
                 legal_n += 1
+                if record_actions:
+                    ep_acts[i].append([int(x) for x in actions[i].tolist()])
             step = env.step(actions)
             ep_ret += step.rewards
             for i in range(batch_n):
@@ -796,10 +829,24 @@ def _run_configs(
                         "won": bool(won),
                         "cause": cause,
                     }
+                    if record_actions:
+                        tapes.append(
+                            {
+                                "seed": seed,
+                                "config": dict(batch[i]),
+                                "actions": ep_acts[i],
+                                "terminal": cause,
+                                "win": bool(won),
+                                "ticks": int(info.get("tick", 0)),
+                                "return": float(ep_ret[i]),
+                                "peak_tiles": peaks[seed],
+                                "final_tiles": finals[seed],
+                            }
+                        )
             obs = step.obs
         idx += batch_n
 
-    return _summarize(
+    summary = _summarize(
         planned_seeds=planned_seeds,
         records=records,
         wins=wins,
@@ -826,6 +873,28 @@ def _run_configs(
         unchanged=unchanged,
         maps=maps,
     )
+    if record_actions:
+        summary["episode_tapes"] = tapes
+    return summary
+
+
+def write_actions_out(path: Path, plan: EvalPlan, report: dict) -> None:
+    """Structured greedy/sampled tapes for nation_episodes replay."""
+    episodes: list[dict] = []
+    for mode_name in ("deterministic", "sampled"):
+        for tape in report.get(mode_name, {}).get("episode_tapes") or []:
+            episodes.append({**tape, "mode": mode_name})
+    payload = {
+        "stage": plan.stage,
+        "suite": plan.suite,
+        "source": "eval",
+        "episodes": episodes,
+    }
+    path.write_text(
+        json.dumps(_json_ready(payload), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"actions_out={path} episodes={len(episodes)}")
 
 
 def _print(label: str, r: dict) -> None:
@@ -859,6 +928,15 @@ def _print(label: str, r: dict) -> None:
     seeds = r.get("seeds") or []
     if seeds:
         print(f"  seeds    : {len(seeds)} (first={seeds[0]!s})")
+    records = r.get("episode_records") or []
+    if records:
+        print(
+            "  episodes : "
+            + ", ".join(
+                f"{rec.get('seed', '?')[:8]}:{rec.get('cause', '?')}@{rec.get('ticks', '?')}"
+                for rec in records
+            )
+        )
 
 
 def _json_ready(obj: Any) -> Any:
@@ -905,6 +983,8 @@ def run_eval(
     env: VecEnv,
     plan: EvalPlan,
     device: torch.device,
+    *,
+    record_actions: bool = False,
 ) -> dict:
     """Run sampled/det modes from a resolved plan (no server lifecycle)."""
     modes: dict[str, dict] = {}
@@ -925,6 +1005,7 @@ def run_eval(
                 deterministic=True,
                 scripted=plan.scripted,
                 stage_tiles_frac=plan.stage_tiles_frac,
+                record_actions=record_actions,
             )
             _print(f"scripted-{plan.scripted}-det", modes["deterministic"])
         else:
@@ -939,6 +1020,7 @@ def run_eval(
                 deterministic=True,
                 scripted=plan.scripted,
                 stage_tiles_frac=plan.stage_tiles_frac,
+                record_actions=record_actions,
             )
             _print(f"scripted-{plan.scripted}", modes["sampled"])
         else:
@@ -961,6 +1043,7 @@ def run_eval(
             deterministic=True,
             scripted="",
             stage_tiles_frac=plan.stage_tiles_frac,
+            record_actions=record_actions,
         )
         _print("deterministic", modes["deterministic"])
     else:
@@ -975,6 +1058,7 @@ def run_eval(
             deterministic=False,
             scripted="",
             stage_tiles_frac=plan.stage_tiles_frac,
+            record_actions=record_actions,
         )
         _print("sampled", modes["sampled"])
     else:
@@ -1006,7 +1090,9 @@ def main(argv: list[str] | None = None) -> dict:
     server = None if args.connect else spawn_eval_server(args.port, plan.workers)
     env = VecEnv("127.0.0.1", args.port)
     try:
-        report = run_eval(policy, env, plan, device)
+        report = run_eval(
+            policy, env, plan, device, record_actions=bool(args.actions_out)
+        )
     finally:
         env.close()
         if server is not None:
@@ -1014,11 +1100,17 @@ def main(argv: list[str] | None = None) -> dict:
 
     if args.json_out:
         path = Path(args.json_out)
+        ready = _json_ready(report)
+        for mode in ("sampled", "deterministic"):
+            if isinstance(ready.get(mode), dict):
+                ready[mode].pop("episode_tapes", None)
         path.write_text(
-            json.dumps(_json_ready(report), indent=2, sort_keys=True) + "\n",
+            json.dumps(ready, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         print(f"json_out={path}")
+    if args.actions_out:
+        write_actions_out(Path(args.actions_out), plan, report)
     return report
 
 

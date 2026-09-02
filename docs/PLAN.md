@@ -420,7 +420,9 @@ missing runtime is required, the selector returns official **before**
 `ShardedVecEnv` creates episodes. A Rust farm that later sees an
 unsupported `nextConfig` raises rather than approximating or switching
 mid-episode. `--backend official` always uses the TypeScript core.
-Standalone `agent.eval` is official-only.
+Standalone `agent.eval` is official-only. Train-time holdout/mastery
+defaults to the official core when collect is Rust (`--eval-backend auto`);
+`--eval-backend train` reuses the collect farm as an A/B escape hatch.
 
 Implemented official parity: sequential and parallel TypeScript actors
 are byte-equal on goldens and randomized traces (obs, masks, rewards,

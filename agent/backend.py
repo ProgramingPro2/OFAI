@@ -8,7 +8,8 @@ switching and approximation are forbidden.
 Training defaults to auto: Rust when the capability document supports
 every remaining stage (boats, structures, diplomacy, tribe/nation AI,
 rails, nukes, doomsday). Unknown or unsupported capabilities select
-the official TypeScript core before episode creation. agent.eval is
+the official TypeScript core before episode creation. Holdout/mastery
+eval defaults to official-core when collect is Rust. agent.eval is
 always official-core.
 """
 
@@ -25,6 +26,9 @@ from . import spaces
 BACKEND_OFFICIAL = "official"
 BACKEND_RUST = "rust"
 BACKEND_AUTO = "auto"
+EVAL_BACKEND_AUTO = "auto"
+EVAL_BACKEND_OFFICIAL = "official"
+EVAL_BACKEND_TRAIN = "train"
 
 SCHEMA_V2 = "v2"
 
@@ -85,6 +89,33 @@ def parse_backend_arg(value: str) -> str:
     raise ValueError(
         f"unknown backend {value!r}; expected official, rust, or auto"
     )
+
+
+def parse_eval_backend_arg(value: str) -> str:
+    key = str(value).strip().lower()
+    if key in (EVAL_BACKEND_AUTO, EVAL_BACKEND_OFFICIAL, EVAL_BACKEND_TRAIN):
+        return key
+    raise ValueError(
+        f"unknown eval backend {value!r}; expected auto, official, or train"
+    )
+
+
+def resolve_holdout_backend(train_backend: str, eval_backend: str = EVAL_BACKEND_AUTO) -> str:
+    """Farm used for mastery / regression holdout.
+
+    ``auto`` (default) and ``official`` score on the TypeScript core so a
+    Rust collect farm cannot gate advancement on a different game.
+    ``train`` reuses the collect farm (escape hatch / A/B).
+    """
+    train = str(train_backend).strip().lower()
+    ev = parse_eval_backend_arg(eval_backend)
+    if ev == EVAL_BACKEND_TRAIN:
+        if train not in (BACKEND_OFFICIAL, BACKEND_RUST):
+            raise ValueError(
+                f"holdout train farm needs a resolved backend, got {train_backend!r}"
+            )
+        return train
+    return BACKEND_OFFICIAL
 
 
 def _action_names(raw: object) -> set[str]:

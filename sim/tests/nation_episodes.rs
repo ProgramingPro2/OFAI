@@ -133,10 +133,81 @@ fn episode_action(obs: &ObsBuffers, step: usize) -> ActionVec {
     }
 }
 
+fn action_from_row(row: [i32; 5]) -> ActionVec {
+    ActionVec {
+        action_type: row[0],
+        target: row[1],
+        region: row[2],
+        quantity: row[3],
+        unit: row[4],
+    }
+}
+
+fn parse_action_rows(v: &serde_json::Value) -> Vec<[i32; 5]> {
+    let arr = v
+        .as_array()
+        .unwrap_or_else(|| panic!("NATION_EP_ACTIONS actions must be an array"));
+    arr.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let cells = row.as_array().unwrap_or_else(|| panic!("action {i} must be a 5-int row"));
+            assert_eq!(cells.len(), 5, "action {i} must have 5 ints");
+            let mut out = [0i32; 5];
+            for (j, cell) in cells.iter().enumerate() {
+                out[j] = cell.as_i64().unwrap_or_else(|| panic!("action {i}[{j}] not an int")) as i32;
+            }
+            out
+        })
+        .collect()
+}
+
+/// Load a recorded eval tape (`--actions-out`) or a bare `{actions:[...]}` payload.
+/// Returns (actions, optional shaping override, path, optional seed override).
+fn load_recorded_tape(seed: &str) -> Option<(Vec<[i32; 5]>, Option<f64>, String, Option<String>)> {
+    let path = std::env::var("NATION_EP_ACTIONS").ok()?;
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("NATION_EP_ACTIONS={path}: {e}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("NATION_EP_ACTIONS json: {e}"));
+    let episode = if v.get("episodes").and_then(|e| e.as_array()).is_some() {
+        let eps = v["episodes"].as_array().unwrap();
+        eps.iter()
+            .find(|e| e.get("seed").and_then(|s| s.as_str()) == Some(seed))
+            .cloned()
+            .or_else(|| {
+                if eps.len() == 1 {
+                    Some(eps[0].clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("NATION_EP_ACTIONS has no episode for seed {seed}"))
+    } else if v.get("actions").and_then(|a| a.as_array()).is_some() {
+        v
+    } else {
+        panic!("NATION_EP_ACTIONS={path} missing actions/episodes");
+    };
+    let actions = parse_action_rows(
+        episode
+            .get("actions")
+            .unwrap_or_else(|| panic!("NATION_EP_ACTIONS episode missing actions")),
+    );
+    let shaping = episode
+        .pointer("/config/shaping")
+        .and_then(|s| s.as_f64())
+        .or_else(|| episode.get("shaping").and_then(|s| s.as_f64()));
+    let tape_seed = episode
+        .get("seed")
+        .and_then(|s| s.as_str())
+        .or_else(|| episode.pointer("/config/seed").and_then(|s| s.as_str()))
+        .map(|s| s.to_string());
+    Some((actions, shaping, path, tape_seed))
+}
+
 fn official_replay_boundaries(
     raw_cfg: &serde_json::Value,
     actions: &[[i32; 5]],
-) -> Result<(String, Vec<serde_json::Value>), String> {
+) -> Result<(String, Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../OpenFrontIO");
     let name = raw_cfg
         .get("seed")
@@ -151,14 +222,16 @@ fn official_replay_boundaries(
     let payload = serde_json::json!({
         "config": raw_cfg,
         "actions": actions,
+        "census": true,
         "outPath": dump.to_string_lossy(),
     });
-    let out = std::process::Command::new("npx")
-        .args(["tsx", "ofai/tests/fidelity.ts", "--replay-stdin"])
+    let mut cmd = std::process::Command::new("npx");
+    cmd.args(["tsx", "ofai/tests/fidelity.ts", "--replay-stdin"])
         .current_dir(&root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = cmd
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
@@ -192,10 +265,281 @@ fn official_replay_boundaries(
     })?;
     let init = v["init"]["tileDigest"].as_str().unwrap_or("").to_string();
     let bounds = v["boundaries"].as_array().cloned().unwrap_or_default();
-    Ok((init, bounds))
+    let census = v["census"].as_array().cloned().unwrap_or_default();
+    Ok((init, bounds, census))
 }
 
-fn assert_boundary(label: &str, i: usize, got: &ofai_sim::digest::DecisionBoundary, exp: &serde_json::Value) {
+fn format_off_census(c: &serde_json::Value) -> String {
+    let Some(players) = c.get("players").and_then(|p| p.as_array()) else {
+        return c.to_string();
+    };
+    let player_line = players
+        .iter()
+        .map(|p| {
+            let allies = p
+                .get("allies")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let atk = p
+                .get("attacks")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|a| {
+                            format!(
+                                "{}:t{}@{:.0}{}",
+                                a.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                                a.get("target").and_then(|v| v.as_u64()).unwrap_or(0),
+                                a.get("troops").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                if a.get("retreating").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                    "R"
+                                } else {
+                                    ""
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let embargoes = p
+                .get("embargoes")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            format!(
+                "sid={} tiles={} troops={:.0} gold={} atk=[{}] allies=[{}] emb=[{}] rel={}/{}",
+                p.get("smallId").and_then(|v| v.as_u64()).unwrap_or(0),
+                p.get("tiles").and_then(|v| v.as_u64()).unwrap_or(0),
+                p.get("troops").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                p.get("gold").and_then(|v| v.as_str()).unwrap_or("?"),
+                atk,
+                allies,
+                embargoes,
+                p.get("relFromMe").and_then(|v| v.as_u64()).unwrap_or(0),
+                p.get("relToMe").and_then(|v| v.as_u64()).unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    player_line
+}
+
+fn rust_census_line(game: &ofai_sim::game::Game) -> String {
+    let mut players: Vec<_> = game.all_players().collect();
+    players.sort_by_key(|p| p.small_id);
+    let rows: Vec<String> = players
+        .iter()
+        .map(|p| {
+            let mut allies: Vec<u16> = game
+                .alliances()
+                .iter()
+                .filter(|a| a.requestor == p.id() || a.recipient == p.id())
+                .filter_map(|a| game.player(a.other(p.id())).map(|o| o.small_id))
+                .collect();
+            allies.sort_unstable();
+            let atk: Vec<String> = p
+                .outgoing
+                .iter()
+                .filter(|a| a.active)
+                .map(|a| {
+                    format!(
+                        "{}:t{}@{:.0}{}",
+                        a.id,
+                        a.target_small_id,
+                        a.troops,
+                        if a.retreating { "R" } else { "" }
+                    )
+                })
+                .collect();
+            let mut emb: Vec<u16> = players
+                .iter()
+                .filter(|o| o.id() != p.id() && p.has_embargo_against(o.id()))
+                .map(|o| o.small_id)
+                .collect();
+            emb.sort_unstable();
+            format!(
+                "sid={} type={:?} tiles={} troops={:.0} gold={} atk=[{}] allies=[{:?}] emb={:?} alive={}",
+                p.small_id,
+                p.player_type(),
+                p.num_tiles(),
+                p.troops_f64(),
+                p.gold,
+                atk.join(","),
+                allies,
+                emb,
+                p.is_alive()
+            )
+        })
+        .collect();
+    let pending: Vec<String> = game
+        .incoming_requests()
+        .iter()
+        .filter(|r| r.status == ofai_sim::diplomacy::RequestStatus::Pending)
+        .map(|r| {
+            let from = game.player(&r.requestor).map(|p| p.small_id).unwrap_or(0);
+            let to = game.player(&r.recipient).map(|p| p.small_id).unwrap_or(0);
+            format!("{from}->{to}@{}", r.created_at)
+        })
+        .collect();
+    let human = players.iter().find(|p| p.player_type() == ofai_sim::spec::PlayerType::Human);
+    let rels = if let Some(me) = human {
+        let mut pairs: Vec<String> = players
+            .iter()
+            .filter(|p| p.id() != me.id())
+            .map(|p| format!("{}:{:?}", p.small_id, me.relation(p.id())))
+            .collect();
+        pairs.sort();
+        pairs.join(",")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} || pending=[{}] rels=[{}]",
+        rows.join(" | "),
+        pending.join(","),
+        rels
+    )
+}
+
+fn rust_obs_line(env: &AgentEnv) -> String {
+    let obs = env.peek_obs();
+    let slots: Vec<String> = env
+        .slots()
+        .iter()
+        .map(|s| {
+            s.player_id
+                .as_ref()
+                .and_then(|id| env.game().player(id).map(|p| p.small_id.to_string()))
+                .unwrap_or_else(|| "-".into())
+        })
+        .collect();
+    let attack_row = (ACTION_ATTACK as usize) * NUM_PLAYER_SLOTS;
+    let ally_row = (ACTION_ALLY as usize) * NUM_PLAYER_SLOTS;
+    let break_row = (ACTION_BREAK_ALLY as usize) * NUM_PLAYER_SLOTS;
+    let mut rel_pairs = String::new();
+    if let Some(me) = env
+        .game()
+        .all_players()
+        .find(|p| p.player_type() == ofai_sim::spec::PlayerType::Human)
+    {
+        let mut parts = Vec::new();
+        for p in env.game().all_players() {
+            if p.id() == me.id() {
+                continue;
+            }
+            let a = me.relation_value(p.id());
+            let b = p.relation_value(me.id());
+            if a != 0.0 || b != 0.0 {
+                parts.push(format!("{}:{a:.1}/{b:.1}", p.small_id));
+            }
+        }
+        rel_pairs = parts.join(",");
+    }
+    format!(
+        "am={:?} slots=[{}] atk={:?} ally={:?} brk={:?} unit={:?} build={:?} boat={:?} relAB=[{}]",
+        obs.action_mask,
+        slots.join(","),
+        &obs.target_masks[attack_row..attack_row + NUM_PLAYER_SLOTS],
+        &obs.target_masks[ally_row..ally_row + NUM_PLAYER_SLOTS],
+        &obs.target_masks[break_row..break_row + NUM_PLAYER_SLOTS],
+        obs.unit_mask,
+        obs.build_regions.iter().filter(|&&b| b != 0).count(),
+        obs.boat_regions.iter().filter(|&&b| b != 0).count(),
+        rel_pairs
+    )
+}
+
+fn format_off_obs(c: &serde_json::Value) -> String {
+    let slots = c
+        .get("slots")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let rels = c
+        .get("relations")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    format!(
+                        "{}:{}",
+                        r.get("sid").and_then(|v| v.as_u64()).unwrap_or(0),
+                        r.get("rel").and_then(|v| v.as_u64()).unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let pending = c
+        .get("pending")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    format!(
+                        "{}->{}@{}",
+                        r.get("from").and_then(|v| v.as_u64()).unwrap_or(0),
+                        r.get("to").and_then(|v| v.as_u64()).unwrap_or(0),
+                        r.get("at").and_then(|v| v.as_u64()).unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    format!(
+        "am={:?} slots=[{}] atk={:?} ally={:?} brk={:?} unit={:?} rels=[{}] pending=[{}]",
+        json_u8_vec(c.get("actionMask")),
+        slots,
+        json_u8_vec(c.get("attackTargets")),
+        json_u8_vec(c.get("allyTargets")),
+        json_u8_vec(c.get("breakTargets")),
+        json_u8_vec(c.get("unitMask")),
+        rels,
+        pending
+    )
+}
+
+fn json_u8_vec(v: Option<&serde_json::Value>) -> Vec<u8> {
+    v.and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+        .unwrap_or_default()
+}
+
+fn assert_boundary(
+    label: &str,
+    i: usize,
+    got: &ofai_sim::digest::DecisionBoundary,
+    exp: &serde_json::Value,
+    rust_census: Option<&str>,
+    off_census: Option<&str>,
+    prev_rust: Option<&str>,
+    prev_off: Option<&str>,
+    action: Option<&[i32; 5]>,
+    rust_obs: Option<&str>,
+    off_obs: Option<&str>,
+) {
     let field = |k: &str| -> String {
         match &exp[k] {
             serde_json::Value::Null => "null".into(),
@@ -204,21 +548,33 @@ fn assert_boundary(label: &str, i: usize, got: &ofai_sim::digest::DecisionBounda
     };
     if got.tile_digest != exp["tileDigest"].as_str().unwrap_or("") {
         panic!(
-            "{label} step {i} FIRST MISMATCH tileDigest rust_tick={} off_tick={} rust_hash={} off_hash={}\nrust_tile={}\noff_tile={}",
+            "{label} step {i} FIRST MISMATCH tileDigest rust_tick={} off_tick={} rust_hash={} off_hash={} action={:?} rust_accepted={} off_accepted={}\nprev_rust={}\nprev_off={}\nrust_census={}\noff_census={}",
             got.tick,
             field("tick"),
             field("coreHash"),
             got.core_hash.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
-            got.tile_digest,
-            exp["tileDigest"].as_str().unwrap_or(""),
+            action,
+            got.action_accepted,
+            exp["actionAccepted"].as_bool().unwrap_or(false),
+            prev_rust.unwrap_or("-"),
+            prev_off.unwrap_or("-"),
+            rust_census.unwrap_or("-"),
+            off_census.unwrap_or("-"),
         );
     }
     assert_eq!(got.core_hash, exp["coreHash"].as_f64(), "{label} step {i} FIRST MISMATCH coreHash");
-    assert_eq!(
-        got.obs_digest,
-        exp["obsDigest"].as_str().unwrap_or(""),
-        "{label} step {i} FIRST MISMATCH obsDigest (masks+obs)"
-    );
+    if got.obs_digest != exp["obsDigest"].as_str().unwrap_or("") {
+        panic!(
+            "{label} step {i} FIRST MISMATCH obsDigest action={:?} rust_accepted={} off_accepted={}\nrust_obs={}\noff_obs={}\nrust_census={}\noff_census={}",
+            action,
+            got.action_accepted,
+            exp["actionAccepted"].as_bool().unwrap_or(false),
+            rust_obs.unwrap_or("-"),
+            off_obs.unwrap_or("-"),
+            rust_census.unwrap_or("-"),
+            off_census.unwrap_or("-"),
+        );
+    }
     assert_eq!(
         got.step_digest,
         exp["stepDigest"].as_str().unwrap_or(""),
@@ -278,7 +634,14 @@ fn episode_raw(spec: &EpisodeSpec) -> serde_json::Value {
 
 fn run_episode(cache: &mut TerrainCache, spec: &EpisodeSpec) -> EpisodeOutcome {
     let t0 = Instant::now();
-    let raw = episode_raw(spec);
+    let recorded = load_recorded_tape(spec.seed);
+    let mut raw = episode_raw(spec);
+    if let Some((_, Some(shaping), _, _)) = &recorded {
+        raw["shaping"] = serde_json::json!(shaping);
+    }
+    if let Some((_, _, _, Some(tape_seed))) = &recorded {
+        raw["seed"] = serde_json::json!(tape_seed);
+    }
     let cfg = EnvConfig::from_json(&raw).unwrap_or_else(|e| panic!("{} cfg: {e}", spec.name));
     let mut rust = AgentEnv::create(cfg, cache).unwrap_or_else(|e| panic!("{} create: {e}", spec.name));
     assert_eq!(
@@ -290,17 +653,43 @@ fn run_episode(cache: &mut TerrainCache, spec: &EpisodeSpec) -> EpisodeOutcome {
     let rust_init = rust.strong_state_digest();
     let mut actions = Vec::new();
     let mut rust_bounds = Vec::new();
+    let mut rust_censuses = Vec::new();
+    let mut rust_obs_lines = Vec::new();
     let mut terminal = "none".to_string();
     let mut win = false;
+    let step_cap = std::env::var("NATION_EP_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    if let Some((tape, _, path, tape_seed)) = &recorded {
+        eprintln!(
+            "  {} replaying {} recorded actions from {path} seed={}",
+            spec.name,
+            tape.len(),
+            tape_seed.as_deref().unwrap_or(spec.seed)
+        );
+    }
     loop {
         let i = actions.len();
-        let act = episode_action(rust.peek_obs(), i);
+        if i >= step_cap {
+            break;
+        }
+        let act = if let Some((tape, _, _, _)) = &recorded {
+            if i >= tape.len() {
+                break;
+            }
+            action_from_row(tape[i])
+        } else {
+            episode_action(rust.peek_obs(), i)
+        };
         actions.push([act.action_type, act.target, act.region, act.quantity, act.unit]);
         let step = rust.step(act);
         if let Some(reason) = step.info.fallback.as_deref() {
             panic!("{} rust fallback at step {i} tick={}: {reason}", spec.name, step.info.tick);
         }
         rust_bounds.push(rust.strong_state_digest());
+        rust_censuses.push(rust_census_line(rust.game()));
+        rust_obs_lines.push(rust_obs_line(&rust));
         terminal = step.info.terminal_cause.as_str().to_string();
         win = step.info.win;
         if i > 0 && i % 40 == 0 {
@@ -316,15 +705,36 @@ fn run_episode(cache: &mut TerrainCache, spec: &EpisodeSpec) -> EpisodeOutcome {
             panic!("{} rust exceeded maxTicks without terminal", spec.name);
         }
     }
-    let (off_init, off_bounds) = official_replay_boundaries(&raw, &actions)
+    let (off_init, off_bounds, off_census) = official_replay_boundaries(&raw, &actions)
         .unwrap_or_else(|e| panic!("{} official replay: {e}", spec.name));
     assert_eq!(rust_init.tile_digest, off_init, "{} init tileDigest", spec.name);
     assert_eq!(off_bounds.len(), rust_bounds.len(), "{} boundary count rust={} official={}", spec.name, rust_bounds.len(), off_bounds.len());
     for (i, (got, exp)) in rust_bounds.iter().zip(off_bounds.iter()).enumerate() {
-        assert_boundary(spec.name, i, got, exp);
+        let off_c = off_census.get(i).map(format_off_census);
+        let off_o = off_census.get(i).map(format_off_obs);
+        let prev_off = if i > 0 {
+            off_census.get(i - 1).map(format_off_census)
+        } else {
+            None
+        };
+        assert_boundary(
+            spec.name,
+            i,
+            got,
+            exp,
+            Some(&rust_censuses[i]),
+            off_c.as_deref(),
+            if i > 0 { Some(rust_censuses[i - 1].as_str()) } else { None },
+            prev_off.as_deref(),
+            actions.get(i),
+            Some(&rust_obs_lines[i]),
+            off_o.as_deref(),
+        );
     }
     let last = rust_bounds.last().expect("episode produced a boundary");
-    assert_ne!(last.terminal_cause.as_str(), "none", "{} ended without exclusive terminal", spec.name);
+    if step_cap == usize::MAX {
+        assert_ne!(last.terminal_cause.as_str(), "none", "{} ended without exclusive terminal", spec.name);
+    }
     EpisodeOutcome {
         name: spec.name,
         stage: spec.stage,
@@ -425,6 +835,31 @@ fn nation_episodes() -> Vec<EpisodeSpec> {
             gold: None,
             max_ticks: 700,
             seed: "nation-ep-small-0",
+            win_tiles_frac: 0.0,
+            shaping: 0.15,
+        },
+        // Canonical late / greedy-holdout[0] tape: same seed as holdout[0],
+        // maxTicks=12000. Mask-aware actions are the default; set
+        // NATION_EP_ACTIONS to replay an eval `--actions-out` greedy tape
+        // (shaping is taken from the tape config so holdout 0.0 matches).
+        // Combat sigmoid uses js_exp. Land-attack init cancels opposing
+        // incoming before same-target absorb. Nation embargo/relation
+        // scans match official `mg.players()` (alive-only). Alliance
+        // accept clears temporary embargoes only on the mutual-request
+        // shortcut. Captured Defense Posts are deleted, not transferred.
+        // Uncaptured trade ships use ship-owner canTrade vs dest, not
+        // the source port owner (official TradeShipExecution.tick).
+        EpisodeSpec {
+            name: "nations-easy-small-late",
+            stage: "nations-easy-small",
+            map: "FourIslands",
+            map_size: "Normal",
+            nations: serde_json::json!(8),
+            bots: 20,
+            difficulty: "Easy",
+            gold: None,
+            max_ticks: 12000,
+            seed: "36cd15ca77bc7e9f23424dab8a6d1ae3",
             win_tiles_frac: 0.0,
             shaping: 0.15,
         },
@@ -599,6 +1034,41 @@ fn nation_episodes() -> Vec<EpisodeSpec> {
     ];
 
     later.into_iter().chain(curriculum).collect()
+}
+
+#[test]
+fn recorded_eval_tape_selects_matching_seed() {
+    let payload = serde_json::json!({
+        "stage": "nations-easy-small",
+        "suite": "holdout",
+        "source": "eval",
+        "episodes": [
+            {
+                "seed": "other-seed",
+                "config": {"shaping": 0.2},
+                "actions": [[0, 0, 0, 0, 0]],
+            },
+            {
+                "seed": "36cd15ca77bc7e9f23424dab8a6d1ae3",
+                "config": {"shaping": 0.0},
+                "actions": [[1, 0, 12, 0, 0], [2, 3, 4, 1, 0]],
+            }
+        ]
+    });
+    let path = std::env::temp_dir().join(format!(
+        "ofai-nation-tape-parse-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, payload.to_string()).unwrap();
+    std::env::set_var("NATION_EP_ACTIONS", path.to_string_lossy().as_ref());
+    let (actions, shaping, loaded, tape_seed) =
+        load_recorded_tape("36cd15ca77bc7e9f23424dab8a6d1ae3").expect("tape");
+    std::env::remove_var("NATION_EP_ACTIONS");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(loaded, path.to_string_lossy());
+    assert_eq!(shaping, Some(0.0));
+    assert_eq!(tape_seed.as_deref(), Some("36cd15ca77bc7e9f23424dab8a6d1ae3"));
+    assert_eq!(actions, vec![[1, 0, 12, 0, 0], [2, 3, 4, 1, 0]]);
 }
 
 #[test]
