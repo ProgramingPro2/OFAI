@@ -303,3 +303,7 @@ Limitations: a Rust farm that cannot declare a required capability stays
 on official. Parallel official workers fall back to sequential if a
 worker farm fails to init. Do not point this stack at public
 multiplayer servers.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
